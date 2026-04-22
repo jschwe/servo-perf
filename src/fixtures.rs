@@ -109,6 +109,18 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    #[test]
+    fn http2_fixture_spawns() {
+        let workloads_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
+        let fx = Fixture {
+            kind: FixtureKind::Http2,
+            port: pick_free_port(),
+            doc_root: "www".into(),
+        };
+        let handle = spawn(&workloads_dir, &fx).expect("spawn http/2 fixture");
+        assert!(TcpStream::connect(format!("127.0.0.1:{}", handle.port())).is_ok());
+    }
+
     fn pick_free_port() -> u16 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
