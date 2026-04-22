@@ -219,6 +219,11 @@ pub struct CriticalPathReport {
 ///   entries (their duration is ignored; only the start time matters).
 /// * Gaps: for each registry edge `from → to`, compute `to.ts_ns -
 ///   (from.ts_ns + from.dur_ns)` and flag if above `flag_threshold_ms`.
+///
+/// All `ts_ms` values in the returned report are **trace-relative** — the
+/// smallest `ts_ns` across all input slices is treated as time zero. Raw
+/// perfetto timestamps are a platform clock (usually `CLOCK_BOOTTIME` /
+/// `CLOCK_MONOTONIC`) whose absolute value is meaningless outside the run.
 pub fn analyse(slices: &[Slice], registry: &SpanRegistry) -> CriticalPathReport {
     // Pick the slice with the smallest ts_ns per name. This makes `analyse`
     // correct regardless of the caller's input order — callers aren't
@@ -235,11 +240,16 @@ pub fn analyse(slices: &[Slice], registry: &SpanRegistry) -> CriticalPathReport 
             acc
         });
 
+    // Rebase everything to the trace's earliest timestamp so ts_ms is the
+    // duration-from-trace-start, not an absolute wallclock value.
+    let t0_ns: u64 = slices.iter().map(|s| s.ts_ns).min().unwrap_or(0);
+    let rel_ms = |ns: u64| (ns.saturating_sub(t0_ns)) as f64 / 1_000_000.0;
+
     let mut report = CriticalPathReport::default();
 
     for phase in &registry.phases {
         if let Some(s) = first_by_name.get(phase.name.as_str()) {
-            let ts_ms = s.ts_ns as f64 / 1_000_000.0;
+            let ts_ms = rel_ms(s.ts_ns);
             let dur_ms = s.dur_ns as f64 / 1_000_000.0;
             if phase.is_milestone {
                 report.milestones.push(Milestone { name: phase.name.clone(), ts_ms });
@@ -361,9 +371,13 @@ flag_threshold_ms = 10
         assert_eq!(r.named_spans.len(), 2);
         assert_eq!(r.named_spans[0].name, "A");
         assert_eq!(r.named_spans[0].dur_ms, 2.0);
+        // ts_ms is trace-relative: t0 = 5 ms (earliest slice), so A = 0 ms.
+        assert_eq!(r.named_spans[0].ts_ms, 0.0);
+        assert_eq!(r.named_spans[1].ts_ms, 5.0);
         assert_eq!(r.milestones.len(), 1);
         assert_eq!(r.milestones[0].name, "FirstContentfulPaint");
-        assert_eq!(r.milestones[0].ts_ms, 20.0);
+        // t0 = 5 ms → FCP at 20 ms in the source → 15 ms relative.
+        assert_eq!(r.milestones[0].ts_ms, 15.0);
     }
 
     #[test]
@@ -405,7 +419,8 @@ flag_threshold_ms = 10
         ];
         let r = super::analyse(&slices, &simple_registry());
         assert_eq!(r.named_spans.len(), 1);
-        assert_eq!(r.named_spans[0].ts_ms, 3.0, "analyse should pick the earliest occurrence");
+        // t0 = 3 ms (the earliest slice); the picked "A" is at 3 ms → relative 0 ms.
+        assert_eq!(r.named_spans[0].ts_ms, 0.0, "analyse should pick the earliest occurrence (rebased to t0)");
         assert_eq!(r.named_spans[0].dur_ms, 1.0);
     }
 }
