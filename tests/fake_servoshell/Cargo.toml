@@ -1,0 +1,9 @@
+[package]
+name = "fake_servoshell"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "fake_servoshell"
+path = "src/main.rs"
