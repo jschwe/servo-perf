@@ -1,0 +1,9 @@
+name = "localhost-simple"
+url = "https://127.0.0.1:4443/simple.html"
+iterations = 20
+servoshell_args = ["--ignore-certificate-errors"]
+
+[fixture]
+kind = "http1"
+port = 4443
+doc_root = "www"

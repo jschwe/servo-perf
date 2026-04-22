@@ -98,4 +98,21 @@ url = "https://example.test/"
         let err = load(dir.path(), "x").unwrap_err();
         assert!(err.to_string().contains("does not match filename"));
     }
+
+    #[test]
+    fn all_checked_in_workloads_load() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            if stem.starts_with('_') {
+                continue; // registry file, not a workload
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+                continue;
+            }
+            let w = super::load(&dir, stem).unwrap_or_else(|e| panic!("loading {stem}: {e:#}"));
+            assert_eq!(w.name, stem);
+        }
+    }
 }

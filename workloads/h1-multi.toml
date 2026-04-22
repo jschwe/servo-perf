@@ -1,0 +1,12 @@
+name = "h1-multi"
+url = "https://127.0.0.1:4443/multi.html"
+iterations = 20
+viewport = [824, 1830]
+device_pixel_ratio = 2.625
+user_agent = "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/14.2 Chrome/87.0.4280.141 Mobile Safari/537.36"
+servoshell_args = ["--ignore-certificate-errors"]
+
+[fixture]
+kind = "http1"
+port = 4443
+doc_root = "www"

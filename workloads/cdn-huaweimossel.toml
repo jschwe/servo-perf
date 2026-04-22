@@ -1,0 +1,7 @@
+name = "cdn-huaweimossel"
+url = "https://m.huaweimossel.com/#/"
+iterations = 15
+viewport = [824, 1830]
+device_pixel_ratio = 2.625
+user_agent = "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/14.2 Chrome/87.0.4280.141 Mobile Safari/537.36"
+# No [fixture] — real CDN.
