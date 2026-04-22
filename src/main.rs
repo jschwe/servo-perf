@@ -9,6 +9,7 @@ mod proto;
 mod fixtures;
 mod runner;
 mod stats;
+mod report;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
