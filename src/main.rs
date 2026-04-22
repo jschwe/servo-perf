@@ -7,6 +7,7 @@ mod workload;
 mod trace;
 mod proto;
 mod fixtures;
+mod runner;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
