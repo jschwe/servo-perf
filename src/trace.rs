@@ -292,10 +292,18 @@ pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) ->
     let mut report = CriticalPathReport::default();
 
     // Synthesize startup::exec_to_anchor from the wallclock anchor event.
+    //
+    // tracing's Visit trait has no dedicated `record_u64`: the tracing-perfetto
+    // visitor records u64 fields via `record_i64`, so the annotation value can
+    // arrive as either Int or Uint. Accept both.
     let anchor = slices.iter().find(|s| s.name == "servoshell::startup_anchor");
     let anchor_wall_ns = anchor.and_then(|s| {
         s.debug_annotations.iter().find(|(k, _)| k == "wallclock_ns").and_then(|(_, v)| {
-            match v { DebugAnnotationValue::Uint(n) => Some(*n), _ => None }
+            match v {
+                DebugAnnotationValue::Uint(n) => Some(*n),
+                DebugAnnotationValue::Int(n) if *n >= 0 => Some(*n as u64),
+                _ => None,
+            }
         })
     });
     if let (Some(anc), Some(wall_ns)) = (anchor, anchor_wall_ns) {
@@ -519,5 +527,28 @@ flag_threshold_ms = 10
         assert_eq!(r.named_spans[0].name, "startup::exec_to_anchor");
         assert!((r.named_spans[0].dur_ms - 800.0).abs() < 0.01);
         assert_eq!(r.named_spans[0].thread, "_meta");
+    }
+
+    #[test]
+    fn analyse_accepts_int_valued_wallclock_ns() {
+        // tracing's Visit trait has no record_u64 — u64 fields arrive as
+        // DebugAnnotationValue::Int in real traces. Make sure analyse
+        // handles that too.
+        let anchor_wall_ns = 1_500_000_000u64;
+        let spawn_wall_ns = anchor_wall_ns - 300_000_000;
+        let slices = vec![
+            Slice {
+                name: "servoshell::startup_anchor".into(),
+                thread: "main".into(),
+                ts_ns: anchor_wall_ns,
+                dur_ns: 0,
+                debug_annotations: vec![
+                    ("wallclock_ns".into(), super::DebugAnnotationValue::Int(anchor_wall_ns as i64)),
+                ],
+            },
+        ];
+        let r = super::analyse(&slices, &simple_registry(), spawn_wall_ns);
+        assert_eq!(r.named_spans[0].name, "startup::exec_to_anchor");
+        assert!((r.named_spans[0].dur_ms - 300.0).abs() < 0.01);
     }
 }
