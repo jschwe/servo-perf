@@ -5,6 +5,7 @@
 
 mod workload;
 mod trace;
+mod proto;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
