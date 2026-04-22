@@ -9,6 +9,7 @@ pub mod perfetto_protos {
     include!(concat!(env!("OUT_DIR"), "/perfetto.protos.rs"));
 }
 
+#[allow(unused_imports)]
 pub use perfetto_protos::{
     InternedData, ProcessDescriptor, ThreadDescriptor, TracePacket, TrackDescriptor, TrackEvent,
 };
