@@ -63,6 +63,16 @@ use crate::proto::{
 use prost::Message;
 use std::collections::HashMap;
 
+/// A typed value from a Perfetto debug annotation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DebugAnnotationValue {
+    Uint(u64),
+    Int(i64),
+    Double(f64),
+    String(String),
+    Bool(bool),
+}
+
 /// One completed span from a pftrace, materialised.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Slice {
@@ -70,6 +80,7 @@ pub struct Slice {
     pub thread: String,
     pub ts_ns: u64,
     pub dur_ns: u64,
+    pub debug_annotations: Vec<(String, DebugAnnotationValue)>,
 }
 
 /// Parse a `.pftrace` file into a `Vec<Slice>`.
@@ -142,6 +153,7 @@ pub fn parse(path: &Path) -> Result<Vec<Slice>> {
                         thread,
                         ts_ns: begin_ts,
                         dur_ns: ts.saturating_sub(begin_ts),
+                        debug_annotations: vec![],
                     });
                 }
             } else if event_type == TE::Instant as i32 {
@@ -150,7 +162,8 @@ pub fn parse(path: &Path) -> Result<Vec<Slice>> {
                     .and_then(|pt| thread_names.get(pt))
                     .cloned()
                     .unwrap_or_else(|| "?".to_string());
-                slices.push(Slice { name, thread, ts_ns: ts, dur_ns: 0 });
+                let debug_annotations = collect_debug_annotations(seq, te, &interned_names);
+                slices.push(Slice { name, thread, ts_ns: ts, dur_ns: 0, debug_annotations });
             }
         }
     }
@@ -177,6 +190,37 @@ fn resolve_name(seq: u32, te: &TrackEvent, interned: &HashMap<(u32, u64), String
             .unwrap_or_else(|| format!("<name_iid={}>", iid)),
         None => "<anon>".to_string(),
     }
+}
+
+fn collect_debug_annotations(
+    _seq: u32,
+    te: &TrackEvent,
+    _interned: &HashMap<(u32, u64), String>,
+) -> Vec<(String, DebugAnnotationValue)> {
+    use crate::proto::perfetto_protos::debug_annotation;
+
+    let mut result = Vec::new();
+    for ann in &te.debug_annotations {
+        // Resolve the annotation name.
+        let name = match ann.name_field.as_ref() {
+            Some(debug_annotation::NameField::Name(n)) => n.clone(),
+            Some(debug_annotation::NameField::NameIid(iid)) => format!("<iid={}>", iid),
+            None => continue,
+        };
+        // Extract the value.
+        let value = match ann.value.as_ref() {
+            Some(debug_annotation::Value::UintValue(v)) => DebugAnnotationValue::Uint(*v),
+            Some(debug_annotation::Value::IntValue(v)) => DebugAnnotationValue::Int(*v),
+            Some(debug_annotation::Value::DoubleValue(v)) => DebugAnnotationValue::Double(*v),
+            Some(debug_annotation::Value::BoolValue(v)) => DebugAnnotationValue::Bool(*v),
+            Some(debug_annotation::Value::StringValue(v)) => {
+                DebugAnnotationValue::String(v.clone())
+            }
+            _ => continue,
+        };
+        result.push((name, value));
+    }
+    result
 }
 
 // --- Critical path analysis --------------------------------------------
@@ -224,7 +268,7 @@ pub struct CriticalPathReport {
 /// smallest `ts_ns` across all input slices is treated as time zero. Raw
 /// perfetto timestamps are a platform clock (usually `CLOCK_BOOTTIME` /
 /// `CLOCK_MONOTONIC`) whose absolute value is meaningless outside the run.
-pub fn analyse(slices: &[Slice], registry: &SpanRegistry) -> CriticalPathReport {
+pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) -> CriticalPathReport {
     // Pick the slice with the smallest ts_ns per name. This makes `analyse`
     // correct regardless of the caller's input order — callers aren't
     // required to sort before calling us.
@@ -246,6 +290,31 @@ pub fn analyse(slices: &[Slice], registry: &SpanRegistry) -> CriticalPathReport 
     let rel_ms = |ns: u64| (ns.saturating_sub(t0_ns)) as f64 / 1_000_000.0;
 
     let mut report = CriticalPathReport::default();
+
+    // Synthesize startup::exec_to_anchor from the wallclock anchor event.
+    let anchor = slices.iter().find(|s| s.name == "servoshell::startup_anchor");
+    let anchor_wall_ns = anchor.and_then(|s| {
+        s.debug_annotations.iter().find(|(k, _)| k == "wallclock_ns").and_then(|(_, v)| {
+            match v { DebugAnnotationValue::Uint(n) => Some(*n), _ => None }
+        })
+    });
+    if let (Some(anc), Some(wall_ns)) = (anchor, anchor_wall_ns) {
+        let dur_ms = (wall_ns.saturating_sub(spawn_wall_ns)) as f64 / 1_000_000.0;
+        report.named_spans.insert(0, NamedSpanRow {
+            name: "startup::exec_to_anchor".to_string(),
+            ts_ms: 0.0,
+            dur_ms,
+            thread: "_meta".to_string(),
+        });
+        // Diagnostic: clock-skew check.
+        let skew_ms = (anc.ts_ns as i128 - wall_ns as i128) as f64 / 1_000_000.0;
+        if skew_ms.abs() > 10.0 {
+            eprintln!(
+                "warning: anchor clock skew = {:.2} ms (anchor.ts_ns vs anchor.wallclock_ns)",
+                skew_ms
+            );
+        }
+    }
 
     for phase in &registry.phases {
         if let Some(s) = first_by_name.get(phase.name.as_str()) {
@@ -312,8 +381,10 @@ mod tests {
         assert_eq!(slices[0].thread, "main");
         assert_eq!(slices[0].ts_ns, 100);
         assert_eq!(slices[0].dur_ns, 100);
+        assert!(slices[0].debug_annotations.is_empty());
         assert_eq!(slices[1].name, "FirstContentfulPaint");
         assert_eq!(slices[1].dur_ns, 0);
+        assert!(slices[1].debug_annotations.is_empty());
     }
 
     #[test]
@@ -344,6 +415,7 @@ flag_threshold_ms = 10
             thread: "main".into(),
             ts_ns: (ts_ms * 1_000_000.0) as u64,
             dur_ns: (dur_ms * 1_000_000.0) as u64,
+            debug_annotations: vec![],
         }
     }
 
@@ -367,7 +439,7 @@ flag_threshold_ms = 10
             slice("B", 10.0, 4.0),
             slice("FirstContentfulPaint", 20.0, 0.0),
         ];
-        let r = super::analyse(&slices, &simple_registry());
+        let r = super::analyse(&slices, &simple_registry(), 0);
         assert_eq!(r.named_spans.len(), 2);
         assert_eq!(r.named_spans[0].name, "A");
         assert_eq!(r.named_spans[0].dur_ms, 2.0);
@@ -384,7 +456,7 @@ flag_threshold_ms = 10
     fn analyse_flags_gap_over_threshold() {
         // A ends at 7 ms, B starts at 20 ms → gap = 13 ms, threshold = 10 ms.
         let slices = vec![slice("A", 5.0, 2.0), slice("B", 20.0, 1.0)];
-        let r = super::analyse(&slices, &simple_registry());
+        let r = super::analyse(&slices, &simple_registry(), 0);
         assert_eq!(r.gaps.len(), 1);
         assert_eq!(r.gaps[0].from, "A");
         assert_eq!(r.gaps[0].to, "B");
@@ -395,14 +467,14 @@ flag_threshold_ms = 10
     fn analyse_stays_silent_on_within_threshold_gap() {
         // A ends at 7 ms, B starts at 15 ms → gap = 8 ms < 10 ms.
         let slices = vec![slice("A", 5.0, 2.0), slice("B", 15.0, 1.0)];
-        let r = super::analyse(&slices, &simple_registry());
+        let r = super::analyse(&slices, &simple_registry(), 0);
         assert!(r.gaps.is_empty());
     }
 
     #[test]
     fn analyse_skips_missing_phases() {
         let slices = vec![slice("A", 5.0, 2.0)]; // no B, no FCP
-        let r = super::analyse(&slices, &simple_registry());
+        let r = super::analyse(&slices, &simple_registry(), 0);
         assert_eq!(r.named_spans.len(), 1);
         assert!(r.milestones.is_empty());
         assert!(r.gaps.is_empty());
@@ -417,10 +489,35 @@ flag_threshold_ms = 10
             slice("A", 10.0, 2.0),
             slice("A",  3.0, 1.0),
         ];
-        let r = super::analyse(&slices, &simple_registry());
+        let r = super::analyse(&slices, &simple_registry(), 0);
         assert_eq!(r.named_spans.len(), 1);
         // t0 = 3 ms (the earliest slice); the picked "A" is at 3 ms → relative 0 ms.
         assert_eq!(r.named_spans[0].ts_ms, 0.0, "analyse should pick the earliest occurrence (rebased to t0)");
         assert_eq!(r.named_spans[0].dur_ms, 1.0);
+    }
+
+    #[test]
+    fn analyse_synthesizes_exec_to_anchor_from_wallclock() {
+        let anchor_ts_ns = 1_000_000_000u64;       // trace event at 1.0 s wallclock
+        let anchor_wall_ns = anchor_ts_ns;          // perfetto uses wallclock, so ts == wall
+        let spawn_wall_ns = anchor_wall_ns - 800_000_000;  // spawned 800 ms earlier
+        let slices = vec![
+            Slice {
+                name: "servoshell::startup_anchor".into(),
+                thread: "main".into(),
+                ts_ns: anchor_ts_ns,
+                dur_ns: 0,
+                debug_annotations: vec![
+                    ("wallclock_ns".into(), super::DebugAnnotationValue::Uint(anchor_wall_ns)),
+                ],
+            },
+            slice("FirstContentfulPaint", 1200.0, 0.0),  // later in the trace
+        ];
+        // registry needs "FirstContentfulPaint" — simple_registry has it.
+        let r = super::analyse(&slices, &simple_registry(), spawn_wall_ns);
+        // The synthetic row should be at position 0.
+        assert_eq!(r.named_spans[0].name, "startup::exec_to_anchor");
+        assert!((r.named_spans[0].dur_ms - 800.0).abs() < 0.01);
+        assert_eq!(r.named_spans[0].thread, "_meta");
     }
 }

@@ -111,9 +111,10 @@ fn run_and_record(
     registry: &trace::SpanRegistry,
 ) -> Iteration {
     match runner::run_once(bin, w, iter, out_dir) {
-        Ok(pftrace) => match trace::parse(&pftrace) {
+        Ok(art) => match trace::parse(&art.pftrace) {
             Ok(slices) => {
-                let cp = trace::analyse(&slices, registry);
+                let cp = trace::analyse(&slices, registry, art.spawn_wall_ns);
+                let pftrace = art.pftrace;
                 let mut metrics = BTreeMap::new();
                 if let Some(m) = cp.milestones.iter().find(|m| m.name == "FirstContentfulPaint") {
                     metrics.insert("FirstContentfulPaint".to_string(), m.ts_ms);

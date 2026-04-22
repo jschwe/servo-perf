@@ -31,9 +31,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let mut fcp_samples: Vec<f64> = Vec::new();
     for i in 0..w.iterations {
         match runner::run_once(&args.bin, &w, i, &out_dir) {
-            Ok(pftrace) => {
+            Ok(art) => {
+                let pftrace = art.pftrace;
                 let slices = trace::parse(&pftrace)?;
-                let cp = trace::analyse(&slices, &registry);
+                let cp = trace::analyse(&slices, &registry, art.spawn_wall_ns);
                 let mut metrics = BTreeMap::new();
                 if let Some(m) = cp.milestones.iter().find(|m| m.name == "FirstContentfulPaint") {
                     metrics.insert("FirstContentfulPaint".to_string(), m.ts_ms);

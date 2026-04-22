@@ -18,9 +18,16 @@ pub enum RunError {
     MissingTrace { dir: PathBuf },
 }
 
-/// Run `bin` against `workload` once. Returns the path to the copied
-/// `iter_<iter>.pftrace` under `out_dir`.
-pub fn run_once(bin: &Path, workload: &Workload, iter: u32, out_dir: &Path) -> Result<PathBuf> {
+/// Artifacts from a single servoshell run.
+pub struct RunArtifact {
+    pub pftrace: PathBuf,
+    pub spawn_wall_ns: u64,
+    pub exit_wall_ns: u64,
+}
+
+/// Run `bin` against `workload` once. Returns a [`RunArtifact`] containing
+/// the path to the copied `iter_<iter>.pftrace` and wallclock brackets.
+pub fn run_once(bin: &Path, workload: &Workload, iter: u32, out_dir: &Path) -> Result<RunArtifact> {
     if !bin.is_file() {
         anyhow::bail!(RunError::BinaryNotFound(bin.into()));
     }
@@ -48,7 +55,15 @@ pub fn run_once(bin: &Path, workload: &Workload, iter: u32, out_dir: &Path) -> R
     }
     cmd.arg(&workload.url);
 
+    let spawn_wall_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let output = cmd.output().with_context(|| format!("spawning {}", bin.display()))?;
+    let exit_wall_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     if !output.status.success() {
         let code = output.status.code().unwrap_or(-1);
         let stderr = String::from_utf8_lossy(&output.stderr)
@@ -74,5 +89,5 @@ pub fn run_once(bin: &Path, workload: &Workload, iter: u32, out_dir: &Path) -> R
     })?;
     // Clean up the iteration cwd (but keep the pftrace outside it).
     let _ = fs::remove_dir_all(&iter_cwd);
-    Ok(dest)
+    Ok(RunArtifact { pftrace: dest, spawn_wall_ns, exit_wall_ns })
 }
