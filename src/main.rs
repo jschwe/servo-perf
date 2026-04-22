@@ -4,6 +4,7 @@
 //! See docs/superpowers/specs/2026-04-22-startup-perf-workflow-design.md.
 
 mod workload;
+mod trace;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

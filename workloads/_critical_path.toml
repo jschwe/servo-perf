@@ -1,0 +1,86 @@
+# Critical-path phases for Servo startup to FirstContentfulPaint.
+# Derived from /workspaces/servo-workspace/startup-investigation.md.
+
+[[phase]]
+name = "App::init"
+owner_thread = "main"
+
+[[phase]]
+name = "App::create_platform_window"
+owner_thread = "main"
+
+[[phase]]
+name = "ServoBuilder::build"
+owner_thread = "main"
+
+[[phase]]
+name = "startup::script_init"
+owner_thread = "main"
+
+[[phase]]
+name = "App::open_window"
+owner_thread = "main"
+
+[[phase]]
+name = "create_toplevel_webview"
+owner_thread = "main"
+
+[[phase]]
+name = "handle_new_top_level_browsing_context"
+owner_thread = "Constellation"
+
+[[phase]]
+name = "ScriptThread::bootstrap"
+owner_thread = "Script"
+
+[[phase]]
+name = "ScriptThread::new"
+owner_thread = "Script"
+
+[[phase]]
+name = "ScriptThread::spawn_pipeline"
+owner_thread = "Script"
+
+[[phase]]
+name = "ScriptThread::pre_page_load"
+owner_thread = "Script"
+
+[[phase]]
+name = "ServoParser::finish"
+owner_thread = "Script"
+
+[[phase]]
+name = "FirstPaint"
+owner_thread = "main"
+is_milestone = true
+
+[[phase]]
+name = "FirstContentfulPaint"
+owner_thread = "main"
+is_milestone = true
+
+# Edges whose observed gap we want to flag when it grows. Order matters.
+
+[[edge]]
+from = "App::create_platform_window"
+to = "ServoBuilder::build"
+expected_gap_ms = 0.5
+flag_threshold_ms = 5
+
+[[edge]]
+from = "ServoBuilder::build"
+to = "App::open_window"
+expected_gap_ms = 1
+flag_threshold_ms = 10
+
+[[edge]]
+from = "handle_new_top_level_browsing_context"
+to = "ScriptThread::new"
+expected_gap_ms = 3
+flag_threshold_ms = 15
+
+[[edge]]
+from = "ScriptThread::pre_page_load"
+to = "ServoParser::finish"
+expected_gap_ms = 40
+flag_threshold_ms = 200
