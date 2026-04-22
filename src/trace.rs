@@ -3,10 +3,9 @@
 //! Public API:
 //! - [`parse`] — decodes a `.pftrace` file into a `Vec<Slice>`.
 //! - [`load_registry`] — loads the shared `_critical_path.toml`.
-//! - (Task 6) `analyse` — critical-path attribution, added atop `parse`.
+//! - [`analyse`] — critical-path attribution.
 
 use anyhow::{Context, Result};
-#[allow(unused_imports)]
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -180,6 +179,101 @@ fn resolve_name(seq: u32, te: &TrackEvent, interned: &HashMap<(u32, u64), String
     }
 }
 
+// --- Critical path analysis --------------------------------------------
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct NamedSpanRow {
+    pub name: String,
+    pub ts_ms: f64,
+    pub dur_ms: f64,
+    pub thread: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Milestone {
+    pub name: String,
+    pub ts_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FlaggedGap {
+    pub from: String,
+    pub to: String,
+    pub actual_gap_ms: f64,
+    pub threshold_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
+pub struct CriticalPathReport {
+    pub named_spans: Vec<NamedSpanRow>,
+    pub milestones: Vec<Milestone>,
+    pub gaps: Vec<FlaggedGap>,
+}
+
+/// Produce a critical-path report for the given slices against the registry.
+///
+/// * Named spans: for each phase in the registry, the *first* slice with that
+///   name (by ts) is used. Later duplicates are ignored — startup phases
+///   occur at most once.
+/// * Milestones: phases flagged `is_milestone = true` become standalone
+///   entries (their duration is ignored; only the start time matters).
+/// * Gaps: for each registry edge `from → to`, compute `to.ts_ns -
+///   (from.ts_ns + from.dur_ns)` and flag if above `flag_threshold_ms`.
+pub fn analyse(slices: &[Slice], registry: &SpanRegistry) -> CriticalPathReport {
+    // Pick the slice with the smallest ts_ns per name. This makes `analyse`
+    // correct regardless of the caller's input order — callers aren't
+    // required to sort before calling us.
+    let first_by_name: HashMap<&str, &Slice> =
+        slices.iter().fold(HashMap::new(), |mut acc, s| {
+            acc.entry(s.name.as_str())
+                .and_modify(|existing: &mut &Slice| {
+                    if s.ts_ns < existing.ts_ns {
+                        *existing = s;
+                    }
+                })
+                .or_insert(s);
+            acc
+        });
+
+    let mut report = CriticalPathReport::default();
+
+    for phase in &registry.phases {
+        if let Some(s) = first_by_name.get(phase.name.as_str()) {
+            let ts_ms = s.ts_ns as f64 / 1_000_000.0;
+            let dur_ms = s.dur_ns as f64 / 1_000_000.0;
+            if phase.is_milestone {
+                report.milestones.push(Milestone { name: phase.name.clone(), ts_ms });
+            } else {
+                report.named_spans.push(NamedSpanRow {
+                    name: phase.name.clone(),
+                    ts_ms,
+                    dur_ms,
+                    thread: s.thread.clone(),
+                });
+            }
+        }
+    }
+
+    for edge in &registry.edges {
+        let from = first_by_name.get(edge.from.as_str());
+        let to = first_by_name.get(edge.to.as_str());
+        if let (Some(f), Some(t)) = (from, to) {
+            let gap_ns = t.ts_ns.saturating_sub(f.ts_ns + f.dur_ns);
+            let gap_ms = gap_ns as f64 / 1_000_000.0;
+            if gap_ms > edge.flag_threshold_ms {
+                report.gaps.push(FlaggedGap {
+                    from: edge.from.clone(),
+                    to: edge.to.clone(),
+                    actual_gap_ms: gap_ms,
+                    threshold_ms: edge.flag_threshold_ms,
+                });
+            }
+        }
+    }
+
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +326,86 @@ flag_threshold_ms = 10
         .unwrap();
         let err = load_registry(dir.path()).unwrap_err();
         assert!(err.to_string().contains("undeclared phase"));
+    }
+
+    fn slice(name: &str, ts_ms: f64, dur_ms: f64) -> Slice {
+        Slice {
+            name: name.into(),
+            thread: "main".into(),
+            ts_ns: (ts_ms * 1_000_000.0) as u64,
+            dur_ns: (dur_ms * 1_000_000.0) as u64,
+        }
+    }
+
+    fn simple_registry() -> SpanRegistry {
+        SpanRegistry {
+            phases: vec![
+                Phase { name: "A".into(), owner_thread: "main".into(), is_milestone: false },
+                Phase { name: "B".into(), owner_thread: "main".into(), is_milestone: false },
+                Phase { name: "FirstContentfulPaint".into(), owner_thread: "main".into(), is_milestone: true },
+            ],
+            edges: vec![
+                Edge { from: "A".into(), to: "B".into(), expected_gap_ms: 1.0, flag_threshold_ms: 10.0 },
+            ],
+        }
+    }
+
+    #[test]
+    fn analyse_produces_named_spans_and_milestones() {
+        let slices = vec![
+            slice("A", 5.0, 2.0),
+            slice("B", 10.0, 4.0),
+            slice("FirstContentfulPaint", 20.0, 0.0),
+        ];
+        let r = super::analyse(&slices, &simple_registry());
+        assert_eq!(r.named_spans.len(), 2);
+        assert_eq!(r.named_spans[0].name, "A");
+        assert_eq!(r.named_spans[0].dur_ms, 2.0);
+        assert_eq!(r.milestones.len(), 1);
+        assert_eq!(r.milestones[0].name, "FirstContentfulPaint");
+        assert_eq!(r.milestones[0].ts_ms, 20.0);
+    }
+
+    #[test]
+    fn analyse_flags_gap_over_threshold() {
+        // A ends at 7 ms, B starts at 20 ms → gap = 13 ms, threshold = 10 ms.
+        let slices = vec![slice("A", 5.0, 2.0), slice("B", 20.0, 1.0)];
+        let r = super::analyse(&slices, &simple_registry());
+        assert_eq!(r.gaps.len(), 1);
+        assert_eq!(r.gaps[0].from, "A");
+        assert_eq!(r.gaps[0].to, "B");
+        assert!((r.gaps[0].actual_gap_ms - 13.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn analyse_stays_silent_on_within_threshold_gap() {
+        // A ends at 7 ms, B starts at 15 ms → gap = 8 ms < 10 ms.
+        let slices = vec![slice("A", 5.0, 2.0), slice("B", 15.0, 1.0)];
+        let r = super::analyse(&slices, &simple_registry());
+        assert!(r.gaps.is_empty());
+    }
+
+    #[test]
+    fn analyse_skips_missing_phases() {
+        let slices = vec![slice("A", 5.0, 2.0)]; // no B, no FCP
+        let r = super::analyse(&slices, &simple_registry());
+        assert_eq!(r.named_spans.len(), 1);
+        assert!(r.milestones.is_empty());
+        assert!(r.gaps.is_empty());
+    }
+
+    #[test]
+    fn analyse_picks_smallest_ts_when_duplicates_exist() {
+        // Two slices named "A" — the later-in-vec one has earlier ts_ns.
+        // The analyser should pick the earliest by ts, not the first in
+        // iteration order.
+        let slices = vec![
+            slice("A", 10.0, 2.0),
+            slice("A",  3.0, 1.0),
+        ];
+        let r = super::analyse(&slices, &simple_registry());
+        assert_eq!(r.named_spans.len(), 1);
+        assert_eq!(r.named_spans[0].ts_ms, 3.0, "analyse should pick the earliest occurrence");
+        assert_eq!(r.named_spans[0].dur_ms, 1.0);
     }
 }
