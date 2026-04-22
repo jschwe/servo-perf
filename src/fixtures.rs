@@ -15,6 +15,7 @@ pub struct FixtureHandle {
 }
 
 impl FixtureHandle {
+    #[cfg(test)]
     pub fn port(&self) -> u16 {
         self.port
     }

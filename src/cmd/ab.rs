@@ -59,6 +59,17 @@ pub fn run(args: AbArgs) -> Result<()> {
         }
     }
 
+    // Abort if either config had too many failed iterations — the report
+    // would otherwise be a misleading near-empty summary.
+    for (label, iters) in [("base", &base_iters), ("patch", &patch_iters)] {
+        let ok = iters.iter().filter(|i| matches!(i.status, IterationStatus::Ok { .. })).count();
+        anyhow::ensure!(
+            2 * ok >= iters.len(),
+            "{label}: more than 50% of iterations failed ({}/{}); aborting",
+            iters.len() - ok, iters.len()
+        );
+    }
+
     // Summaries + deltas.
     let base_summary = single_summary("FirstContentfulPaint", &base_fcp);
     let patch_summary = single_summary("FirstContentfulPaint", &patch_fcp);
