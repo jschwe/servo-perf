@@ -9,6 +9,10 @@ description = "Servo startup-performance measurement tool"
 name = "servoperf"
 path = "src/main.rs"
 
+[[bin]]
+name = "fixture_server"
+path = "src/bin/fixture_server.rs"
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -32,3 +36,4 @@ prost-build = "0.13"
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

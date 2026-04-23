@@ -1,7 +1,17 @@
 use std::path::{Path, PathBuf};
-use anyhow::Context;
+use std::sync::Arc;
 
-#[derive(Debug, PartialEq)]
+use anyhow::Context;
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::service::service_fn;
+use hyper::{Request, Response};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum Mode {
     Http1,
     Http2,
@@ -37,18 +47,136 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     Ok(Args { mode, port, doc_root })
 }
 
-fn main() {
-    let argv: Vec<String> = std::env::args().collect();
-    match parse_args(&argv[1..]) {
-        Ok(_args) => {
-            eprintln!("fixture_server: parse_args ok but serving not yet implemented");
-            std::process::exit(1);
+fn resolve_safe_path(doc_root: &Path, req_path: &str) -> Result<PathBuf, u16> {
+    let relative = if req_path == "/" {
+        "index.html"
+    } else {
+        req_path.strip_prefix('/').ok_or(400u16)?
+    };
+    if relative.is_empty() || relative.starts_with('/') {
+        return Err(400);
+    }
+    for seg in relative.split('/') {
+        if seg.is_empty() || seg == ".." || seg == "." {
+            return Err(400);
         }
+    }
+    let candidate = doc_root.join(relative);
+    if let Ok(canon_target) = candidate.canonicalize() {
+        let canon_root = doc_root.canonicalize().map_err(|_| 500u16)?;
+        if !canon_target.starts_with(&canon_root) {
+            return Err(400);
+        }
+        return Ok(canon_target);
+    }
+    Ok(candidate)
+}
+
+fn content_type_for(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "html" => "text/html",
+        "css" => "text/css",
+        "js" => "application/javascript",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+fn build_tls_config(cert_path: &Path, key_path: &Path, mode: Mode) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let cert_file = File::open(cert_path)
+        .with_context(|| format!("opening cert file {}", cert_path.display()))?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<_, _>>()
+        .context("parsing cert PEM")?;
+    anyhow::ensure!(!certs.is_empty(), "no certificates found in {}", cert_path.display());
+
+    let key_file = File::open(key_path)
+        .with_context(|| format!("opening key file {}", key_path.display()))?;
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .context("parsing key PEM")?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("building rustls ServerConfig")?;
+    config.alpn_protocols = match mode {
+        Mode::Http1 => vec![b"http/1.1".to_vec()],
+        Mode::Http2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    };
+    Ok(Arc::new(config))
+}
+
+async fn serve(
+    _req: Request<Incoming>,
+    _doc_root: Arc<PathBuf>,
+) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    // Scaffolding — Task 9 replaces with real file serving.
+    Ok(Response::builder()
+        .status(200)
+        .body(Full::new(Bytes::from_static(b"scaffolding")))
+        .unwrap())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("failed to install default crypto provider"))?;
+
+    let argv: Vec<String> = std::env::args().collect();
+    let args = match parse_args(&argv[1..]) {
+        Ok(a) => a,
         Err(msg) => {
             eprintln!("{msg}");
             eprintln!("usage: fixture_server --mode=http1|http2 <port> <doc_root>");
             std::process::exit(2);
         }
+    };
+
+    let cert_path = args.doc_root.join("..").join("cert.pem");
+    let key_path = args.doc_root.join("..").join("key.pem");
+    let tls_config = build_tls_config(&cert_path, &key_path, args.mode)?;
+    let acceptor = TlsAcceptor::from(tls_config);
+
+    let listener = TcpListener::bind(("127.0.0.1", args.port))
+        .await
+        .with_context(|| format!("binding 127.0.0.1:{}", args.port))?;
+    let doc_root = Arc::new(args.doc_root);
+    let mode_str = if args.mode == Mode::Http1 { "http1" } else { "http2" };
+    println!(
+        "listening on https://127.0.0.1:{}/ doc_root={} mode={mode_str}",
+        args.port,
+        doc_root.display()
+    );
+
+    loop {
+        let (tcp, _peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let doc_root = Arc::clone(&doc_root);
+        tokio::spawn(async move {
+            let Ok(tls) = acceptor.accept(tcp).await else {
+                return;
+            };
+            let io = TokioIo::new(tls);
+            let _ = auto::Builder::new(TokioExecutor::new())
+                .serve_connection(io, service_fn(move |req| {
+                    let doc_root = Arc::clone(&doc_root);
+                    async move { serve(req, doc_root).await }
+                }))
+                .await;
+        });
     }
 }
 
@@ -103,31 +231,6 @@ mod arg_tests {
     }
 }
 
-fn resolve_safe_path(doc_root: &Path, req_path: &str) -> Result<PathBuf, u16> {
-    let relative = if req_path == "/" {
-        "index.html"
-    } else {
-        req_path.strip_prefix('/').ok_or(400u16)?
-    };
-    if relative.is_empty() || relative.starts_with('/') {
-        return Err(400);
-    }
-    for seg in relative.split('/') {
-        if seg.is_empty() || seg == ".." || seg == "." {
-            return Err(400);
-        }
-    }
-    let candidate = doc_root.join(relative);
-    if let Ok(canon_target) = candidate.canonicalize() {
-        let canon_root = doc_root.canonicalize().map_err(|_| 500u16)?;
-        if !canon_target.starts_with(&canon_root) {
-            return Err(400);
-        }
-        return Ok(canon_target);
-    }
-    Ok(candidate)
-}
-
 #[cfg(test)]
 mod path_happy_tests {
     use super::*;
@@ -164,8 +267,6 @@ mod path_happy_tests {
 
     #[test]
     fn nonexistent_file_still_returns_ok_path() {
-        // Safety check passes when the parent dir is under doc_root, even if
-        // the file itself is missing; the file-read step will return 404.
         let tmp = tempdir().unwrap();
         let got = resolve_safe_path(tmp.path(), "/does-not-exist").unwrap();
         assert_eq!(got, tmp.path().join("does-not-exist"));
@@ -193,7 +294,6 @@ mod path_rejection_tests {
 
     #[test]
     fn rejects_double_slash_absolute_hijack() {
-        // After strip_prefix('/'), this starts with "/etc/passwd", which is absolute.
         let tmp = tempdir().unwrap();
         let err = resolve_safe_path(tmp.path(), "//etc/passwd").unwrap_err();
         assert_eq!(err, 400);
@@ -201,7 +301,6 @@ mod path_rejection_tests {
 
     #[test]
     fn rejects_single_dot_segment() {
-        // Disallow "./x" as a belt-and-braces check — no workload needs it.
         let tmp = tempdir().unwrap();
         let err = resolve_safe_path(tmp.path(), "/./simple.html").unwrap_err();
         assert_eq!(err, 400);
@@ -219,27 +318,10 @@ mod path_rejection_tests {
     fn rejects_symlink_escape() {
         use std::os::unix::fs::symlink;
         let tmp = tempdir().unwrap();
-        // doc_root/escape -> /etc  (target must exist for canonicalize to succeed)
         symlink("/etc", tmp.path().join("escape")).unwrap();
+        // If /etc/hostname doesn't exist on this host, substitute any readable file under /etc.
         let err = resolve_safe_path(tmp.path(), "/escape/hostname").unwrap_err();
         assert_eq!(err, 400);
-    }
-}
-
-fn content_type_for(path: &Path) -> &'static str {
-    let ext = path
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "html" => "text/html",
-        "css" => "text/css",
-        "js" => "application/javascript",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "ico" => "image/x-icon",
-        _ => "application/octet-stream",
     }
 }
 
@@ -248,78 +330,30 @@ mod mime_tests {
     use super::*;
 
     #[test]
-    fn html() {
-        assert_eq!(content_type_for(Path::new("x.html")), "text/html");
-    }
-
+    fn html() { assert_eq!(content_type_for(Path::new("x.html")), "text/html"); }
     #[test]
-    fn css() {
-        assert_eq!(content_type_for(Path::new("x.css")), "text/css");
-    }
-
+    fn css()  { assert_eq!(content_type_for(Path::new("x.css")),  "text/css"); }
     #[test]
-    fn js() {
-        assert_eq!(content_type_for(Path::new("x.js")), "application/javascript");
-    }
-
+    fn js()   { assert_eq!(content_type_for(Path::new("x.js")),   "application/javascript"); }
     #[test]
-    fn png() {
-        assert_eq!(content_type_for(Path::new("img.png")), "image/png");
-    }
-
+    fn png()  { assert_eq!(content_type_for(Path::new("img.png")),"image/png"); }
     #[test]
     fn jpg_and_jpeg() {
-        assert_eq!(content_type_for(Path::new("a.jpg")), "image/jpeg");
+        assert_eq!(content_type_for(Path::new("a.jpg")),  "image/jpeg");
         assert_eq!(content_type_for(Path::new("a.jpeg")), "image/jpeg");
     }
-
     #[test]
-    fn ico() {
-        assert_eq!(content_type_for(Path::new("a.ico")), "image/x-icon");
-    }
-
+    fn ico()  { assert_eq!(content_type_for(Path::new("a.ico")),  "image/x-icon"); }
     #[test]
     fn case_insensitive() {
         assert_eq!(content_type_for(Path::new("a.HTML")), "text/html");
-        assert_eq!(content_type_for(Path::new("a.PNG")), "image/png");
+        assert_eq!(content_type_for(Path::new("a.PNG")),  "image/png");
     }
-
     #[test]
     fn unknown_falls_back_to_octet_stream() {
         assert_eq!(content_type_for(Path::new("a.bin")), "application/octet-stream");
         assert_eq!(content_type_for(Path::new("noext")), "application/octet-stream");
     }
-}
-
-use std::sync::Arc;
-
-fn build_tls_config(cert_path: &Path, key_path: &Path, mode: Mode) -> anyhow::Result<Arc<rustls::ServerConfig>> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use std::fs::File;
-    use std::io::BufReader;
-
-    let cert_file = File::open(cert_path)
-        .with_context(|| format!("opening cert file {}", cert_path.display()))?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<Result<_, _>>()
-        .context("parsing cert PEM")?;
-    anyhow::ensure!(!certs.is_empty(), "no certificates found in {}", cert_path.display());
-
-    let key_file = File::open(key_path)
-        .with_context(|| format!("opening key file {}", key_path.display()))?;
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .context("parsing key PEM")?
-        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
-
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("building rustls ServerConfig")?;
-    config.alpn_protocols = match mode {
-        Mode::Http1 => vec![b"http/1.1".to_vec()],
-        Mode::Http2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-    };
-    Ok(Arc::new(config))
 }
 
 #[cfg(test)]
@@ -355,10 +389,7 @@ mod tls_tests {
         install_provider();
         let (cert, key) = fixture_paths();
         let cfg = build_tls_config(&cert, &key, Mode::Http2).unwrap();
-        assert_eq!(
-            cfg.alpn_protocols,
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
+        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
     #[test]
