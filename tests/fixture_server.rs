@@ -156,3 +156,11 @@ async fn http1_root_serves_index_html() {
     let body = resp.bytes().await.unwrap();
     assert_eq!(body.as_ref(), expected.as_slice());
 }
+
+#[tokio::test]
+async fn http1_post_returns_405() {
+    let srv = spawn("http1", &www_dir());
+    let url = format!("https://127.0.0.1:{}/simple.html", srv.port);
+    let resp = client().post(&url).body("payload").send().await.unwrap();
+    assert_eq!(resp.status(), 405);
+}
