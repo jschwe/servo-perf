@@ -212,4 +212,15 @@ mod path_rejection_tests {
         let err = resolve_safe_path(tmp.path(), "no-slash").unwrap_err();
         assert_eq!(err, 400);
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        // doc_root/escape -> /etc  (target must exist for canonicalize to succeed)
+        symlink("/etc", tmp.path().join("escape")).unwrap();
+        let err = resolve_safe_path(tmp.path(), "/escape/hostname").unwrap_err();
+        assert_eq!(err, 400);
+    }
 }
