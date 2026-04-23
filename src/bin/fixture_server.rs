@@ -38,7 +38,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    match parse_args(&argv[1..].to_vec()) {
+    match parse_args(&argv[1..]) {
         Ok(_args) => {
             eprintln!("fixture_server: parse_args ok but serving not yet implemented");
             std::process::exit(1);
