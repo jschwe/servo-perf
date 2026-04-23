@@ -144,3 +144,15 @@ async fn http1_head_returns_empty_body_and_correct_content_length() {
     let body = resp.bytes().await.unwrap();
     assert_eq!(body.len(), 0);
 }
+
+#[tokio::test]
+async fn http1_root_serves_index_html() {
+    let srv = spawn("http1", &www_dir());
+    let url = format!("https://127.0.0.1:{}/", srv.port);
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "text/html");
+    let expected = std::fs::read(www_dir().join("index.html")).unwrap();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), expected.as_slice());
+}
