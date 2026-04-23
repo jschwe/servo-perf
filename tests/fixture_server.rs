@@ -74,8 +74,31 @@ fn client() -> reqwest::Client {
 
 #[tokio::test]
 async fn http1_scaffolding_responds_200() {
+    // Any valid static file returns 200; this proves the accept loop,
+    // TLS handshake, and file-serving wire together.
     let srv = spawn("http1", &www_dir());
-    let url = format!("https://127.0.0.1:{}/anything", srv.port);
+    let url = format!("https://127.0.0.1:{}/simple.html", srv.port);
     let resp = client().get(&url).send().await.unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn http1_serves_simple_html() {
+    let srv = spawn("http1", &www_dir());
+    let url = format!("https://127.0.0.1:{}/simple.html", srv.port);
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "text/html");
+    let expected = std::fs::read(www_dir().join("simple.html")).unwrap();
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), expected.as_slice());
+}
+
+#[tokio::test]
+async fn http1_serves_png_with_correct_content_type() {
+    let srv = spawn("http1", &www_dir());
+    let url = format!("https://127.0.0.1:{}/img1.png", srv.port);
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
 }

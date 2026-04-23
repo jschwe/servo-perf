@@ -119,14 +119,50 @@ fn build_tls_config(cert_path: &Path, key_path: &Path, mode: Mode) -> anyhow::Re
 }
 
 async fn serve(
-    _req: Request<Incoming>,
-    _doc_root: Arc<PathBuf>,
+    req: Request<Incoming>,
+    doc_root: Arc<PathBuf>,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    // Scaffolding — Task 9 replaces with real file serving.
-    Ok(Response::builder()
-        .status(200)
-        .body(Full::new(Bytes::from_static(b"scaffolding")))
-        .unwrap())
+    let method = req.method().clone();
+    let uri_path = req.uri().path().to_string();
+
+    if method != hyper::Method::GET {
+        return Ok(status_response(405, Bytes::new()));
+    }
+
+    let resolved = match resolve_safe_path(&doc_root, &uri_path) {
+        Ok(p) => p,
+        Err(code) => return Ok(status_response(code, Bytes::new())),
+    };
+
+    match tokio::fs::read(&resolved).await {
+        Ok(bytes) => {
+            let ct = content_type_for(&resolved);
+            let body_len = bytes.len();
+            let resp = Response::builder()
+                .status(200)
+                .header("content-type", ct)
+                .header("content-length", body_len.to_string())
+                .body(Full::new(Bytes::from(bytes)))
+                .unwrap();
+            Ok(resp)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(status_response(404, Bytes::from_static(b"nf")))
+        }
+        Err(e) => {
+            eprintln!("serve: IO error reading {}: {e}", resolved.display());
+            Ok(status_response(500, Bytes::new()))
+        }
+    }
+}
+
+fn status_response(code: u16, body: Bytes) -> Response<Full<Bytes>> {
+    let body_len = body.len();
+    Response::builder()
+        .status(code)
+        .header("content-length", body_len.to_string())
+        .body(Full::new(body))
+        .unwrap()
 }
 
 #[tokio::main]
