@@ -51,26 +51,38 @@ pub fn spawn(workloads_dir: &Path, fx: &Fixture) -> Result<FixtureHandle> {
         .status()
         .context("running gen_cert.sh")?;
 
-    let child = match fx.kind {
-        FixtureKind::Http1 => Command::new("python3")
-            .arg(fixtures_dir.join("https_server.py"))
-            .arg(fx.port.to_string())
-            .arg(&doc_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawning python3 https_server.py")?,
-        FixtureKind::Http2 => Command::new("node")
-            .arg(fixtures_dir.join("h2_server.js"))
-            .arg(fx.port.to_string())
-            .arg(&doc_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawning node h2_server.js")?,
+    let exe = std::env::current_exe().context("resolving current exe")?;
+    let exe_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("servoperf binary has no parent directory"))?;
+    let candidates = [
+        exe_dir.join("fixture_server"),
+        exe_dir.join("..").join("fixture_server"),
+    ];
+    let fixture_server_bin = candidates
+        .iter()
+        .find(|p| p.is_file())
+        .cloned()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "fixture_server binary not found; searched {:?}",
+                candidates,
+            )
+        })?;
+
+    let mode = match fx.kind {
+        FixtureKind::Http1 => "http1",
+        FixtureKind::Http2 => "http2",
     };
+    let child = Command::new(&fixture_server_bin)
+        .arg(format!("--mode={mode}"))
+        .arg(fx.port.to_string())
+        .arg(&doc_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning fixture_server")?;
 
     // Wait until the port accepts a TCP connection, with a 3 s timeout.
     let deadline = Instant::now() + Duration::from_secs(3);
