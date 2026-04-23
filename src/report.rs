@@ -180,21 +180,74 @@ fn render_markdown(data: &RunResults) -> String {
                 writeln!(s, "| phase | thread | ts (ms) | dur (ms) | flag |").unwrap();
                 writeln!(s, "|---|---|---:|---:|---|").unwrap();
                 // Collect all rows (named spans + milestones) sorted by ts_ms.
-                let mut rows: Vec<(String, String, f64, Option<f64>)> = Vec::new();
+                // Each row carries (name, thread, ts_ms, dur_ms, count, is_milestone).
+                let mut rows: Vec<(String, String, f64, Option<f64>, Option<u32>, bool)> =
+                    Vec::new();
                 for span in &critical_path.named_spans {
-                    rows.push((span.name.clone(), span.thread.clone(), span.ts_ms, Some(span.dur_ms)));
+                    rows.push((
+                        span.name.clone(),
+                        span.thread.clone(),
+                        span.ts_ms,
+                        Some(span.dur_ms),
+                        span.count,
+                        false,
+                    ));
                 }
                 for ms in &critical_path.milestones {
-                    rows.push((ms.name.clone(), "main".to_string(), ms.ts_ms, None));
+                    rows.push((
+                        ms.name.clone(),
+                        "main".to_string(),
+                        ms.ts_ms,
+                        None,
+                        None,
+                        true,
+                    ));
                 }
                 rows.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
-                for (phase, thread, ts, dur) in rows {
+
+                // Interleave `_gap_` rows between consecutive phase rows when
+                // there is meaningful unaccounted time (≥ 1 ms) between the
+                // end of one phase and the start of the next. This gives a
+                // continuous chronological view from 0 to FCP instead of
+                // leaving the gaps implicit.
+                const GAP_THRESHOLD_MS: f64 = 1.0;
+                let mut prev_end: Option<f64> = None;
+                for (phase, thread, ts, dur, count, is_ms) in rows {
+                    if let Some(end) = prev_end {
+                        let gap = ts - end;
+                        if gap >= GAP_THRESHOLD_MS {
+                            writeln!(
+                                s,
+                                "| _gap_ |  | {:.1} | {:.1} |  |",
+                                end, gap
+                            ).unwrap();
+                        }
+                    }
                     let dur_str = match dur {
-                        Some(d) => format!("{:.1}", d),
+                        Some(d) => match count {
+                            Some(n) => format!("{:.1} (×{})", d, n),
+                            None => format!("{:.1}", d),
+                        },
                         None => String::new(),
                     };
-                    let flag = if dur.is_none() { "milestone" } else { "" };
-                    writeln!(s, "| {} | {} | {:.1} | {} | {} |", phase, thread, ts, dur_str, flag).unwrap();
+                    let flag = if is_ms { "milestone" } else { "" };
+                    writeln!(
+                        s,
+                        "| {} | {} | {:.1} | {} | {} |",
+                        phase, thread, ts, dur_str, flag
+                    ).unwrap();
+                    // An aggregated row's `ts + dur` is meaningless as a
+                    // chronology bound (the N occurrences are scattered, not
+                    // contiguous). Only advance `prev_end` for single-span
+                    // rows; otherwise just carry the prior boundary forward.
+                    if let Some(d) = dur {
+                        if count.is_none() {
+                            prev_end = Some(ts + d);
+                        }
+                    } else {
+                        // Milestones have no duration; treat as points.
+                        prev_end = Some(ts);
+                    }
                 }
             }
         } else {

@@ -15,6 +15,13 @@ pub struct Phase {
     pub owner_thread: String,
     #[serde(default)]
     pub is_milestone: bool,
+    /// If true, `analyse()` sums the durations of every span matching
+    /// `(name, owner_thread)` within the startup-to-FCP window and reports
+    /// the total plus a count of occurrences. Use for spans that fire many
+    /// times per run (e.g. `perform_updates`, each render turn) where the
+    /// first-occurrence value is uninformative.
+    #[serde(default)]
+    pub aggregate: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -231,6 +238,10 @@ pub struct NamedSpanRow {
     pub ts_ms: f64,
     pub dur_ms: f64,
     pub thread: String,
+    /// `Some(n)` for aggregated phases (sum of `n` occurrences in
+    /// the [startup, FCP] window); `None` for ordinary single-span rows.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -313,6 +324,7 @@ pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) ->
             ts_ms: 0.0,
             dur_ms,
             thread: "_meta".to_string(),
+            count: None,
         });
         // Diagnostic: clock-skew check.
         let skew_ms = (anc.ts_ns as i128 - wall_ns as i128) as f64 / 1_000_000.0;
@@ -324,7 +336,41 @@ pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) ->
         }
     }
 
+    // For aggregated phases we clamp the accumulation window to FCP so
+    // post-paint frames don't inflate the total. If FCP is not in the
+    // trace, sum everything — the caller gets an upper bound instead of
+    // silently wrong data.
+    let fcp_cutoff_ns: Option<u64> = slices
+        .iter()
+        .filter(|s| s.name == "FirstContentfulPaint")
+        .map(|s| s.ts_ns)
+        .min();
+
     for phase in &registry.phases {
+        if phase.aggregate && !phase.is_milestone {
+            // Sum every matching (name, thread) span up to FCP.
+            let matches: Vec<&Slice> = slices
+                .iter()
+                .filter(|s| {
+                    s.name == phase.name
+                        && s.thread == phase.owner_thread
+                        && fcp_cutoff_ns.map_or(true, |cut| s.ts_ns <= cut)
+                })
+                .collect();
+            if matches.is_empty() {
+                continue;
+            }
+            let first_ts_ns = matches.iter().map(|s| s.ts_ns).min().unwrap();
+            let total_dur_ns: u64 = matches.iter().map(|s| s.dur_ns).sum();
+            report.named_spans.push(NamedSpanRow {
+                name: phase.name.clone(),
+                ts_ms: rel_ms(first_ts_ns),
+                dur_ms: total_dur_ns as f64 / 1_000_000.0,
+                thread: phase.owner_thread.clone(),
+                count: Some(matches.len() as u32),
+            });
+            continue;
+        }
         if let Some(s) = first_by_name.get(phase.name.as_str()) {
             let ts_ms = rel_ms(s.ts_ns);
             let dur_ms = s.dur_ns as f64 / 1_000_000.0;
@@ -336,6 +382,7 @@ pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) ->
                     ts_ms,
                     dur_ms,
                     thread: s.thread.clone(),
+                    count: None,
                 });
             }
         }
@@ -431,9 +478,9 @@ flag_threshold_ms = 10
     fn simple_registry() -> SpanRegistry {
         SpanRegistry {
             phases: vec![
-                Phase { name: "A".into(), owner_thread: "main".into(), is_milestone: false },
-                Phase { name: "B".into(), owner_thread: "main".into(), is_milestone: false },
-                Phase { name: "FirstContentfulPaint".into(), owner_thread: "main".into(), is_milestone: true },
+                Phase { name: "A".into(), owner_thread: "main".into(), is_milestone: false, aggregate: false },
+                Phase { name: "B".into(), owner_thread: "main".into(), is_milestone: false, aggregate: false },
+                Phase { name: "FirstContentfulPaint".into(), owner_thread: "main".into(), is_milestone: true, aggregate: false },
             ],
             edges: vec![
                 Edge { from: "A".into(), to: "B".into(), expected_gap_ms: 1.0, flag_threshold_ms: 10.0 },

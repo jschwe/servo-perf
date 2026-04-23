@@ -41,6 +41,29 @@ name = "pre_page_load"
 owner_thread = "Script"
 
 [[phase]]
+name = "ServoParser::finish"
+owner_thread = "Script"
+
+[[phase]]
+name = "Window::reflow"
+owner_thread = "Script"
+
+[[phase]]
+# perform_updates fires on every main-thread turn (~once per 5 ms),
+# so the first-occurrence value is uninformative. Sum all turns in
+# the [startup, FCP] window to get total main-thread paint/update time.
+name = "perform_updates"
+owner_thread = "main"
+aggregate = true
+
+[[phase]]
+# render() runs inside perform_updates when the frame needs to be
+# repainted. Aggregating gives total WebRender + GL time pre-FCP.
+name = "render"
+owner_thread = "main"
+aggregate = true
+
+[[phase]]
 name = "FirstPaint"
 owner_thread = "main"
 is_milestone = true
@@ -72,6 +95,18 @@ flag_threshold_ms = 15
 
 [[edge]]
 from = "pre_page_load"
-to = "FirstPaint"
+to = "ServoParser::finish"
 expected_gap_ms = 40
 flag_threshold_ms = 200
+
+[[edge]]
+from = "ServoParser::finish"
+to = "Window::reflow"
+expected_gap_ms = 1
+flag_threshold_ms = 20
+
+[[edge]]
+from = "Window::reflow"
+to = "FirstPaint"
+expected_gap_ms = 40
+flag_threshold_ms = 120
