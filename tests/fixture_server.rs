@@ -102,3 +102,13 @@ async fn http1_serves_png_with_correct_content_type() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
 }
+
+#[tokio::test]
+async fn http2_serves_simple_html_over_h2() {
+    let srv = spawn("http2", &www_dir());
+    let url = format!("https://127.0.0.1:{}/simple.html", srv.port);
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.version(), reqwest::Version::HTTP_2);
+    assert_eq!(resp.headers().get("content-type").unwrap(), "text/html");
+}
