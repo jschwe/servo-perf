@@ -108,10 +108,15 @@ fn resolve_safe_path(doc_root: &Path, req_path: &str) -> Result<PathBuf, u16> {
     } else {
         req_path.strip_prefix('/').ok_or(400u16)?
     };
+    if relative.is_empty() || relative.starts_with('/') {
+        return Err(400);
+    }
+    for seg in relative.split('/') {
+        if seg.is_empty() || seg == ".." || seg == "." {
+            return Err(400);
+        }
+    }
     let candidate = doc_root.join(relative);
-    // If the target exists, canonicalise and verify it still lives under
-    // doc_root — catches symlink escapes (Task 5). If it doesn't exist,
-    // pass the candidate through; the file-read step will return 404.
     if let Ok(canon_target) = candidate.canonicalize() {
         let canon_root = doc_root.canonicalize().map_err(|_| 500u16)?;
         if !canon_target.starts_with(&canon_root) {
@@ -163,5 +168,48 @@ mod path_happy_tests {
         let tmp = tempdir().unwrap();
         let got = resolve_safe_path(tmp.path(), "/does-not-exist").unwrap();
         assert_eq!(got, tmp.path().join("does-not-exist"));
+    }
+}
+
+#[cfg(test)]
+mod path_rejection_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn rejects_dot_dot_segment() {
+        let tmp = tempdir().unwrap();
+        let err = resolve_safe_path(tmp.path(), "/../Cargo.toml").unwrap_err();
+        assert_eq!(err, 400);
+    }
+
+    #[test]
+    fn rejects_dot_dot_nested() {
+        let tmp = tempdir().unwrap();
+        let err = resolve_safe_path(tmp.path(), "/sub/../../escape").unwrap_err();
+        assert_eq!(err, 400);
+    }
+
+    #[test]
+    fn rejects_double_slash_absolute_hijack() {
+        // After strip_prefix('/'), this starts with "/etc/passwd", which is absolute.
+        let tmp = tempdir().unwrap();
+        let err = resolve_safe_path(tmp.path(), "//etc/passwd").unwrap_err();
+        assert_eq!(err, 400);
+    }
+
+    #[test]
+    fn rejects_single_dot_segment() {
+        // Disallow "./x" as a belt-and-braces check — no workload needs it.
+        let tmp = tempdir().unwrap();
+        let err = resolve_safe_path(tmp.path(), "/./simple.html").unwrap_err();
+        assert_eq!(err, 400);
+    }
+
+    #[test]
+    fn rejects_missing_leading_slash() {
+        let tmp = tempdir().unwrap();
+        let err = resolve_safe_path(tmp.path(), "no-slash").unwrap_err();
+        assert_eq!(err, 400);
     }
 }
