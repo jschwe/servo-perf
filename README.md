@@ -12,7 +12,7 @@ cargo build --release
 
 ## Prerequisites
 
-- `python3` (HTTP/1.1 fixture), `node` (HTTP/2 fixture), `openssl` (TLS cert gen).
+- `openssl` (TLS cert gen, used by the built-in fixture server).
 - A prebuilt `servoshell` with the `tracing-perfetto` feature enabled. **Build from servo's upstream `main`** — patched feature worktrees will bias the results.
 
 ## Examples
