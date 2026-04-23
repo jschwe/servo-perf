@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, PartialEq)]
 enum Mode {
@@ -99,5 +99,69 @@ mod arg_tests {
         let err = parse_args(&argv(&["--mode=http1", "4443"])).unwrap_err();
         assert!(err.to_lowercase().contains("usage") || err.to_lowercase().contains("expected"),
                 "got: {err}");
+    }
+}
+
+fn resolve_safe_path(doc_root: &Path, req_path: &str) -> Result<PathBuf, u16> {
+    let relative = if req_path == "/" {
+        "index.html"
+    } else {
+        req_path.strip_prefix('/').ok_or(400u16)?
+    };
+    let candidate = doc_root.join(relative);
+    // If the target exists, canonicalise and verify it still lives under
+    // doc_root — catches symlink escapes (Task 5). If it doesn't exist,
+    // pass the candidate through; the file-read step will return 404.
+    if let Ok(canon_target) = candidate.canonicalize() {
+        let canon_root = doc_root.canonicalize().map_err(|_| 500u16)?;
+        if !canon_target.starts_with(&canon_root) {
+            return Err(400);
+        }
+        return Ok(canon_target);
+    }
+    Ok(candidate)
+}
+
+#[cfg(test)]
+mod path_happy_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn root_resolves_to_index_html() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("index.html"), b"<html></html>").unwrap();
+        let got = resolve_safe_path(tmp.path(), "/").unwrap();
+        assert_eq!(got, tmp.path().canonicalize().unwrap().join("index.html"));
+    }
+
+    #[test]
+    fn simple_file_resolves() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("simple.html"), b"hi").unwrap();
+        let got = resolve_safe_path(tmp.path(), "/simple.html").unwrap();
+        assert_eq!(got, tmp.path().canonicalize().unwrap().join("simple.html"));
+    }
+
+    #[test]
+    fn subdir_file_resolves() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/a.css"), b"body{}").unwrap();
+        let got = resolve_safe_path(tmp.path(), "/sub/a.css").unwrap();
+        assert_eq!(
+            got,
+            tmp.path().canonicalize().unwrap().join("sub").join("a.css"),
+        );
+    }
+
+    #[test]
+    fn nonexistent_file_still_returns_ok_path() {
+        // Safety check passes when the parent dir is under doc_root, even if
+        // the file itself is missing; the file-read step will return 404.
+        let tmp = tempdir().unwrap();
+        let got = resolve_safe_path(tmp.path(), "/does-not-exist").unwrap();
+        assert_eq!(got, tmp.path().join("does-not-exist"));
     }
 }
