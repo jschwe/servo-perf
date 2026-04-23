@@ -1,24 +1,22 @@
 # Critical-path phases for Servo startup to FirstContentfulPaint.
-# Derived from /workspaces/servo-workspace/startup-investigation.md.
+# Names aligned with servo's upstream profiling spans as of
+# e2f17e0d28c (after PRs #44443 and #44456). Adjust when servo adds
+# or renames startup spans.
 
 [[phase]]
-name = "App::init"
+name = "create_platform_window"
 owner_thread = "main"
 
 [[phase]]
-name = "App::create_platform_window"
+name = "HeadedWindow::new"
 owner_thread = "main"
 
 [[phase]]
-name = "ServoBuilder::build"
+name = "Servo::new"
 owner_thread = "main"
 
 [[phase]]
-name = "startup::script_init"
-owner_thread = "main"
-
-[[phase]]
-name = "App::open_window"
+name = "script::init"
 owner_thread = "main"
 
 [[phase]]
@@ -29,24 +27,15 @@ owner_thread = "main"
 name = "handle_new_top_level_browsing_context"
 owner_thread = "Constellation"
 
+# Upstream typo in servo's `#[servo_tracing::instrument(name = ...)]`
+# (components/script/script_thread.rs). Match what is emitted until the
+# upstream typo is fixed.
 [[phase]]
-name = "ScriptThread::bootstrap"
+name = "ScripThread::new"
 owner_thread = "Script"
 
 [[phase]]
-name = "ScriptThread::new"
-owner_thread = "Script"
-
-[[phase]]
-name = "ScriptThread::spawn_pipeline"
-owner_thread = "Script"
-
-[[phase]]
-name = "ScriptThread::pre_page_load"
-owner_thread = "Script"
-
-[[phase]]
-name = "ServoParser::finish"
+name = "pre_page_load"
 owner_thread = "Script"
 
 [[phase]]
@@ -62,25 +51,25 @@ is_milestone = true
 # Edges whose observed gap we want to flag when it grows. Order matters.
 
 [[edge]]
-from = "App::create_platform_window"
-to = "ServoBuilder::build"
+from = "create_platform_window"
+to = "Servo::new"
 expected_gap_ms = 0.5
 flag_threshold_ms = 5
 
 [[edge]]
-from = "ServoBuilder::build"
-to = "App::open_window"
+from = "Servo::new"
+to = "create_toplevel_webview"
 expected_gap_ms = 1
 flag_threshold_ms = 10
 
 [[edge]]
 from = "handle_new_top_level_browsing_context"
-to = "ScriptThread::new"
+to = "ScripThread::new"
 expected_gap_ms = 3
 flag_threshold_ms = 15
 
 [[edge]]
-from = "ScriptThread::pre_page_load"
-to = "ServoParser::finish"
+from = "pre_page_load"
+to = "FirstPaint"
 expected_gap_ms = 40
 flag_threshold_ms = 200

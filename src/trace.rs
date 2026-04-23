@@ -296,7 +296,7 @@ pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) ->
     // tracing's Visit trait has no dedicated `record_u64`: the tracing-perfetto
     // visitor records u64 fields via `record_i64`, so the annotation value can
     // arrive as either Int or Uint. Accept both.
-    let anchor = slices.iter().find(|s| s.name == "servoshell::startup_anchor");
+    let anchor = slices.iter().find(|s| s.name == "servoshell::startup_tracing_initialized");
     let anchor_wall_ns = anchor.and_then(|s| {
         s.debug_annotations.iter().find(|(k, _)| k == "wallclock_ns").and_then(|(_, v)| {
             match v {
@@ -371,7 +371,8 @@ mod tests {
         let r = load_registry(&dir).expect("load registry");
         assert!(!r.phases.is_empty());
         assert!(r.phases.iter().any(|p| p.name == "FirstContentfulPaint"));
-        assert!(r.phases.iter().any(|p| p.name == "ScriptThread::new"));
+        // Upstream typo in servo `#[instrument(name = "ScripThread::new")]`.
+        assert!(r.phases.iter().any(|p| p.name == "ScripThread::new"));
         for e in &r.edges {
             assert!(e.flag_threshold_ms >= e.expected_gap_ms);
         }
@@ -511,7 +512,7 @@ flag_threshold_ms = 10
         let spawn_wall_ns = anchor_wall_ns - 800_000_000;  // spawned 800 ms earlier
         let slices = vec![
             Slice {
-                name: "servoshell::startup_anchor".into(),
+                name: "servoshell::startup_tracing_initialized".into(),
                 thread: "main".into(),
                 ts_ns: anchor_ts_ns,
                 dur_ns: 0,
@@ -538,7 +539,7 @@ flag_threshold_ms = 10
         let spawn_wall_ns = anchor_wall_ns - 300_000_000;
         let slices = vec![
             Slice {
-                name: "servoshell::startup_anchor".into(),
+                name: "servoshell::startup_tracing_initialized".into(),
                 thread: "main".into(),
                 ts_ns: anchor_wall_ns,
                 dur_ns: 0,
