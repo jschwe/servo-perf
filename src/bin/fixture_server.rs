@@ -127,18 +127,23 @@ async fn serve(
 
     let is_head = method == hyper::Method::HEAD;
     if method != hyper::Method::GET && !is_head {
+        log_request(method.as_str(), &uri_path, 0);
         return Ok(status_response(405, Bytes::new()));
     }
 
     let resolved = match resolve_safe_path(&doc_root, &uri_path) {
         Ok(p) => p,
-        Err(code) => return Ok(status_response(code, Bytes::new())),
+        Err(code) => {
+            log_request(method.as_str(), &uri_path, 0);
+            return Ok(status_response(code, Bytes::new()));
+        }
     };
 
     match tokio::fs::read(&resolved).await {
         Ok(bytes) => {
             let ct = content_type_for(&resolved);
             let body_len = bytes.len();
+            log_request(method.as_str(), &uri_path, body_len);
             let body = if is_head { Bytes::new() } else { Bytes::from(bytes) };
             let resp = Response::builder()
                 .status(200)
@@ -149,6 +154,7 @@ async fn serve(
             Ok(resp)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            log_request(method.as_str(), &uri_path, 0);
             Ok(status_response(404, Bytes::from_static(b"nf")))
         }
         Err(e) => {
@@ -156,6 +162,14 @@ async fn serve(
             Ok(status_response(500, Bytes::new()))
         }
     }
+}
+
+fn log_request(method: &str, path: &str, body_len: usize) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    println!("[srv {ts:.3}] {method} {path} ({body_len}B)");
 }
 
 fn status_response(code: u16, body: Bytes) -> Response<Full<Bytes>> {
