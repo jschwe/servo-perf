@@ -8,7 +8,9 @@ name = "create_platform_window"
 owner_thread = "main"
 
 [[phase]]
-name = "HeadedWindow::new"
+# Runner always spawns servoshell with `--headless`, so the window
+# created is HeadlessWindow (not HeadedWindow).
+name = "HeadlessWindow::new"
 owner_thread = "main"
 
 [[phase]]

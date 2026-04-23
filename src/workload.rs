@@ -34,7 +34,15 @@ pub enum FixtureKind {
     Http2,
 }
 
-fn default_tracing_filter() -> String { "info".to_string() }
+fn default_tracing_filter() -> String {
+    // info globally, plus trace-level for any span/event tagged
+    // `servo_profiling = true`. The `servo_tracing::instrument` macro
+    // injects that field automatically (and defaults to TRACE level),
+    // so this upgrade is what makes upstream startup spans like
+    // Servo::new, script::init, ScripThread::new, pre_page_load
+    // visible without flooding the trace with every per-frame TRACE span.
+    "info,[{servo_profiling=true}]=trace".to_string()
+}
 fn default_iterations() -> u32 { 20 }
 
 /// Load a workload from `<workloads_dir>/<name>.toml`.
@@ -80,7 +88,7 @@ url = "https://example.test/"
         )
         .unwrap();
         let w = load(dir.path(), "min").unwrap();
-        assert_eq!(w.tracing_filter, "info");
+        assert_eq!(w.tracing_filter, "info,[{servo_profiling=true}]=trace");
         assert_eq!(w.iterations, 20);
         assert!(w.fixture.is_none());
     }
