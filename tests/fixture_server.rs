@@ -112,3 +112,13 @@ async fn http2_serves_simple_html_over_h2() {
     assert_eq!(resp.version(), reqwest::Version::HTTP_2);
     assert_eq!(resp.headers().get("content-type").unwrap(), "text/html");
 }
+
+#[tokio::test]
+async fn http1_returns_404_with_nf_body_for_missing_file() {
+    let srv = spawn("http1", &www_dir());
+    let url = format!("https://127.0.0.1:{}/does-not-exist.html", srv.port);
+    let resp = client().get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 404);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.as_ref(), b"nf");
+}
