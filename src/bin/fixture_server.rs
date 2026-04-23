@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use anyhow::Context;
 
 #[derive(Debug, PartialEq)]
 enum Mode {
@@ -287,5 +288,89 @@ mod mime_tests {
     fn unknown_falls_back_to_octet_stream() {
         assert_eq!(content_type_for(Path::new("a.bin")), "application/octet-stream");
         assert_eq!(content_type_for(Path::new("noext")), "application/octet-stream");
+    }
+}
+
+use std::sync::Arc;
+
+fn build_tls_config(cert_path: &Path, key_path: &Path, mode: Mode) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let cert_file = File::open(cert_path)
+        .with_context(|| format!("opening cert file {}", cert_path.display()))?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<_, _>>()
+        .context("parsing cert PEM")?;
+    anyhow::ensure!(!certs.is_empty(), "no certificates found in {}", cert_path.display());
+
+    let key_file = File::open(key_path)
+        .with_context(|| format!("opening key file {}", key_path.display()))?;
+    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .context("parsing key PEM")?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("building rustls ServerConfig")?;
+    config.alpn_protocols = match mode {
+        Mode::Http1 => vec![b"http/1.1".to_vec()],
+        Mode::Http2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    };
+    Ok(Arc::new(config))
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Once;
+
+    static INSTALL: Once = Once::new();
+    fn install_provider() {
+        INSTALL.call_once(|| {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .expect("install default crypto provider");
+        });
+    }
+
+    fn fixture_paths() -> (PathBuf, PathBuf) {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        (base.join("cert.pem"), base.join("key.pem"))
+    }
+
+    #[test]
+    fn http1_mode_advertises_only_http1_1() {
+        install_provider();
+        let (cert, key) = fixture_paths();
+        let cfg = build_tls_config(&cert, &key, Mode::Http1).unwrap();
+        assert_eq!(cfg.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn http2_mode_advertises_h2_then_http1_1() {
+        install_provider();
+        let (cert, key) = fixture_paths();
+        let cfg = build_tls_config(&cert, &key, Mode::Http2).unwrap();
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn missing_cert_errors_cleanly() {
+        install_provider();
+        let err = build_tls_config(
+            Path::new("/does/not/exist.pem"),
+            Path::new("/does/not/exist.pem"),
+            Mode::Http1,
+        ).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.to_lowercase().contains("no such file") || msg.to_lowercase().contains("cert"),
+                "unexpected error message: {msg}");
     }
 }
