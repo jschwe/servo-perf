@@ -224,3 +224,68 @@ mod path_rejection_tests {
         assert_eq!(err, 400);
     }
 }
+
+fn content_type_for(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "html" => "text/html",
+        "css" => "text/css",
+        "js" => "application/javascript",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod mime_tests {
+    use super::*;
+
+    #[test]
+    fn html() {
+        assert_eq!(content_type_for(Path::new("x.html")), "text/html");
+    }
+
+    #[test]
+    fn css() {
+        assert_eq!(content_type_for(Path::new("x.css")), "text/css");
+    }
+
+    #[test]
+    fn js() {
+        assert_eq!(content_type_for(Path::new("x.js")), "application/javascript");
+    }
+
+    #[test]
+    fn png() {
+        assert_eq!(content_type_for(Path::new("img.png")), "image/png");
+    }
+
+    #[test]
+    fn jpg_and_jpeg() {
+        assert_eq!(content_type_for(Path::new("a.jpg")), "image/jpeg");
+        assert_eq!(content_type_for(Path::new("a.jpeg")), "image/jpeg");
+    }
+
+    #[test]
+    fn ico() {
+        assert_eq!(content_type_for(Path::new("a.ico")), "image/x-icon");
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert_eq!(content_type_for(Path::new("a.HTML")), "text/html");
+        assert_eq!(content_type_for(Path::new("a.PNG")), "image/png");
+    }
+
+    #[test]
+    fn unknown_falls_back_to_octet_stream() {
+        assert_eq!(content_type_for(Path::new("a.bin")), "application/octet-stream");
+        assert_eq!(content_type_for(Path::new("noext")), "application/octet-stream");
+    }
+}
