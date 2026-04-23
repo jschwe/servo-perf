@@ -51,6 +51,17 @@ pub fn spawn(workloads_dir: &Path, fx: &Fixture) -> Result<FixtureHandle> {
         .status()
         .context("running gen_cert.sh")?;
 
+    // Refuse to proceed if the port is already taken by some other process —
+    // otherwise our child would fail to bind with EADDRINUSE and the
+    // port-readiness probe below would silently connect to the squatter.
+    let preflight_addr = format!("127.0.0.1:{}", fx.port);
+    if TcpStream::connect(&preflight_addr).is_ok() {
+        anyhow::bail!(
+            "port {} is already in use by another process; stop it before running servoperf",
+            fx.port
+        );
+    }
+
     let exe = std::env::current_exe().context("resolving current exe")?;
     let exe_dir = exe
         .parent()
@@ -85,16 +96,23 @@ pub fn spawn(workloads_dir: &Path, fx: &Fixture) -> Result<FixtureHandle> {
         .context("spawning fixture_server")?;
 
     // Wait until the port accepts a TCP connection, with a 3 s timeout.
+    // Also detect early child exit (e.g. bind failure) so we don't wait the
+    // full timeout when the fixture never starts serving.
     let deadline = Instant::now() + Duration::from_secs(3);
     let addr = format!("127.0.0.1:{}", fx.port);
+    let mut handle = FixtureHandle { child, port: fx.port };
     loop {
         if TcpStream::connect(&addr).is_ok() {
-            return Ok(FixtureHandle { child, port: fx.port });
+            return Ok(handle);
+        }
+        if let Some(status) = handle.child.try_wait().context("polling fixture child")? {
+            anyhow::bail!(
+                "fixture_server exited before accepting connections (status={status})"
+            );
         }
         if Instant::now() >= deadline {
-            // `handle` owns `child`; going out of scope at the `bail!` below
-            // fires Drop, which kills the subprocess. No explicit drop needed.
-            let _handle = FixtureHandle { child, port: fx.port };
+            // Dropping `handle` fires its Drop impl, which kills the subprocess.
+            drop(handle);
             anyhow::bail!("fixture on {addr} never accepted a connection within 3 s");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -120,6 +138,29 @@ mod tests {
         drop(handle);
         // After drop, connection refused (port should free up shortly).
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn refuses_port_already_in_use() {
+        let workloads_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
+        // Bind and hold the port to simulate a squatter (e.g. a stale fixture
+        // from a previous session still listening on the workload port).
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let fx = Fixture {
+            kind: FixtureKind::Http1,
+            port,
+            doc_root: "www".into(),
+        };
+        let err = match spawn(&workloads_dir, &fx) {
+            Ok(_) => panic!("spawn should have refused an occupied port"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("already in use"),
+            "expected 'already in use' error, got: {err}"
+        );
+        drop(squatter);
     }
 
     #[test]
