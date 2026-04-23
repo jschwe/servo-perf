@@ -125,7 +125,8 @@ async fn serve(
     let method = req.method().clone();
     let uri_path = req.uri().path().to_string();
 
-    if method != hyper::Method::GET {
+    let is_head = method == hyper::Method::HEAD;
+    if method != hyper::Method::GET && !is_head {
         return Ok(status_response(405, Bytes::new()));
     }
 
@@ -138,11 +139,12 @@ async fn serve(
         Ok(bytes) => {
             let ct = content_type_for(&resolved);
             let body_len = bytes.len();
+            let body = if is_head { Bytes::new() } else { Bytes::from(bytes) };
             let resp = Response::builder()
                 .status(200)
                 .header("content-type", ct)
                 .header("content-length", body_len.to_string())
-                .body(Full::new(Bytes::from(bytes)))
+                .body(Full::new(body))
                 .unwrap();
             Ok(resp)
         }

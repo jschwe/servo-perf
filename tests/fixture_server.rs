@@ -122,3 +122,25 @@ async fn http1_returns_404_with_nf_body_for_missing_file() {
     let body = resp.bytes().await.unwrap();
     assert_eq!(body.as_ref(), b"nf");
 }
+
+#[tokio::test]
+async fn http1_head_returns_empty_body_and_correct_content_length() {
+    let srv = spawn("http1", &www_dir());
+    let url = format!("https://127.0.0.1:{}/simple.html", srv.port);
+    let resp = client().head(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let expected_len = std::fs::metadata(www_dir().join("simple.html"))
+        .unwrap()
+        .len();
+    let got_len: u64 = resp
+        .headers()
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(got_len, expected_len);
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), 0);
+}
