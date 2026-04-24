@@ -23,7 +23,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
     let fx: Option<FixtureHandle> = match w.fixture.as_ref() {
-        Some(_) => Some(fixtures::spawn(&workloads_dir, &w, &args.bin)?),
+        Some(_) => Some(fixtures::spawn(&workloads_dir, &w, &args.bin, &out_dir)?),
         None => None,
     };
     let proxy_uri = fx.as_ref().and_then(|h| h.proxy_uri().map(|s| s.to_string()));

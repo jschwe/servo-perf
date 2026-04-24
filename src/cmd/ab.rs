@@ -26,7 +26,7 @@ pub fn run(args: AbArgs) -> Result<()> {
     // use `base` since the record is discarded (we only care about the
     // archive it produces).
     let fx: Option<FixtureHandle> = match w.fixture.as_ref() {
-        Some(_) => Some(fixtures::spawn(&workloads_dir, &w, &args.base_bin)?),
+        Some(_) => Some(fixtures::spawn(&workloads_dir, &w, &args.base_bin, &out_dir)?),
         None => None,
     };
     let proxy_uri = fx.as_ref().and_then(|h| h.proxy_uri().map(|s| s.to_string()));

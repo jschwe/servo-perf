@@ -57,6 +57,7 @@ pub fn spawn(
     workloads_dir: &Path,
     workload: &Workload,
     servoshell_bin: &Path,
+    out_dir: &Path,
 ) -> Result<FixtureHandle> {
     let fixture = workload
         .fixture
@@ -64,10 +65,10 @@ pub fn spawn(
         .ok_or_else(|| anyhow::anyhow!("workload has no fixture to spawn"))?;
     match fixture {
         Fixture::Http1 { port, doc_root } => {
-            spawn_local_server(workloads_dir, "http1", *port, doc_root)
+            spawn_local_server(workloads_dir, "http1", *port, doc_root, out_dir)
         }
         Fixture::Http2 { port, doc_root } => {
-            spawn_local_server(workloads_dir, "http2", *port, doc_root)
+            spawn_local_server(workloads_dir, "http2", *port, doc_root, out_dir)
         }
         Fixture::WprReplay {
             archive,
@@ -80,6 +81,7 @@ pub fn spawn(
             archive,
             *wpr_port,
             *tunnel_port,
+            out_dir,
         ),
     }
 }
@@ -91,6 +93,7 @@ fn spawn_local_server(
     mode: &str,
     port: u16,
     doc_root_rel: &Path,
+    out_dir: &Path,
 ) -> Result<FixtureHandle> {
     let fixtures_dir = workloads_dir
         .parent()
@@ -119,7 +122,7 @@ fn spawn_local_server(
         .arg(&doc_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(open_log(out_dir, "fixture_server.stderr")?)
         .spawn()
         .context("spawning fixture_server")?;
 
@@ -141,6 +144,7 @@ fn spawn_wpr_replay(
     archive_rel: &Path,
     wpr_port: u16,
     tunnel_port: u16,
+    out_dir: &Path,
 ) -> Result<FixtureHandle> {
     let archives_dir = workloads_dir
         .parent()
@@ -211,6 +215,7 @@ fn spawn_wpr_replay(
             tunnel_port,
             workload,
             servoshell_bin,
+            out_dir,
         )
         .with_context(|| "wpr-replay record pass")?;
         anyhow::ensure!(
@@ -233,8 +238,9 @@ fn spawn_wpr_replay(
         &key_path,
         &archive,
         wpr_port,
+        open_log(out_dir, "wpr.stderr")?,
     )?;
-    let tunnel_child = spawn_tunnel(tunnel_port, wpr_port)?;
+    let tunnel_child = spawn_tunnel(tunnel_port, wpr_port, open_log(out_dir, "tunnel.stderr")?)?;
     let mut handle = FixtureHandle {
         children: vec![wpr_child, tunnel_child],
         port: tunnel_port,
@@ -254,9 +260,22 @@ fn record_one_pass(
     tunnel_port: u16,
     workload: &Workload,
     servoshell_bin: &Path,
+    out_dir: &Path,
 ) -> Result<()> {
-    let wpr_child = spawn_wpr(wpr_bin, "record", cert_path, key_path, archive, wpr_port)?;
-    let tunnel_child = spawn_tunnel(tunnel_port, wpr_port)?;
+    let wpr_child = spawn_wpr(
+        wpr_bin,
+        "record",
+        cert_path,
+        key_path,
+        archive,
+        wpr_port,
+        open_log(out_dir, "wpr-record.stderr")?,
+    )?;
+    let tunnel_child = spawn_tunnel(
+        tunnel_port,
+        wpr_port,
+        open_log(out_dir, "tunnel-record.stderr")?,
+    )?;
     let mut handle = FixtureHandle {
         children: vec![wpr_child, tunnel_child],
         port: tunnel_port,
@@ -288,6 +307,7 @@ fn spawn_wpr(
     key_path: &Path,
     archive: &Path,
     wpr_port: u16,
+    stderr: Stdio,
 ) -> Result<Child> {
     // WPR needs CWD-relative access to its deterministic.js — rely on
     // --https-cert-file/--https-key-file being absolute, and run WPR
@@ -307,12 +327,12 @@ fn spawn_wpr(
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(stderr)
         .spawn()
         .with_context(|| format!("spawning wpr ({mode})"))
 }
 
-fn spawn_tunnel(tunnel_port: u16, wpr_port: u16) -> Result<Child> {
+fn spawn_tunnel(tunnel_port: u16, wpr_port: u16, stderr: Stdio) -> Result<Child> {
     let tunnel_bin = sibling_binary("wpr_tunnel")?;
     Command::new(&tunnel_bin)
         .arg("--listen")
@@ -321,9 +341,27 @@ fn spawn_tunnel(tunnel_port: u16, wpr_port: u16) -> Result<Child> {
         .arg(format!("127.0.0.1:{wpr_port}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(stderr)
         .spawn()
         .context("spawning wpr_tunnel")
+}
+
+/// Open (create/truncate) a log file under `out_dir` for a fixture child's
+/// stderr. Returns a `Stdio` ready to hand to `Command::stderr`.
+///
+/// Why this exists: WPR logs ~150 bytes per replayed request. With
+/// `Stdio::piped()` and no reader, the ~64 KiB default pipe buffer fills
+/// after a handful of iterations and WPR's next log write blocks inside
+/// its request-serving goroutine — freezing the HTTPS server for the
+/// rest of the bench. Writing to a regular file on disk is never
+/// flow-controlled the same way, so this deadlock can't recur.
+fn open_log(out_dir: &Path, name: &str) -> Result<Stdio> {
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("creating {}", out_dir.display()))?;
+    let path = out_dir.join(name);
+    let file = std::fs::File::create(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    Ok(Stdio::from(file))
 }
 
 fn run_servoshell_once(
@@ -495,13 +533,14 @@ mod tests {
     #[test]
     fn http1_fixture_spawns_and_drops_cleanly() {
         let workloads_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
+        let out_dir = tempfile::tempdir().unwrap();
         let fx = Fixture::Http1 {
             port: pick_free_port(),
             doc_root: "www".into(),
         };
         let w = workload_with(fx);
         // servoshell_bin is only used by WprReplay; a non-existent path is OK here.
-        let handle = spawn(&workloads_dir, &w, Path::new("/does/not/exist"))
+        let handle = spawn(&workloads_dir, &w, Path::new("/does/not/exist"), out_dir.path())
             .expect("spawn http/1.1 fixture");
         assert!(TcpStream::connect(format!("127.0.0.1:{}", handle.port())).is_ok());
         drop(handle);
@@ -511,13 +550,14 @@ mod tests {
     #[test]
     fn refuses_port_already_in_use() {
         let workloads_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
+        let out_dir = tempfile::tempdir().unwrap();
         let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = squatter.local_addr().unwrap().port();
         let w = workload_with(Fixture::Http1 {
             port,
             doc_root: "www".into(),
         });
-        let err = match spawn(&workloads_dir, &w, Path::new("/does/not/exist")) {
+        let err = match spawn(&workloads_dir, &w, Path::new("/does/not/exist"), out_dir.path()) {
             Ok(_) => panic!("spawn should have refused an occupied port"),
             Err(e) => e,
         };
@@ -531,12 +571,13 @@ mod tests {
     #[test]
     fn http2_fixture_spawns() {
         let workloads_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
+        let out_dir = tempfile::tempdir().unwrap();
         let fx = Fixture::Http2 {
             port: pick_free_port(),
             doc_root: "www".into(),
         };
         let w = workload_with(fx);
-        let handle = spawn(&workloads_dir, &w, Path::new("/does/not/exist"))
+        let handle = spawn(&workloads_dir, &w, Path::new("/does/not/exist"), out_dir.path())
             .expect("spawn http/2 fixture");
         assert!(TcpStream::connect(format!("127.0.0.1:{}", handle.port())).is_ok());
     }
