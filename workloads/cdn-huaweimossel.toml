@@ -4,4 +4,16 @@ iterations = 15
 viewport = [824, 1830]
 device_pixel_ratio = 2.625
 user_agent = "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/14.2 Chrome/87.0.4280.141 Mobile Safari/537.36"
-# No [fixture] — real CDN.
+# The wpr-replay fixture accepts WPR's self-signed leaf certs via this
+# flag; no system-wide CA installation required. See docs/wpr-setup.md.
+# When this workload is instead run against the live CDN (e.g. by
+# removing the [fixture] block below) the flag is a near no-op.
+servoshell_args = ["--ignore-certificate-errors"]
+
+# Serve the page from a local WPR archive instead of hitting the live
+# CDN. On first use, if the archive file is missing, servoperf makes
+# one record pass against the real origin and writes the archive to
+# tools/servoperf/wpr-archives/<archive>.
+[fixture]
+kind = "wpr-replay"
+archive = "cdn-huaweimossel.wprgo"

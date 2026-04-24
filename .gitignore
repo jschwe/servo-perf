@@ -1,0 +1,8 @@
+/target
+/out
+/wpr-archives
+/fixtures/cert.pem
+/fixtures/key.pem
+/tests/fake_servoshell/target
+/tests/fake_servoshell/Cargo.lock
+/servo.pftrace

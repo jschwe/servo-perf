@@ -22,16 +22,23 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let out_dir = resolve_out(args.out.as_deref(), &w.name);
     std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
-    let _fx: Option<FixtureHandle> = match w.fixture.as_ref() {
-        Some(fx) => Some(fixtures::spawn(&workloads_dir, fx)?),
+    let fx: Option<FixtureHandle> = match w.fixture.as_ref() {
+        Some(_) => Some(fixtures::spawn(&workloads_dir, &w, &args.bin)?),
         None => None,
     };
+    let proxy_uri = fx.as_ref().and_then(|h| h.proxy_uri().map(|s| s.to_string()));
 
     let mut iterations = Vec::with_capacity(w.iterations as usize);
     let mut fcp_samples: Vec<f64> = Vec::new();
+    let mut successful_wall: Vec<std::time::Duration> = Vec::new();
     for i in 0..w.iterations {
-        match runner::run_once(&args.bin, &w, i, &out_dir) {
+        let timeout = runner::pick_timeout(&successful_wall);
+        match runner::run_once(&args.bin, &w, i, &out_dir, proxy_uri.as_deref(), timeout) {
             Ok(art) => {
+                let wall = std::time::Duration::from_nanos(
+                    art.exit_wall_ns.saturating_sub(art.spawn_wall_ns),
+                );
+                successful_wall.push(wall);
                 let pftrace = art.pftrace;
                 let slices = trace::parse(&pftrace)?;
                 let cp = trace::analyse(&slices, &registry, art.spawn_wall_ns);

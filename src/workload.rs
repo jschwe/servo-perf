@@ -20,18 +20,48 @@ pub struct Workload {
     pub fixture: Option<Fixture>,
 }
 
+/// A background server that needs to be running while a workload's
+/// iterations execute. Each variant's fields live inline so TOML reads as
+/// `kind = "http1"` + sibling fields.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Fixture {
-    pub kind: FixtureKind,
-    pub port: u16,
-    pub doc_root: PathBuf,
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Fixture {
+    /// Local static-file server over HTTP/1.1 + TLS. Used by `h1-multi`,
+    /// `simple`, etc. Doc root is resolved under
+    /// `<workloads_dir>/../fixtures/<doc_root>`.
+    Http1 {
+        port: u16,
+        doc_root: PathBuf,
+    },
+    /// Same as `Http1` but negotiates HTTP/2 via ALPN.
+    Http2 {
+        port: u16,
+        doc_root: PathBuf,
+    },
+    /// Replay a Web Page Replay archive through a local CONNECT shim so
+    /// servoshell talks to a deterministic on-disk recording instead of
+    /// the live origin. On first use (archive missing), a single
+    /// recording pass is made against the live origin automatically.
+    WprReplay {
+        /// Path to the `.wprgo` archive, resolved relative to
+        /// `<workloads_dir>/../wpr-archives/` if not absolute.
+        archive: PathBuf,
+        /// Port WPR's HTTPS server listens on.
+        #[serde(default = "default_wpr_port")]
+        wpr_port: u16,
+        /// Port the CONNECT-tunnel shim (`wpr_tunnel` binary) listens on.
+        /// servoshell is invoked with
+        /// `https_proxy=http://127.0.0.1:<tunnel_port>`.
+        #[serde(default = "default_tunnel_port")]
+        tunnel_port: u16,
+    },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum FixtureKind {
-    Http1,
-    Http2,
+fn default_wpr_port() -> u16 {
+    4443
+}
+fn default_tunnel_port() -> u16 {
+    4480
 }
 
 fn default_tracing_filter() -> String {
@@ -72,9 +102,10 @@ mod tests {
         assert_eq!(w.name, "h2-multi");
         assert_eq!(w.iterations, 20);
         assert!(w.url.starts_with("https://127.0.0.1:4444/"));
-        let fx = w.fixture.expect("fixture present");
-        assert_eq!(fx.kind, FixtureKind::Http2);
-        assert_eq!(fx.port, 4444);
+        match w.fixture.expect("fixture present") {
+            Fixture::Http2 { port, .. } => assert_eq!(port, 4444),
+            other => panic!("expected Http2 fixture, got {other:?}"),
+        }
     }
 
     #[test]

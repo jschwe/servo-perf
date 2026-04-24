@@ -22,10 +22,14 @@ pub fn run(args: AbArgs) -> Result<()> {
     let out_dir = resolve_out(args.out.as_deref(), &w.name);
     std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
-    let _fx: Option<FixtureHandle> = match w.fixture.as_ref() {
-        Some(fx) => Some(fixtures::spawn(&workloads_dir, fx)?),
+    // For the (one-off) wpr-replay record pass we need a servoshell bin;
+    // use `base` since the record is discarded (we only care about the
+    // archive it produces).
+    let fx: Option<FixtureHandle> = match w.fixture.as_ref() {
+        Some(_) => Some(fixtures::spawn(&workloads_dir, &w, &args.base_bin)?),
         None => None,
     };
+    let proxy_uri = fx.as_ref().and_then(|h| h.proxy_uri().map(|s| s.to_string()));
 
     // For each iteration, shuffle the order of (base, patch) so the pair
     // is symmetric against short-term system noise.
@@ -35,14 +39,22 @@ pub fn run(args: AbArgs) -> Result<()> {
     let mut base_fcp: Vec<f64> = Vec::new();
     let mut patch_fcp: Vec<f64> = Vec::new();
 
+    // Track successful iteration wallclock durations for adaptive timeout.
+    // Shared across base + patch — both are running the same workload.
+    let mut successful_wall: Vec<std::time::Duration> = Vec::new();
     for i in 0..w.iterations {
         let mut order = [("base", &args.base_bin), ("patch", &args.patch_bin)];
         order.shuffle(&mut rng);
         for (label, bin) in order {
             let iter_out = out_dir.join(format!("{label}_{i}_cwd"));
             std::fs::create_dir_all(&iter_out)?;
-            let iter = run_and_record(bin, &w, i, &iter_out, &registry);
-            if let IterationStatus::Ok { ref metrics, .. } = iter.status {
+            let timeout = runner::pick_timeout(&successful_wall);
+            let outcome =
+                run_and_record(bin, &w, i, &iter_out, &registry, proxy_uri.as_deref(), timeout);
+            if let Some(wall) = outcome.wall_duration {
+                successful_wall.push(wall);
+            }
+            if let IterationStatus::Ok { ref metrics, .. } = outcome.iteration.status {
                 if let Some(&v) = metrics.get("FirstContentfulPaint") {
                     match label {
                         "base" => base_fcp.push(v),
@@ -52,8 +64,8 @@ pub fn run(args: AbArgs) -> Result<()> {
                 }
             }
             match label {
-                "base" => base_iters.push(iter),
-                "patch" => patch_iters.push(iter),
+                "base" => base_iters.push(outcome.iteration),
+                "patch" => patch_iters.push(outcome.iteration),
                 _ => {}
             }
         }
@@ -103,38 +115,60 @@ pub fn run(args: AbArgs) -> Result<()> {
     Ok(())
 }
 
+/// Iteration result plus its wallclock duration (if the run exited
+/// cleanly). Duration is recorded even when parsing the pftrace fails,
+/// since the goal is to keep the adaptive timeout grounded in real
+/// servoshell-run times.
+struct IterationOutcome {
+    iteration: Iteration,
+    wall_duration: Option<std::time::Duration>,
+}
+
 fn run_and_record(
     bin: &Path,
     w: &Workload,
     iter: u32,
     out_dir: &Path,
     registry: &trace::SpanRegistry,
-) -> Iteration {
-    match runner::run_once(bin, w, iter, out_dir) {
-        Ok(art) => match trace::parse(&art.pftrace) {
-            Ok(slices) => {
-                let cp = trace::analyse(&slices, registry, art.spawn_wall_ns);
-                let pftrace = art.pftrace;
-                let mut metrics = BTreeMap::new();
-                if let Some(m) = cp.milestones.iter().find(|m| m.name == "FirstContentfulPaint") {
-                    metrics.insert("FirstContentfulPaint".to_string(), m.ts_ms);
+    proxy_uri: Option<&str>,
+    timeout: std::time::Duration,
+) -> IterationOutcome {
+    match runner::run_once(bin, w, iter, out_dir, proxy_uri, timeout) {
+        Ok(art) => {
+            let wall = std::time::Duration::from_nanos(
+                art.exit_wall_ns.saturating_sub(art.spawn_wall_ns),
+            );
+            let iteration = match trace::parse(&art.pftrace) {
+                Ok(slices) => {
+                    let cp = trace::analyse(&slices, registry, art.spawn_wall_ns);
+                    let pftrace = art.pftrace;
+                    let mut metrics = BTreeMap::new();
+                    if let Some(m) =
+                        cp.milestones.iter().find(|m| m.name == "FirstContentfulPaint")
+                    {
+                        metrics.insert("FirstContentfulPaint".to_string(), m.ts_ms);
+                    }
+                    for row in &cp.named_spans {
+                        metrics.insert(format!("{}.dur_ms", row.name), row.dur_ms);
+                    }
+                    Iteration {
+                        index: iter,
+                        status: IterationStatus::Ok { pftrace, metrics, critical_path: cp },
+                    }
                 }
-                for row in &cp.named_spans {
-                    metrics.insert(format!("{}.dur_ms", row.name), row.dur_ms);
-                }
-                Iteration {
+                Err(err) => Iteration {
                     index: iter,
-                    status: IterationStatus::Ok { pftrace, metrics, critical_path: cp },
-                }
-            }
-            Err(err) => Iteration {
+                    status: IterationStatus::Failed { error: format!("parse: {err:#}") },
+                },
+            };
+            IterationOutcome { iteration, wall_duration: Some(wall) }
+        }
+        Err(err) => IterationOutcome {
+            iteration: Iteration {
                 index: iter,
-                status: IterationStatus::Failed { error: format!("parse: {err:#}") },
+                status: IterationStatus::Failed { error: format!("run: {err:#}") },
             },
-        },
-        Err(err) => Iteration {
-            index: iter,
-            status: IterationStatus::Failed { error: format!("run: {err:#}") },
+            wall_duration: None,
         },
     }
 }
