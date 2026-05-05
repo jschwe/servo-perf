@@ -112,6 +112,54 @@ fn fcp_bar(ms: f64, max: f64, width: usize) -> String {
     format!("[{}{}]", "█".repeat(fill), " ".repeat(blank))
 }
 
+/// Append a "Per-iteration <SHORT>" bar-chart section for a milestone
+/// metric. Iterations that didn't produce the metric (e.g. LCP on a
+/// page without a large enough fragment) print as "—" so the chart
+/// stays aligned with the iteration list.
+fn render_per_iter_chart(
+    s: &mut String,
+    short: &str,
+    metric: &str,
+    cfg: &ConfigResults,
+) {
+    writeln!(s, "### Per-iteration {}\n", short).unwrap();
+    let bar_width = 30usize;
+    let max_v = cfg
+        .iterations
+        .iter()
+        .filter_map(|i| {
+            if let IterationStatus::Ok { ref metrics, .. } = i.status {
+                metrics.get(metric).copied()
+            } else {
+                None
+            }
+        })
+        .fold(0.0_f64, f64::max);
+    for iter in &cfg.iterations {
+        match &iter.status {
+            IterationStatus::Ok { ref metrics, .. } => match metrics.get(metric) {
+                Some(&v) => {
+                    let bar = fcp_bar(v, max_v, bar_width);
+                    writeln!(s, "iter {:>2}  {} {:.0} ms", iter.index, bar, v).unwrap();
+                }
+                None => {
+                    writeln!(
+                        s,
+                        "iter {:>2}  [{}] —",
+                        iter.index,
+                        " ".repeat(bar_width)
+                    )
+                    .unwrap();
+                }
+            },
+            IterationStatus::Failed { .. } => {
+                writeln!(s, "iter {:>2}  FAILED", iter.index).unwrap();
+            }
+        }
+    }
+    writeln!(s).unwrap();
+}
+
 fn render_markdown(data: &RunResults) -> String {
     let mut s = String::new();
     writeln!(
@@ -279,33 +327,16 @@ fn render_markdown(data: &RunResults) -> String {
         }
         writeln!(s).unwrap();
 
-        // Per-iteration FCP bar chart.
-        writeln!(s, "### Per-iteration FCP\n").unwrap();
-        let bar_width = 30usize;
-        let max_fcp = cfg
-            .iterations
-            .iter()
-            .filter_map(|i| {
-                if let IterationStatus::Ok { ref metrics, .. } = i.status {
-                    metrics.get("FirstContentfulPaint").copied()
-                } else {
-                    None
-                }
-            })
-            .fold(0.0_f64, f64::max);
-        for iter in &cfg.iterations {
-            match &iter.status {
-                IterationStatus::Ok { ref metrics, .. } => {
-                    let fcp = metrics.get("FirstContentfulPaint").copied().unwrap_or(0.0);
-                    let bar = fcp_bar(fcp, max_fcp, bar_width);
-                    writeln!(s, "iter {:>2}  {} {:.0} ms", iter.index, bar, fcp).unwrap();
-                }
-                IterationStatus::Failed { .. } => {
-                    writeln!(s, "iter {:>2}  FAILED", iter.index).unwrap();
-                }
-            }
+        // Per-iteration milestone bar charts. FCP always; LCP only
+        // when at least one iteration produced one (pages without a
+        // large enough text/image fragment never fire LCP).
+        render_per_iter_chart(&mut s, "FCP", "FirstContentfulPaint", cfg);
+        if cfg.iterations.iter().any(|i| {
+            matches!(&i.status, IterationStatus::Ok { metrics, .. }
+                if metrics.contains_key("LargestContentfulPaint"))
+        }) {
+            render_per_iter_chart(&mut s, "LCP", "LargestContentfulPaint", cfg);
         }
-        writeln!(s).unwrap();
     }
 
     if !data.deltas.is_empty() {

@@ -18,6 +18,43 @@ use std::time::{Duration, Instant};
 
 use crate::workload::{Fixture, Workload};
 
+/// "Drive servoshell once against a fixture in record mode" —
+/// abstracted so that both desktop (a local subprocess) and OHOS
+/// (`hdc` + `aa start`) can implement it without `fixtures.rs` having
+/// to know which target it's running for.
+///
+/// The driver is invoked by `record_one_pass` after WPR + the tunnel
+/// are listening. It must return when the page has been on screen long
+/// enough for the recording to capture the initial document *and* its
+/// lazy-loaded tail (images, async fetches, …). The caller then SIGINTs
+/// WPR to flush the archive.
+pub trait RecordDriver {
+    fn drive(
+        &self,
+        workload: &Workload,
+        handle: &FixtureHandle,
+        out_dir: &Path,
+    ) -> Result<()>;
+}
+
+/// Drives one record pass by spawning a local `servoshell` binary with
+/// the proxy env-vars set. This is the desktop case; matches the
+/// pre-existing behaviour of `record_one_pass`.
+pub struct LocalServoshellDriver {
+    pub bin: PathBuf,
+}
+
+impl RecordDriver for LocalServoshellDriver {
+    fn drive(
+        &self,
+        workload: &Workload,
+        handle: &FixtureHandle,
+        _out_dir: &Path,
+    ) -> Result<()> {
+        run_servoshell_once(&self.bin, workload, handle)
+    }
+}
+
 pub struct FixtureHandle {
     /// Subprocesses this fixture owns. All are SIGKILL'd on Drop.
     children: Vec<Child>,
@@ -51,12 +88,14 @@ impl Drop for FixtureHandle {
 }
 
 /// Spawn the fixture described by `workload.fixture` (must be `Some`).
-/// `servoshell_bin` is only consulted when a `wpr-replay` fixture needs
-/// a one-time recording pass; it is otherwise unused.
+/// `record_driver` is only consulted when a `wpr-replay` fixture needs
+/// a one-time recording pass; it is otherwise unused. Pass any
+/// [`RecordDriver`] impl — `LocalServoshellDriver` for desktop,
+/// [`crate::ohos::OhosRecordDriver`] for HarmonyOS.
 pub fn spawn(
     workloads_dir: &Path,
     workload: &Workload,
-    servoshell_bin: &Path,
+    record_driver: &dyn RecordDriver,
     out_dir: &Path,
 ) -> Result<FixtureHandle> {
     let fixture = workload
@@ -77,7 +116,7 @@ pub fn spawn(
         } => spawn_wpr_replay(
             workloads_dir,
             workload,
-            servoshell_bin,
+            record_driver,
             archive,
             *wpr_port,
             *tunnel_port,
@@ -140,7 +179,7 @@ fn spawn_local_server(
 fn spawn_wpr_replay(
     workloads_dir: &Path,
     workload: &Workload,
-    servoshell_bin: &Path,
+    record_driver: &dyn RecordDriver,
     archive_rel: &Path,
     wpr_port: u16,
     tunnel_port: u16,
@@ -214,14 +253,32 @@ fn spawn_wpr_replay(
             wpr_port,
             tunnel_port,
             workload,
-            servoshell_bin,
+            record_driver,
             out_dir,
         )
         .with_context(|| "wpr-replay record pass")?;
+        // Sanity: refuse to silently move on when the device-driven
+        // record produced essentially nothing — the most common failure
+        // is "device couldn't reach the proxy" (rport not listening or
+        // bundle not actually launchable), which leaves WPR with zero
+        // requests served and an archive of just headers / no responses.
+        // 100 KiB is large enough to clear the empty-archive baseline
+        // and small enough that any real-world workload trivially
+        // exceeds it.
+        const MIN_ARCHIVE_BYTES: u64 = 100 * 1024;
+        let archive_size = std::fs::metadata(&archive)
+            .map(|m| m.len())
+            .unwrap_or(0);
         anyhow::ensure!(
-            archive.is_file() && std::fs::metadata(&archive).map(|m| m.len() > 0).unwrap_or(false),
-            "record pass did not produce a non-empty archive at {}",
-            archive.display()
+            archive.is_file() && archive_size >= MIN_ARCHIVE_BYTES,
+            "record pass produced an unexpectedly small archive at {} ({} bytes < {} expected). \
+             The drive likely couldn't reach the proxy. Check that the bundle is installed and \
+             reachable via `hdc list targets`, that `hdc fport ls` shows the proxy rport, and \
+             review {}/wpr-record.stderr for `Proxy: WRITING response` lines.",
+            archive.display(),
+            archive_size,
+            MIN_ARCHIVE_BYTES,
+            out_dir.display(),
         );
         eprintln!(
             "wpr-replay: recorded {} bytes to {}",
@@ -259,7 +316,7 @@ fn record_one_pass(
     wpr_port: u16,
     tunnel_port: u16,
     workload: &Workload,
-    servoshell_bin: &Path,
+    record_driver: &dyn RecordDriver,
     out_dir: &Path,
 ) -> Result<()> {
     let wpr_child = spawn_wpr(
@@ -284,9 +341,12 @@ fn record_one_pass(
     wait_for_accept(&mut handle, wpr_port, "wpr")?;
     wait_for_accept(&mut handle, tunnel_port, "wpr_tunnel")?;
 
-    // One servoshell run; we don't care about the trace output.
-    run_servoshell_once(servoshell_bin, workload, &handle)
-        .context("servoshell record pass")?;
+    // Drive one pass against the WPR-record-mode fixture. The driver
+    // is responsible for whatever target-specific orchestration this
+    // takes (a local subprocess, or `hdc rport` + `aa start` on OHOS).
+    record_driver
+        .drive(workload, &handle, out_dir)
+        .context("record pass driver")?;
 
     // SIGINT WPR so it flushes the archive. The child is the second-to-
     // last entry in handle.children (wpr was pushed first); but for
@@ -313,8 +373,8 @@ fn spawn_wpr(
     // --https-cert-file/--https-key-file being absolute, and run WPR
     // from the cert directory so deterministic.js resolves.
     let cwd = cert_path.parent().unwrap_or(Path::new("."));
-    Command::new(wpr_bin)
-        .arg(mode)
+    let mut cmd = Command::new(wpr_bin);
+    cmd.arg(mode)
         .arg("--https-port")
         .arg(wpr_port.to_string())
         .arg("--host")
@@ -322,13 +382,27 @@ fn spawn_wpr(
         .arg("--https-cert-file")
         .arg(cert_path)
         .arg("--https-key-file")
-        .arg(key_path)
-        .arg(archive)
+        .arg(key_path);
+    // `--no-archive-certificates` only applies to replay. Using it
+    // during recording would prevent WPR from caching minted leaves
+    // alongside response bodies; that's what we want anyway, so we
+    // mirror the flag on both sides.
+    //
+    // Without this flag WPR replays whichever leaf cert was in the
+    // archive at recording time. Those leaves were signed by the
+    // recording-time root key, which won't match the host's current
+    // wpr_cert.pem / wpr_key.pem after a CA regeneration — every TLS
+    // handshake then fails with `BadSignature` (servoshell's
+    // `--ignore-certificate-errors` only suppresses the *trust* error,
+    // not a cryptographic signature mismatch). Forcing fresh leaves at
+    // play time keeps the leaves consistent with the live root.
+    cmd.arg("--no-archive-certificates");
+    cmd.arg(archive)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(stderr)
-        .spawn()
+        .stderr(stderr);
+    cmd.spawn()
         .with_context(|| format!("spawning wpr ({mode})"))
 }
 
@@ -530,6 +604,23 @@ mod tests {
         }
     }
 
+    /// Stand-in driver for fixture-spawn tests that exercise the
+    /// HTTP/1 + HTTP/2 paths only — those branches never invoke
+    /// `record_driver.drive`, so a stub is fine. Panics if it ever
+    /// gets called: that would mean the test accidentally hit the
+    /// WPR-record path, which we want to know about.
+    struct PanickingDriver;
+    impl RecordDriver for PanickingDriver {
+        fn drive(
+            &self,
+            _: &Workload,
+            _: &FixtureHandle,
+            _: &Path,
+        ) -> Result<()> {
+            panic!("PanickingDriver should never be invoked in HTTP/1 or HTTP/2 fixture tests");
+        }
+    }
+
     #[test]
     fn http1_fixture_spawns_and_drops_cleanly() {
         let workloads_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
@@ -540,7 +631,7 @@ mod tests {
         };
         let w = workload_with(fx);
         // servoshell_bin is only used by WprReplay; a non-existent path is OK here.
-        let handle = spawn(&workloads_dir, &w, Path::new("/does/not/exist"), out_dir.path())
+        let handle = spawn(&workloads_dir, &w, &PanickingDriver, out_dir.path())
             .expect("spawn http/1.1 fixture");
         assert!(TcpStream::connect(format!("127.0.0.1:{}", handle.port())).is_ok());
         drop(handle);
@@ -557,7 +648,7 @@ mod tests {
             port,
             doc_root: "www".into(),
         });
-        let err = match spawn(&workloads_dir, &w, Path::new("/does/not/exist"), out_dir.path()) {
+        let err = match spawn(&workloads_dir, &w, &PanickingDriver, out_dir.path()) {
             Ok(_) => panic!("spawn should have refused an occupied port"),
             Err(e) => e,
         };
@@ -577,7 +668,7 @@ mod tests {
             doc_root: "www".into(),
         };
         let w = workload_with(fx);
-        let handle = spawn(&workloads_dir, &w, Path::new("/does/not/exist"), out_dir.path())
+        let handle = spawn(&workloads_dir, &w, &PanickingDriver, out_dir.path())
             .expect("spawn http/2 fixture");
         assert!(TcpStream::connect(format!("127.0.0.1:{}", handle.port())).is_ok());
     }

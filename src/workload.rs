@@ -57,6 +57,26 @@ pub enum Fixture {
     },
 }
 
+impl Fixture {
+    /// Ports on `127.0.0.1` (host) that need to be reachable from the
+    /// servoshell process. Used by the OHOS target to set up
+    /// `hdc rport` forwards so the device can talk to host-side
+    /// fixtures.
+    ///
+    /// For HTTP/1.1 + HTTP/2: the fixture's listening port (the URL
+    /// targets it directly).
+    ///
+    /// For WPR replay: only the tunnel port — servoshell is configured
+    /// with `https_proxy=http://127.0.0.1:<tunnel_port>` and never
+    /// connects to the WPR server itself.
+    pub fn ports_to_forward(&self) -> Vec<u16> {
+        match self {
+            Fixture::Http1 { port, .. } | Fixture::Http2 { port, .. } => vec![*port],
+            Fixture::WprReplay { tunnel_port, .. } => vec![*tunnel_port],
+        }
+    }
+}
+
 fn default_wpr_port() -> u16 {
     4443
 }
@@ -136,6 +156,22 @@ url = "https://example.test/"
         .unwrap();
         let err = load(dir.path(), "x").unwrap_err();
         assert!(err.to_string().contains("does not match filename"));
+    }
+
+    #[test]
+    fn ports_to_forward_lists_relevant_host_ports() {
+        // http1/http2 → fixture port (the URL hits it directly).
+        let f = Fixture::Http1 { port: 4443, doc_root: "www".into() };
+        assert_eq!(f.ports_to_forward(), vec![4443]);
+        let f = Fixture::Http2 { port: 4444, doc_root: "www".into() };
+        assert_eq!(f.ports_to_forward(), vec![4444]);
+        // wpr-replay → tunnel only; servoshell never connects to wpr_port directly.
+        let f = Fixture::WprReplay {
+            archive: "x.wprgo".into(),
+            wpr_port: 4443,
+            tunnel_port: 4480,
+        };
+        assert_eq!(f.ports_to_forward(), vec![4480]);
     }
 
     #[test]

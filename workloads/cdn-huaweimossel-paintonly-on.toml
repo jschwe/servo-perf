@@ -1,0 +1,19 @@
+name = "cdn-huaweimossel-paintonly-on"
+url = "https://m.huaweimossel.com/#/"
+iterations = 15
+viewport = [824, 1830]
+device_pixel_ratio = 2.625
+user_agent = "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/14.2 Chrome/87.0.4280.141 Mobile Safari/537.36"
+# Patch arm of the paint-only-repatch A/B. Identical to the baseline
+# variant except for the `dom_image_paint_only_repatch_enabled=true`
+# pref, which routes <img> arrivals with already-known dimensions
+# through the new fragment-only repatch path in layout.
+servoshell_args = [
+    "--ignore-certificate-errors",
+    "--pref=threadpools_image_cache_workers_max=16",
+    "--pref=dom_image_paint_only_repatch_enabled=true",
+]
+
+[fixture]
+kind = "wpr-replay"
+archive = "cdn-huaweimossel.wprgo"

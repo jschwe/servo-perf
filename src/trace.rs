@@ -41,9 +41,20 @@ pub struct SpanRegistry {
 }
 
 /// Load the shared critical-path registry from
-/// `<workloads_dir>/_critical_path.toml`.
+/// `<workloads_dir>/_critical_path.toml`. Equivalent to
+/// `load_registry_named(workloads_dir, "_critical_path")`. Kept as the
+/// thin wrapper for tests and any external callers that don't care
+/// about target-specific registries.
+#[cfg(test)]
 pub fn load_registry(workloads_dir: &Path) -> Result<SpanRegistry> {
-    let path = workloads_dir.join("_critical_path.toml");
+    load_registry_named(workloads_dir, "_critical_path")
+}
+
+/// Load a critical-path registry by file stem (no extension). Used to
+/// switch between the desktop (`_critical_path`) and OHOS
+/// (`_critical_path_ohos`) registries — see [`crate::runner::Target`].
+pub fn load_registry_named(workloads_dir: &Path, stem: &str) -> Result<SpanRegistry> {
+    let path = workloads_dir.join(format!("{stem}.toml"));
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading critical-path registry at {}", path.display()))?;
     let r: SpanRegistry = toml::from_str(&text)
@@ -279,15 +290,31 @@ pub struct CriticalPathReport {
 /// smallest `ts_ns` across all input slices is treated as time zero. Raw
 /// perfetto timestamps are a platform clock (usually `CLOCK_BOOTTIME` /
 /// `CLOCK_MONOTONIC`) whose absolute value is meaningless outside the run.
+/// Phase names whose latest occurrence is the canonical one — the
+/// inverse of the default "first occurrence wins" rule. Currently
+/// only `LargestContentfulPaint`: servo fires an LCP candidate event
+/// every time a strictly *larger* contentful fragment is observed
+/// (per the W3C LCP spec's monotonic-area requirement), so the
+/// latest fire by `ts_ns` corresponds to the largest-area candidate
+/// — which is what the report should publish as "the LCP".
+const PICK_LATEST_PHASES: &[&str] = &["LargestContentfulPaint"];
+
 pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) -> CriticalPathReport {
-    // Pick the slice with the smallest ts_ns per name. This makes `analyse`
-    // correct regardless of the caller's input order — callers aren't
-    // required to sort before calling us.
+    // Pick the canonical slice per name. For most phases that's the
+    // smallest ts_ns (the *first* time it fires). For phases listed
+    // in PICK_LATEST_PHASES, it's the largest ts_ns (latest fire) —
+    // see the constant's docs.
     let first_by_name: HashMap<&str, &Slice> =
         slices.iter().fold(HashMap::new(), |mut acc, s| {
+            let pick_latest = PICK_LATEST_PHASES.contains(&s.name.as_str());
             acc.entry(s.name.as_str())
                 .and_modify(|existing: &mut &Slice| {
-                    if s.ts_ns < existing.ts_ns {
+                    let take = if pick_latest {
+                        s.ts_ns > existing.ts_ns
+                    } else {
+                        s.ts_ns < existing.ts_ns
+                    };
+                    if take {
                         *existing = s;
                     }
                 })
@@ -336,15 +363,24 @@ pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) ->
         }
     }
 
-    // For aggregated phases we clamp the accumulation window to FCP so
-    // post-paint frames don't inflate the total. If FCP is not in the
-    // trace, sum everything — the caller gets an upper bound instead of
-    // silently wrong data.
+    // Aggregate spans (`perform_updates`, `render`) accumulate every
+    // occurrence in the [startup, cutoff] window. Use the *latest*
+    // milestone that actually fired so the timeline extends through
+    // LCP when the page produces one — that's the user-facing
+    // "until LCP" requirement. If only earlier milestones (FP / FCP)
+    // fired, fall back to those. If none fired, sum everything (the
+    // caller gets an upper bound, not silently wrong data).
+    let milestone_names: Vec<&str> = registry
+        .phases
+        .iter()
+        .filter(|p| p.is_milestone)
+        .map(|p| p.name.as_str())
+        .collect();
     let fcp_cutoff_ns: Option<u64> = slices
         .iter()
-        .filter(|s| s.name == "FirstContentfulPaint")
+        .filter(|s| milestone_names.contains(&s.name.as_str()))
         .map(|s| s.ts_ns)
-        .min();
+        .max();
 
     for phase in &registry.phases {
         if phase.aggregate && !phase.is_milestone {
@@ -534,6 +570,67 @@ flag_threshold_ms = 10
         assert_eq!(r.named_spans.len(), 1);
         assert!(r.milestones.is_empty());
         assert!(r.gaps.is_empty());
+    }
+
+    #[test]
+    fn lcp_picks_latest_candidate() {
+        // Servo emits one LCP event per "new largest" candidate, so
+        // the LATEST occurrence corresponds to the largest area —
+        // which is what we want to report as "the LCP" per spec.
+        let registry = SpanRegistry {
+            phases: vec![
+                Phase {
+                    name: "LargestContentfulPaint".into(),
+                    owner_thread: "main".into(),
+                    is_milestone: true,
+                    aggregate: false,
+                },
+            ],
+            edges: vec![],
+        };
+        let slices = vec![
+            slice("LargestContentfulPaint", 100.0, 0.0), // small candidate, fires first
+            slice("LargestContentfulPaint", 200.0, 0.0),
+            slice("LargestContentfulPaint", 300.0, 0.0), // largest, fires last
+        ];
+        let r = super::analyse(&slices, &registry, 0);
+        assert_eq!(r.milestones.len(), 1);
+        // t0 = 100 ms (earliest slice). Latest LCP at 300 ms → 200 ms relative.
+        assert!(
+            (r.milestones[0].ts_ms - 200.0).abs() < 0.01,
+            "expected LCP@200 (latest, rebased), got {}",
+            r.milestones[0].ts_ms
+        );
+    }
+
+    #[test]
+    fn aggregate_cutoff_extends_to_latest_milestone() {
+        // Two milestones fire (FCP at 100, LCP at 300). Aggregate
+        // should sum every "render" up to LCP, not stop at FCP.
+        let registry = SpanRegistry {
+            phases: vec![
+                Phase { name: "render".into(), owner_thread: "main".into(), is_milestone: false, aggregate: true },
+                Phase { name: "FirstContentfulPaint".into(), owner_thread: "main".into(), is_milestone: true, aggregate: false },
+                Phase { name: "LargestContentfulPaint".into(), owner_thread: "main".into(), is_milestone: true, aggregate: false },
+            ],
+            edges: vec![],
+        };
+        let slices = vec![
+            slice("render", 50.0, 5.0),                  // before FCP — counted
+            slice("render", 150.0, 5.0),                 // post-FCP, pre-LCP — should still be counted
+            slice("FirstContentfulPaint", 100.0, 0.0),
+            slice("LargestContentfulPaint", 300.0, 0.0),
+            slice("render", 350.0, 5.0),                 // post-LCP — must NOT be counted
+        ];
+        let r = super::analyse(&slices, &registry, 0);
+        let render = r.named_spans.iter().find(|s| s.name == "render").expect("render row");
+        // 5 ms + 5 ms = 10 ms total, count 2; 350 ms occurrence excluded.
+        assert!(
+            (render.dur_ms - 10.0).abs() < 0.01,
+            "expected 10 ms aggregate up to LCP, got {} ms",
+            render.dur_ms
+        );
+        assert_eq!(render.count, Some(2));
     }
 
     #[test]

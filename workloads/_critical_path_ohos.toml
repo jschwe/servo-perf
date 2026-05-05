@@ -1,0 +1,209 @@
+# Critical-path phases for Servo startup on HarmonyOS / OpenHarmony.
+#
+# Differences from desktop's `_critical_path.toml`:
+#   * `FirstPaint` / `FirstContentfulPaint` / `LargestContentfulPaint`
+#     are now emitted via hitrace from servo's metrics setters in
+#     components/metrics/lib.rs (`tracing::trace_span!(name = ...,
+#     servo_profiling = true)`). They also reach the desktop pftrace
+#     via the same call. `PageLoadEndedPrompt` (host-side ScopedTrace
+#     in servoshell on `LoadStatus::Complete`) is kept as a fallback
+#     phase — it fires later than FCP and helps surface the
+#     post-paint loading tail.
+#   * Servo's per-isolate Script thread is named `Script#1` / `Script#2`
+#     on OHOS (vs. plain `Script` on desktop). The runner is currently
+#     exact-match on `owner_thread`, so we list both worker variants.
+#   * `HeadlessWindow::new` / desktop's `create_platform_window` don't
+#     appear; we use `on_surface_created_cb` (emitted by servoshell's
+#     XComponent surface callback) as the startup-bracket anchor.
+#   * Process-wide spans (`Servo::new`, `script::init`,
+#     `create_toplevel_webview`) are emitted from the comm
+#     `org.servo.servo` rather than `main`.
+#   * `perform_updates` and `render` fire many times per startup
+#     (each main-thread turn). Aggregating until FCP gives total
+#     main-thread paint/update / WebRender time and helps surface
+#     where the script→FCP gap goes.
+
+[[phase]]
+# Servoshell's surface callback — first servoshell-side trace event
+# after the OHOS UIAbility hands control to the native side.
+name = "on_surface_created_cb"
+owner_thread = "org.servo.servo"
+
+[[phase]]
+name = "Servo::new"
+owner_thread = "org.servo.servo"
+
+[[phase]]
+name = "script::init"
+owner_thread = "org.servo.servo"
+
+[[phase]]
+name = "create_toplevel_webview"
+owner_thread = "org.servo.servo"
+
+[[phase]]
+name = "handle_new_top_level_browsing_context"
+owner_thread = "Constellation"
+
+# Same upstream typo as desktop. Script thread is named "Script#1" on
+# the first webview; later isolates get "Script#N". We attribute to
+# `Script#1` since startup-to-FCP runs on the initial Script worker.
+[[phase]]
+name = "ScripThread::new"
+owner_thread = "Script#1"
+
+[[phase]]
+name = "pre_page_load"
+owner_thread = "Script#1"
+
+# `document::first_byte` fires from the script thread when the first
+# response byte for the top-level document arrives. Splits the
+# pre_page_load → ServoParser::finish gap into "network wait" vs
+# "parse".
+[[phase]]
+name = "document::first_byte"
+owner_thread = "Script#1"
+
+[[phase]]
+name = "ServoParser::finish"
+owner_thread = "Script#1"
+
+# Body parsed completely. Useful anchor between ServoParser::finish
+# (parser teardown) and the first reflow. On some pages
+# `body_complete` fires *before* `ServoParser::finish` because the
+# body element completes parsing while the parser still has more
+# work to do for trailing scripts/iframes; that's normal.
+[[phase]]
+name = "document::body_complete"
+owner_thread = "Script#1"
+
+[[phase]]
+name = "Window::reflow"
+owner_thread = "Script#1"
+
+# Each of these fires many times per startup (one per main-thread
+# turn / one per WebRender draw / one per layout / one per image
+# arrival). Aggregating up to the latest milestone (LCP when it
+# fires) gives total time spent in each phase across the window —
+# the typical biggest gaps on slower devices.
+[[phase]]
+name = "perform_updates"
+owner_thread = "org.servo.servo"
+aggregate = true
+
+[[phase]]
+name = "render"
+owner_thread = "org.servo.servo"
+aggregate = true
+
+# Layout work on the initial Script worker. Aggregates each layout
+# pass (from style recalc through fragment tree). A high count
+# during the FCP→LCP tail means lots of relayouts driven by lazy
+# image arrivals.
+[[phase]]
+name = "Layout"
+owner_thread = "Script#1"
+aggregate = true
+
+# Box-tree (re)construction subset of `Layout`. When a `<img>` is
+# loaded, today's path marks the node `NodeDamage::Other` ⇒
+# `RestyleDamage::reconstruct()`, which runs full box-tree
+# reconstruct on the next layout. Aggregating this gives a more
+# accurate cost-per-image-arrival than `Layout` (which also covers
+# style recalc and fragment-tree). Counted on Script#1 since that's
+# where the initial pipeline runs; sub-pipelines on Script#2 are
+# captured separately when needed.
+[[phase]]
+name = "Box Tree Construction"
+owner_thread = "Script#1"
+aggregate = true
+
+# Fires from the constellation each time an async image finishes
+# loading (and thus may trigger an LCP candidate). Count tells you
+# how many images landed before LCP; total dur is the constellation
+# overhead.
+[[phase]]
+name = "handle_no_longer_waiting_on_asynchronous_image_updates"
+owner_thread = "Constellation"
+aggregate = true
+
+# Constellation-side handler that promotes paint metrics into LCP
+# candidates. One firing per metric update, so the count = number
+# of paint metrics observed up to LCP.
+[[phase]]
+name = "handle_paint_metric"
+owner_thread = "Constellation"
+aggregate = true
+
+# Real paint metrics. Emitted from `set_first_paint` /
+# `set_first_contentful_paint` / `set_largest_contentful_paint` in
+# components/metrics/lib.rs as instant tracing events with
+# `tracing::trace!(name: "...", servo_profiling = true)`. The
+# `HitraceLayer::on_event` impl emits a B/E pair (~1 µs apart) for
+# every event whose name + level pass the EnvFilter; the
+# `servo_profiling = true` field is what gates a TRACE-level event
+# through `info,[{servo_profiling=true}]=trace`. The setter runs on
+# whichever thread is processing the layout/paint, which on OHOS is
+# normally `org.servo.servo` (the process main) for the first
+# pipeline and `Script#1` / `Script#2` for sub-pipelines.
+# Milestones match by name only — `analyse()` ignores
+# `owner_thread` for them — so the value here is documentation
+# rather than constraint.
+[[phase]]
+name = "FirstPaint"
+owner_thread = "org.servo.servo"
+is_milestone = true
+
+[[phase]]
+name = "FirstContentfulPaint"
+owner_thread = "org.servo.servo"
+is_milestone = true
+
+[[phase]]
+name = "LargestContentfulPaint"
+owner_thread = "org.servo.servo"
+is_milestone = true
+
+# Diagnostic — fires from servoshell when `LoadStatus::Complete`
+# reaches the host. Tracks "load events fired" rather than "first
+# content painted". Kept as a regular (non-milestone) phase so it
+# still shows at the bottom of the critical-path table; the
+# **timeline cutoff** for aggregates (`perform_updates`, `render`)
+# is the latest fired milestone, which we want to be LCP — having
+# PageLoadEndedPrompt as a milestone too would extend aggregates by
+# ~hundreds of ms past the user-meaningful "until LCP" window.
+[[phase]]
+name = "PageLoadEndedPrompt"
+owner_thread = "org.servo.servo"
+
+# Edges: pick a few that we expect to remain stable.
+
+[[edge]]
+from = "on_surface_created_cb"
+to = "Servo::new"
+expected_gap_ms = 1
+flag_threshold_ms = 50
+
+[[edge]]
+from = "Servo::new"
+to = "create_toplevel_webview"
+expected_gap_ms = 5
+flag_threshold_ms = 50
+
+[[edge]]
+from = "handle_new_top_level_browsing_context"
+to = "ScripThread::new"
+expected_gap_ms = 5
+flag_threshold_ms = 50
+
+[[edge]]
+from = "pre_page_load"
+to = "ServoParser::finish"
+expected_gap_ms = 50
+flag_threshold_ms = 500
+
+[[edge]]
+from = "Window::reflow"
+to = "PageLoadEndedPrompt"
+expected_gap_ms = 100
+flag_threshold_ms = 1000

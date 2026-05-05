@@ -1,5 +1,11 @@
 // tools/servoperf/src/runner.rs
-//! Runs one servoshell iteration, captures its pftrace.
+//! Runs one servoshell iteration and produces a parseable trace file.
+//!
+//! Two targets are supported:
+//!   * **Local** — spawn `servoshell` as a subprocess on the host, copy
+//!     out `servo.pftrace` (perfetto binary).
+//!   * **OHOS** — drive a HarmonyOS device via `hdc`, capture `hitrace`
+//!     text, pull it via `hdc file recv`. See [`crate::ohos`].
 
 use anyhow::{Context, Result};
 use std::fs;
@@ -8,7 +14,59 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::ohos::OhosTarget;
 use crate::workload::Workload;
+
+/// Where this iteration is going to execute. Built once per servoperf
+/// invocation from CLI args, then passed by reference into [`run_once`].
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// Spawn a local servoshell binary (the original behaviour).
+    Local { bin: PathBuf },
+    /// Drive a HarmonyOS device. The .hap is expected to already be
+    /// installed; install once via `OhosTarget::install_hap` before the
+    /// loop if you have a hap path.
+    Ohos(OhosTarget),
+}
+
+impl Target {
+    /// Path-shaped identifier for `report.rs` ("which binary did we
+    /// measure?"). For OHOS this is the device's bundle name dressed up
+    /// as a fake path so existing JSON consumers keep working.
+    pub fn bin_label(&self) -> PathBuf {
+        match self {
+            Target::Local { bin } => bin.clone(),
+            Target::Ohos(t) => PathBuf::from(format!("ohos://{}", t.bundle)),
+        }
+    }
+
+    /// Filename stem (under `workloads/`) of the critical-path registry
+    /// to use for this target. OHOS lacks several spans desktop has
+    /// (FCP / FirstPaint), and labels its `Script` thread differently,
+    /// so it gets its own registry.
+    pub fn registry_stem(&self) -> &'static str {
+        match self {
+            Target::Local { .. } => "_critical_path",
+            Target::Ohos(_) => "_critical_path_ohos",
+        }
+    }
+
+    /// Span name used as the headline "first-paint-like" milestone for
+    /// this target. Both desktop and OHOS now report
+    /// `FirstContentfulPaint` — servo's metrics setters emit a tracing
+    /// span tagged `servo_profiling = true` (see
+    /// `components/metrics/lib.rs`), which both the PerfettoLayer
+    /// (desktop) and HitraceLayer (OHOS) pick up. The OHOS-only
+    /// `PageLoadEndedPrompt` fallback stays in the registry as a
+    /// further-down phase so it still shows in the critical-path
+    /// table for diagnostic purposes.
+    pub fn primary_milestone(&self) -> &'static str {
+        match self {
+            Target::Local { .. } => "FirstContentfulPaint",
+            Target::Ohos(_) => "FirstContentfulPaint",
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -31,30 +89,40 @@ pub struct RunArtifact {
     pub exit_wall_ns: u64,
 }
 
-/// Run `bin` against `workload` once. Returns a [`RunArtifact`] containing
-/// the path to the copied `iter_<iter>.pftrace` and wallclock brackets.
+/// Run a single iteration against `target`. Returns a [`RunArtifact`]
+/// containing the path to the produced trace file and wallclock
+/// brackets.
 ///
 /// `proxy_uri`, when `Some`, is passed to servoshell via `https_proxy` /
-/// `http_proxy` env vars so its fetches route through e.g. the
-/// `wpr-replay` tunnel.
+/// `http_proxy` env vars (Local) or as `network_*_proxy_uri` prefs
+/// (OHOS) so its fetches route through e.g. the `wpr-replay` tunnel.
 ///
-/// `timeout` bounds how long we wait for servoshell to exit. A hung
-/// servoshell (e.g. a page script retrying a 404 forever) is SIGKILL'd
-/// and the iteration is reported as a [`RunError::Timeout`]. The caller
-/// picks the bound dynamically from the median of prior successful
-/// iterations (see `bench.rs` / `ab.rs`).
+/// `timeout` bounds the local case only — OHOS uses
+/// `OhosTarget::capture_seconds` instead, which the device-side hitrace
+/// capture window already enforces.
 pub fn run_once(
-    bin: &Path,
+    target: &Target,
     workload: &Workload,
     iter: u32,
     out_dir: &Path,
     proxy_uri: Option<&str>,
     timeout: Duration,
 ) -> Result<RunArtifact> {
+    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+    let bin = match target {
+        Target::Local { bin } => bin.as_path(),
+        Target::Ohos(ohos) => {
+            let art = ohos.run_iteration(workload, iter, out_dir, proxy_uri)?;
+            return Ok(RunArtifact {
+                pftrace: art.trace,
+                spawn_wall_ns: art.spawn_wall_ns,
+                exit_wall_ns: art.exit_wall_ns,
+            });
+        }
+    };
     if !bin.is_file() {
         anyhow::bail!(RunError::BinaryNotFound(bin.into()));
     }
-    fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     // Each iteration runs in a unique cwd so servo.pftrace lands in isolation.
     let iter_cwd = out_dir.join(format!("cwd_{iter}"));
     fs::create_dir_all(&iter_cwd).with_context(|| format!("creating {}", iter_cwd.display()))?;
@@ -64,6 +132,11 @@ pub fn run_once(
     cmd.arg("--headless").arg("--exit");
     cmd.arg("--tracing-filter").arg(&workload.tracing_filter);
     cmd.arg("-o").arg(iter_cwd.join("out.png"));
+    // LCP fragment-area accounting is gated by an off-by-default pref;
+    // servoperf cares about LCP on every workload, so enable it
+    // unconditionally here. Mirrored in
+    // `crate::ohos::workload_args_to_aa_params` for the OHOS path.
+    cmd.arg("--pref").arg("largest_contentful_paint_enabled=true");
     if let Some((w, h)) = workload.viewport {
         cmd.arg("--window-size").arg(format!("{}x{}", w, h));
     }

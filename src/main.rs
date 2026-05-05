@@ -4,6 +4,7 @@
 mod cli;
 mod cmd;
 mod fixtures;
+mod ohos;
 mod proto;
 mod report;
 mod runner;

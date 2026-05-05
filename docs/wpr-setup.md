@@ -113,6 +113,24 @@ servoshell accept WPR's self-signed leaf certs without any OS-level
 trust-store wiring. That's the same mechanism the local `h1-multi` and
 `h2-multi` fixtures use for their self-signed certs.
 
+### Why the `--no-archive-certificates` flag?
+
+WPR's default replay mode reuses the leaf certs that were minted at
+recording time and stored inside the `.wprgo`. Those leaves were signed
+by the recording-time root key, so once you regenerate `wpr_cert.pem`
+/ `wpr_key.pem` (e.g. moving from the shipped 1024-bit RSA to the new
+2048-bit one in step 5), the archived leaves no longer chain to the
+on-disk root and every TLS handshake fails with
+`InvalidCertificate(BadSignature)`. This error is **not** suppressed by
+`--ignore-certificate-errors` in servoshell — that flag only ignores
+the trust path (`UnknownIssuer`), not a cryptographic signature
+mismatch.
+
+`servoperf` passes `--no-archive-certificates` to WPR automatically
+(see `fn spawn_wpr` in `src/fixtures.rs`), forcing fresh leaves at
+play time using whatever root is currently on disk. You don't need to
+do anything; this section just records *why* we set the flag.
+
 ## 6. (One-off, after environment changes) Tell servoperf where WPR is
 
 The servoperf `wpr-replay` fixture looks for the binary and cert files
@@ -148,13 +166,76 @@ like randomised analytics URLs), run `servoperf bench` three or four
 times against the live origin before deleting; each additional record
 pass merges into the same archive file.
 
-## 8. Troubleshooting
+## 8. Replaying to a HarmonyOS / OpenHarmony device
+
+The WPR fixture works with `--ohos` too. The host runs `wpr` + the
+`wpr_tunnel` shim exactly as for desktop; servoperf adds an
+`hdc rport tcp:<tunnel_port> tcp:<tunnel_port>` so the device can
+reach the host's loopback proxy:
+
+```
+device                                host
+servoshell  --(CONNECT m.huaweimossel.com:443)-->  wpr_tunnel:4480
+                via 127.0.0.1:4480 → rport →               │
+                                                           ▼
+                                                       wpr:4443
+                                                  (replays archive)
+```
+
+What's plumbed automatically:
+
+- `Fixture::ports_to_forward()` returns `[tunnel_port]` for `WprReplay`.
+  servoperf installs the rport, the device sees `127.0.0.1:<tunnel_port>`
+  bridged to the host, and the proxy URI works unchanged.
+- The OHOS args translator routes the workload's
+  `--ignore-certificate-errors` to `--psn=--ignore-certificate-errors`
+  on `aa start`. It also injects the proxy URI as servoshell prefs
+  (`network_https_proxy_uri` / `network_http_proxy_uri`) — env-var
+  inheritance doesn't survive the `aa start` boundary.
+
+**Auto-record on OHOS** works the same as on desktop: when the
+`.wprgo` archive is missing, `servoperf` runs a one-shot record pass
+through `aa start` against the live origin (via `wpr_tunnel` +
+`hdc rport`) and then flips into replay mode for the iteration loop.
+The window is 45 s by default — enough to capture page load and the
+lazy-loaded image tail — and is overridable with
+`--ohos-record-seconds <n>`. The driver is selected automatically by
+[`build_record_driver`](../src/cmd/bench.rs):
+
+- desktop target → `LocalServoshellDriver { bin: <servoshell> }`
+- OHOS target    → `OhosRecordDriver { target, record_seconds }`
+
+After recording, `servoperf` requires the archive to be at least
+100 KB (a tiny archive almost always means "device couldn't reach the
+proxy" — bundle not installed, or `hdc rport` not listening).
+
+End-to-end recipe (no prior desktop record needed):
+
+```sh
+# 1. Build + install the OHOS hap with hitrace tracing.
+( cd servo
+  ./mach build --ohos --flavor=harmonyos --profile=release \
+               --features tracing,tracing-hitrace
+  ./mach install --ohos --flavor=harmonyos --profile=release )
+
+# 2. Bench against the device. servoperf records the missing archive
+#    on first run, then replays. Subsequent runs replay only.
+servoperf bench cdn-huaweimossel --ohos --iterations=10
+# Override the record window for slow pages: --ohos-record-seconds=90
+```
+
+## 9. Troubleshooting
 
 - **`listen tcp 127.0.0.1:4443: bind: address already in use`** — a
   previous WPR or tunnel didn't exit cleanly. `pkill -x wpr` and
   re-run.
-- **`invalid peer certificate: BadSignature`** — your WPR is still
-  using the shipped 1024-bit CA. Redo step 5.
+- **`invalid peer certificate: BadSignature`** — *either* your WPR is
+  still using the shipped 1024-bit CA (redo step 5), *or* WPR is
+  replaying archived leaves signed by an older root key. The current
+  `spawn_wpr` passes `--no-archive-certificates`, so this should be a
+  non-issue with `servoperf`-launched WPR. If you're invoking `wpr`
+  by hand, add the flag yourself; otherwise rebuild a fresh archive
+  after regenerating the CA.
 - **`x509: no SerialNumber given`** — the patch in step 3 didn't land.
   Re-edit `certs.go` and re-run `go build`.
 - **`fixture_server binary not found`** — the servoperf binary and the
