@@ -73,6 +73,11 @@ name = "FirstContentfulPaint"
 owner_thread = "main"
 is_milestone = true
 
+[[phase]]
+name = "LargestContentfulPaint"
+owner_thread = "main"
+is_milestone = true
+
 # Edges whose observed gap we want to flag when it grows. Order matters.
 
 [[edge]]
