@@ -87,6 +87,14 @@ pub struct RunArtifact {
     pub pftrace: PathBuf,
     pub spawn_wall_ns: u64,
     pub exit_wall_ns: u64,
+    /// SoC thermal zone reading (milli-Celsius) immediately before
+    /// launch, on OHOS only. `None` for local targets or when the
+    /// read failed.
+    pub thermal_before_milli_c: Option<i64>,
+    /// SoC thermal zone reading right after the iteration's render
+    /// window, on OHOS only. `None` for local targets or when the
+    /// read failed.
+    pub thermal_after_milli_c: Option<i64>,
 }
 
 /// Run a single iteration against `target`. Returns a [`RunArtifact`]
@@ -117,6 +125,8 @@ pub fn run_once(
                 pftrace: art.trace,
                 spawn_wall_ns: art.spawn_wall_ns,
                 exit_wall_ns: art.exit_wall_ns,
+                thermal_before_milli_c: art.thermal_before_milli_c,
+                thermal_after_milli_c: art.thermal_after_milli_c,
             });
         }
     };
@@ -208,7 +218,13 @@ pub fn run_once(
     })?;
     // Clean up the iteration cwd (but keep the pftrace outside it).
     let _ = fs::remove_dir_all(&iter_cwd);
-    Ok(RunArtifact { pftrace: dest, spawn_wall_ns, exit_wall_ns })
+    Ok(RunArtifact {
+        pftrace: dest,
+        spawn_wall_ns,
+        exit_wall_ns,
+        thermal_before_milli_c: None,
+        thermal_after_milli_c: None,
+    })
 }
 
 /// Drain whatever is pending on the child's stderr pipe and return the

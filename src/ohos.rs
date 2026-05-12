@@ -41,6 +41,12 @@ pub struct OhosTarget {
     pub trace_tags: Vec<String>,
     pub capture_seconds: u64,
     pub trace_level: String,
+    /// Seconds to sleep after each `install_hap` so the SoC cools from
+    /// install-time CPU load before iterations begin.
+    pub post_install_cooldown_seconds: u64,
+    /// Seconds to keep the warmup `aa start about:blank` alive after
+    /// install so sandbox setup is paid before the first measured run.
+    pub warmup_seconds: u64,
 }
 
 impl OhosTarget {
@@ -61,14 +67,55 @@ impl OhosTarget {
                 .collect(),
             capture_seconds: a.ohos_capture_seconds,
             trace_level: a.ohos_trace_level.clone(),
+            post_install_cooldown_seconds: a.ohos_post_install_cooldown_seconds,
+            warmup_seconds: a.ohos_warmup_seconds,
         }
     }
 
-    /// Bundle override (used by `ab` to launch base vs patch hap when
-    /// they're installed under distinct bundle names).
-    pub fn with_bundle(mut self, bundle: String) -> Self {
-        self.bundle = bundle;
-        self
+    /// Launch the app once against `about:blank`, hold for
+    /// `warmup_seconds`, then force-stop. Pays the sandbox-init cost
+    /// (inode/mmap warming, JIT cache priming) outside the measured
+    /// loop so the first measured iteration starts from the same
+    /// steady-state as later ones. No tracing — this launch isn't
+    /// captured. No-op when the window is zero.
+    pub fn warmup_launch(&self) -> Result<()> {
+        if self.warmup_seconds == 0 {
+            return Ok(());
+        }
+        self.force_stop();
+        self.hdc(&[
+            "shell", "aa", "start",
+            "-a", &self.ability,
+            "-b", &self.bundle,
+            "-U", "about:blank",
+        ])
+        .context("warmup aa start about:blank")?;
+        std::thread::sleep(Duration::from_secs(self.warmup_seconds));
+        self.force_stop();
+        eprintln!("ohos: warmup launch about:blank held {}s", self.warmup_seconds);
+        Ok(())
+    }
+
+    /// Sample SoC thermal, sleep `post_install_cooldown_seconds`, sample
+    /// again; log both readings to stderr so the operator can tell if the
+    /// wait was sufficient. No-op when the cooldown window is zero.
+    pub fn cooldown_after_install(&self) {
+        if self.post_install_cooldown_seconds == 0 {
+            return;
+        }
+        let before = self.read_soc_thermal_milli_c();
+        std::thread::sleep(Duration::from_secs(self.post_install_cooldown_seconds));
+        let after = self.read_soc_thermal_milli_c();
+        let fmt = |mc: Option<i64>| match mc {
+            Some(v) => format!("{:.1} °C", (v as f64) / 1000.0),
+            None => "—".to_string(),
+        };
+        eprintln!(
+            "ohos: cooldown {}s after install — SoC {} → {}",
+            self.post_install_cooldown_seconds,
+            fmt(before),
+            fmt(after),
+        );
     }
 
     /// Run `hdc <args>`, threading `-s <server>` if configured. Returns
@@ -132,6 +179,20 @@ impl OhosTarget {
     /// Stop any running instance of the bundle. Tolerates "not running".
     pub fn force_stop(&self) {
         let _ = self.hdc(&["shell", "aa", "force-stop", &self.bundle]);
+    }
+
+    /// Read SoC thermal zone 0 (`/sys/class/thermal/thermal_zone0/temp`,
+    /// labelled `soc_thermal`) in milli-Celsius. The SoC trip point on
+    /// this hardware is 70 000 mC (70 °C, `passive` type, `power_allocator`
+    /// governor); reading milli-Celsius keeps both before and after
+    /// snapshots comparable against that threshold without losing
+    /// precision. Returns `None` if the read fails — caller treats absence
+    /// as "no thermal info this iter" rather than failing the iteration.
+    pub fn read_soc_thermal_milli_c(&self) -> Option<i64> {
+        let out = self
+            .hdc(&["shell", "cat", "/sys/class/thermal/thermal_zone0/temp"])
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse::<i64>().ok()
     }
 
     /// Read the current `persist.hitrace.level.threshold` via
@@ -270,6 +331,11 @@ impl OhosTarget {
         begin_args.push("--trace_begin");
         self.hdc(&begin_args).context("hitrace --trace_begin")?;
 
+        // Thermal snapshot immediately before launch — anchors the
+        // per-iteration delta. If the read fails the iteration still
+        // runs; the metric just won't appear in raw.json for this iter.
+        let thermal_before_milli_c = self.read_soc_thermal_milli_c();
+
         let spawn_wall_ns = wall_now_ns();
         self.aa_start(workload, proxy_uri)
             .with_context(|| format!("aa start failed for {}", self.bundle))?;
@@ -277,6 +343,11 @@ impl OhosTarget {
         // Wait for the app to render. The capture window is fixed: too
         // short and we miss FCP, too long and we waste seconds per iter.
         std::thread::sleep(Duration::from_secs(self.capture_seconds));
+
+        // Thermal snapshot right after the render window — captures
+        // whatever peak heat the iteration produced before `force_stop`
+        // lets the SoC start cooling again.
+        let thermal_after_milli_c = self.read_soc_thermal_milli_c();
 
         // Stop the trace, flushing the buffer to a file on the device.
         let stop_args: Vec<&str> = vec![
@@ -300,7 +371,13 @@ impl OhosTarget {
         // Stop the app so the next iteration starts cold.
         self.force_stop();
 
-        Ok(RunArtifact { trace: dest, spawn_wall_ns, exit_wall_ns })
+        Ok(RunArtifact {
+            trace: dest,
+            spawn_wall_ns,
+            exit_wall_ns,
+            thermal_before_milli_c,
+            thermal_after_milli_c,
+        })
     }
 }
 
@@ -310,6 +387,12 @@ pub struct RunArtifact {
     pub trace: PathBuf,
     pub spawn_wall_ns: u64,
     pub exit_wall_ns: u64,
+    /// SoC thermal zone reading (milli-Celsius) sampled right before
+    /// `aa start`. `None` if the read failed.
+    pub thermal_before_milli_c: Option<i64>,
+    /// SoC thermal zone reading sampled right after the capture window.
+    /// `None` if the read failed.
+    pub thermal_after_milli_c: Option<i64>,
 }
 
 /// RAII handle that drops `hdc rport` forwards on scope exit. Holds its

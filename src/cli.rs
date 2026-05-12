@@ -13,7 +13,10 @@ pub struct Cli {
 pub enum Command {
     /// Run a workload once against a single binary.
     Bench(BenchArgs),
-    /// Run a workload paired against two binaries, interleaved.
+    /// Run a workload paired against two binaries, sequentially: all base
+    /// iterations first, then all patch iterations. In OHOS mode this lets
+    /// both haps share a single bundle name (re-installing once between
+    /// phases) at the cost of any drift in system state between phases.
     Ab(AbArgs),
     /// Run a workload and compare against a saved baseline JSON.
     Regression(RegressionArgs),
@@ -74,6 +77,22 @@ pub struct OhosArgs {
     /// already configured it).
     #[arg(long, default_value = "Debug")]
     pub ohos_trace_level: String,
+    /// Seconds to sleep after each `hdc install` so the device's SoC
+    /// can cool from install-time CPU load (sustained `hdc install`
+    /// of the ~90 MB servoshell hap pushes the SoC up by 10+ °C on the
+    /// reference device) before the first iteration. The cooldown
+    /// brackets are logged so it's visible whether the wait was
+    /// sufficient. Set to 0 to skip.
+    #[arg(long, default_value_t = 15)]
+    pub ohos_post_install_cooldown_seconds: u64,
+    /// Seconds to keep the warmup `aa start about:blank` alive after
+    /// install (run between cooldown and the first measured iteration).
+    /// First-launch-after-install on OHOS pays a one-time sandbox
+    /// initialisation cost (inode/mmap warming, JIT cache priming);
+    /// without this the first measured iteration is ~3× the steady-state
+    /// FCP. Set to 0 to skip.
+    #[arg(long, default_value_t = 5)]
+    pub ohos_warmup_seconds: u64,
     /// Wall-clock window (seconds) for one WPR record pass on OHOS.
     /// Only consulted when a `wpr-replay` workload is running with
     /// `--ohos` and the .wprgo archive is missing — `servoperf` then
@@ -110,22 +129,16 @@ pub struct BenchArgs {
 #[derive(clap::Args, Clone)]
 pub struct AbArgs {
     pub workload: String,
-    /// Base servoshell binary, or `.hap` in OHOS mode (optional in OHOS
-    /// mode if both haps are pre-installed under different bundle names —
-    /// see `--base-ohos-bundle`).
+    /// Base servoshell binary, or `.hap` in OHOS mode. In OHOS mode the
+    /// hap is installed before the base phase begins — relying on a
+    /// pre-installed bundle would risk measuring stale code.
     #[arg(long)]
-    pub base_bin: Option<PathBuf>,
-    /// Patch servoshell binary, or `.hap` in OHOS mode.
+    pub base_bin: PathBuf,
+    /// Patch servoshell binary, or `.hap` in OHOS mode. In OHOS mode the
+    /// hap is installed between the base and patch phases, overwriting
+    /// the base install (both phases use `--ohos-bundle`).
     #[arg(long)]
-    pub patch_bin: Option<PathBuf>,
-    /// In OHOS mode: bundle name for the "base" .hap. Defaults to
-    /// `--ohos-bundle`. Use a distinct value when both haps are
-    /// pre-installed side-by-side.
-    #[arg(long)]
-    pub base_ohos_bundle: Option<String>,
-    /// In OHOS mode: bundle name for the "patch" .hap.
-    #[arg(long)]
-    pub patch_ohos_bundle: Option<String>,
+    pub patch_bin: PathBuf,
     #[arg(long)]
     pub iterations: Option<u32>,
     #[arg(long)]

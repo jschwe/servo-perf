@@ -160,6 +160,83 @@ fn render_per_iter_chart(
     writeln!(s).unwrap();
 }
 
+/// Append a "Thermal" section with a min/max/peak-delta summary and a
+/// per-iteration before/after/Δ table. Values are stored as milli-Celsius
+/// in the metrics map; the section converts to °C with one decimal for
+/// readability. Iterations missing the metric (read failures, local
+/// target) render as `—`.
+fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
+    fn mc_to_c(mc: f64) -> f64 { mc / 1000.0 }
+    let befores: Vec<f64> = cfg
+        .iterations
+        .iter()
+        .filter_map(|i| match &i.status {
+            IterationStatus::Ok { metrics, .. } => metrics.get("soc_thermal_milli_c.before").copied(),
+            _ => None,
+        })
+        .collect();
+    let afters: Vec<f64> = cfg
+        .iterations
+        .iter()
+        .filter_map(|i| match &i.status {
+            IterationStatus::Ok { metrics, .. } => metrics.get("soc_thermal_milli_c.after").copied(),
+            _ => None,
+        })
+        .collect();
+    let deltas: Vec<f64> = cfg
+        .iterations
+        .iter()
+        .filter_map(|i| match &i.status {
+            IterationStatus::Ok { metrics, .. } => metrics.get("soc_thermal_milli_c.delta").copied(),
+            _ => None,
+        })
+        .collect();
+
+    writeln!(s, "### SoC thermal (zone0 `soc_thermal`, 70 °C trip)\n").unwrap();
+    let min_temp = befores.iter().chain(afters.iter()).cloned().fold(f64::INFINITY, f64::min);
+    let max_temp = befores.iter().chain(afters.iter()).cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max_delta = deltas.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if min_temp.is_finite() && max_temp.is_finite() {
+        let headroom_to_trip = 70.0 - mc_to_c(max_temp);
+        let max_delta_str = if max_delta.is_finite() {
+            format!("{:+.1} °C", mc_to_c(max_delta))
+        } else {
+            "—".to_string()
+        };
+        writeln!(
+            s,
+            "min {:.1} °C, max {:.1} °C (headroom to trip: {:.1} °C), peak Δ per iter: {}.\n",
+            mc_to_c(min_temp),
+            mc_to_c(max_temp),
+            headroom_to_trip,
+            max_delta_str,
+        )
+        .unwrap();
+    }
+    writeln!(s, "| iter | before (°C) | after (°C) | Δ (°C) |").unwrap();
+    writeln!(s, "|---:|---:|---:|---:|").unwrap();
+    for iter in &cfg.iterations {
+        let (b, a, d) = match &iter.status {
+            IterationStatus::Ok { metrics, .. } => (
+                metrics.get("soc_thermal_milli_c.before").copied().map(mc_to_c),
+                metrics.get("soc_thermal_milli_c.after").copied().map(mc_to_c),
+                metrics.get("soc_thermal_milli_c.delta").copied().map(mc_to_c),
+            ),
+            _ => (None, None, None),
+        };
+        let fmt = |v: Option<f64>| match v {
+            Some(x) => format!("{:.1}", x),
+            None => "—".to_string(),
+        };
+        let dfmt = match d {
+            Some(x) => format!("{:+.1}", x),
+            None => "—".to_string(),
+        };
+        writeln!(s, "| {} | {} | {} | {} |", iter.index, fmt(b), fmt(a), dfmt).unwrap();
+    }
+    writeln!(s).unwrap();
+}
+
 fn render_markdown(data: &RunResults) -> String {
     let mut s = String::new();
     writeln!(
@@ -336,6 +413,18 @@ fn render_markdown(data: &RunResults) -> String {
                 if metrics.contains_key("LargestContentfulPaint"))
         }) {
             render_per_iter_chart(&mut s, "LCP", "LargestContentfulPaint", cfg);
+        }
+
+        // SoC thermal trace, OHOS only — gated on at least one
+        // iteration having captured a `before` sample. The SoC trip
+        // point is 70 °C on this hardware (`thermal_zone0` passive
+        // trip); a max anywhere near that means the run was thermally
+        // bounded and FCP/LCP numbers should be treated with caution.
+        if cfg.iterations.iter().any(|i| {
+            matches!(&i.status, IterationStatus::Ok { metrics, .. }
+                if metrics.contains_key("soc_thermal_milli_c.before"))
+        }) {
+            render_thermal_section(&mut s, cfg);
         }
     }
 

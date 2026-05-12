@@ -98,6 +98,21 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 for row in &cp.named_spans {
                     metrics.insert(format!("{}.dur_ms", row.name), row.dur_ms);
                 }
+                // Thermal snapshots (OHOS only). Absent on local targets.
+                if let Some(v) = art.thermal_before_milli_c {
+                    metrics.insert("soc_thermal_milli_c.before".to_string(), v as f64);
+                }
+                if let Some(v) = art.thermal_after_milli_c {
+                    metrics.insert("soc_thermal_milli_c.after".to_string(), v as f64);
+                }
+                if let (Some(b), Some(a)) =
+                    (art.thermal_before_milli_c, art.thermal_after_milli_c)
+                {
+                    metrics.insert(
+                        "soc_thermal_milli_c.delta".to_string(),
+                        (a - b) as f64,
+                    );
+                }
                 iterations.push(Iteration {
                     index: i,
                     status: IterationStatus::Ok {
@@ -170,6 +185,8 @@ pub(crate) fn build_target(ohos: &OhosArgs, bin: Option<&Path>) -> Result<Target
     if let Some(hap) = bin {
         eprintln!("ohos: installing {} on device", hap.display());
         target.install_hap(hap)?;
+        target.cooldown_after_install();
+        target.warmup_launch()?;
     }
     Ok(Target::Ohos(target))
 }
