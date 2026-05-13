@@ -237,6 +237,37 @@ fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
     writeln!(s).unwrap();
 }
 
+/// Render per-function inclusive instruction summaries when the run was
+/// invoked with `--with-instructions`. Quietly skipped otherwise.
+///
+/// Counts come from hiperf's stack-mode report, aggregated by
+/// [`crate::instructions::aggregate_inclusive`] and stored on each
+/// iteration under the key `instructions.<func>`. The summary row is
+/// computed in `cmd::bench` and lives at the same key in `cfg.summary`.
+fn render_instructions_section(s: &mut String, cfg: &ConfigResults) {
+    let entries: Vec<(&String, &Summary)> = cfg
+        .summary
+        .iter()
+        .filter(|(k, _)| k.starts_with("instructions."))
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    writeln!(s, "### Instructions (inclusive, hw-instructions)\n").unwrap();
+    writeln!(s, "| function | n | p50 (M) | mean (M) | p90 (M) | max (M) |").unwrap();
+    writeln!(s, "|---|---:|---:|---:|---:|---:|").unwrap();
+    for (key, sum) in entries {
+        let func = key.trim_start_matches("instructions.");
+        let m = |v: f64| v / 1_000_000.0;
+        writeln!(
+            s,
+            "| `{}` | {} | {:.1} | {:.1} | {:.1} | {:.1} |",
+            func, sum.n, m(sum.p50), m(sum.mean), m(sum.p90), m(sum.max),
+        ).unwrap();
+    }
+    writeln!(s).unwrap();
+}
+
 fn render_markdown(data: &RunResults) -> String {
     let mut s = String::new();
     writeln!(
@@ -289,6 +320,12 @@ fn render_markdown(data: &RunResults) -> String {
         writeln!(s, "| metric | n | min | p25 | p50 | mean | p75 | p90 | max |").unwrap();
         writeln!(s, "|---|---:|---:|---:|---:|---:|---:|---:|---:|").unwrap();
         for (metric, sum) in &cfg.summary {
+            // Instruction summaries are rendered in their own section with
+            // millions-formatting — skip them here to keep this table about
+            // timing metrics.
+            if metric.starts_with("instructions.") {
+                continue;
+            }
             writeln!(
                 s,
                 "| {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |",
@@ -297,6 +334,11 @@ fn render_markdown(data: &RunResults) -> String {
             .unwrap();
         }
         writeln!(s).unwrap();
+
+        // Per-function inclusive hw-instructions, populated only when
+        // `bench --with-instructions` ran. Numbers shown as millions; the
+        // raw integer counts are available in `raw.json`.
+        render_instructions_section(&mut s, cfg);
 
         // Critical-path phase table (representative iteration).
         writeln!(s, "### Critical path\n").unwrap();

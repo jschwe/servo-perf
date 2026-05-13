@@ -95,6 +95,10 @@ pub struct RunArtifact {
     /// window, on OHOS only. `None` for local targets or when the
     /// read failed.
     pub thermal_after_milli_c: Option<i64>,
+    /// Stack-mode hiperf report text from this iteration, OHOS-only
+    /// and only when `--with-instructions` was passed. Empty
+    /// otherwise.
+    pub stack_report: Option<String>,
 }
 
 /// Run a single iteration against `target`. Returns a [`RunArtifact`]
@@ -127,6 +131,7 @@ pub fn run_once(
                 exit_wall_ns: art.exit_wall_ns,
                 thermal_before_milli_c: art.thermal_before_milli_c,
                 thermal_after_milli_c: art.thermal_after_milli_c,
+                stack_report: art.stack_report,
             });
         }
     };
@@ -224,6 +229,7 @@ pub fn run_once(
         exit_wall_ns,
         thermal_before_milli_c: None,
         thermal_after_milli_c: None,
+        stack_report: None,
     })
 }
 

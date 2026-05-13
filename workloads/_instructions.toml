@@ -1,0 +1,87 @@
+# Global per-engine instruction-aggregation registry.
+#
+# servoperf detects which engine to use from the bundle name (--ohos-bundle).
+# The selected engine's `functions` substring list is matched against the
+# resolved symbol names in hiperf's stack-mode text report; each match
+# contributes its inclusive instruction count to the per-iteration metric
+# named after the function.
+#
+# Matching semantics (same as /tmp/parse_stack_report.py from session work):
+#   - case-sensitive substring match
+#   - within a single root-to-leaf path in the call tree, each function name
+#     is counted at most once (deepest occurrence wins) so transitively
+#     re-entered frames (e.g. UpdateLifecycle calling itself via a thunk)
+#     don't double-count.
+#
+# To add a new engine:
+#   1. Add a `[[engines]]` entry whose `bundles` list contains every bundle
+#      name servoperf might launch with this engine.
+#   2. Optionally set `symbol_file` — a host-side path to an unstripped .so
+#      that hiperf needs in `--symbol-dir`. Used by
+#      `servoperf prepare-arkweb-symbols` to produce the merged file and
+#      push it. Engines whose on-device library already has a usable
+#      .symtab (e.g. servoshell built with debug symbols) can leave it
+#      empty; servoperf will skip the prep step.
+
+[[engines]]
+id = "servo"
+# Servo builds installed under any of these bundles map to engine = servo.
+bundles = [
+  "org.servo.servo",
+  "org.servo.servo.base",
+  "org.servo.servo.patch",
+]
+# Symbols are present in the installed .so (release-with-symbols build),
+# nothing to merge.
+symbol_file = ""
+# Inclusive instruction counts for these symbols are exported as
+# per-iteration metrics named `instructions.<func>`.
+functions = [
+  # Trait-impl methods stay v0-mangled in hiperf's text output, so the
+  # match has to use the `$LT$ … $GT$` form. `Layout$GT$::reflow` picks
+  # up `<LayoutThread as Layout>::reflow` without colliding with
+  # `LayoutThread::handle_reflow`.
+  "Layout$GT$::reflow",
+  # `<T>::method` notation lands in the report demangled but with the
+  # closing angle bracket retained.
+  "Window>::reflow",
+  "LayoutThread::handle_reflow",
+]
+# Servoperf injects these flags (one per line) when the workload uses a
+# fixture-side proxy (e.g. wpr-replay). `$PROXY` is replaced with the
+# host-side proxy URI (already reachable from device via `hdc rport`).
+# Pre-`--ps=` / `--psn=` lines are passed through verbatim; bare lines
+# are wrapped in `--psn=…` automatically.
+proxy_args = [
+  "--pref=network_https_proxy_uri=$PROXY",
+  "--pref=network_http_proxy_uri=$PROXY",
+  "--ignore-certificate-errors",
+]
+
+[[engines]]
+id = "arkweb"
+bundles = [
+  "org.openharmonyrs.arkwebtest",
+  "com.huawei.hmos.browser",
+]
+# On-device libarkweb_engine.so is stripped to .dynsym + .gnu_debugdata
+# (LZMA-compressed minidebug). `servoperf prepare-arkweb-symbols` extracts
+# .gnu_debugdata, re-adds proper .symtab / .strtab sections, and pushes the
+# result. Path here is host-side; the device-side push target is fixed at
+# /data/local/tmp/symbols/libarkweb_engine.so.
+symbol_file = "libarkweb_engine.merged.so"
+functions = [
+  "WebFrameWidgetImpl::UpdateLifecycle",
+  "LocalFrameView::UpdateAllLifecyclePhases",
+  "LocalFrameView::RunPaintLifecyclePhase",
+  "LocalFrameView::UpdateStyleAndLayoutIfNeededRecursive",
+  "LocalFrameView::UpdateStyleAndLayout(",
+  "Document::UpdateStyleAndLayout(",
+  "Document::UpdateStyleAndLayoutTree",
+]
+# arkweb-test reads these in EntryAbility.ets and applies the proxy via
+# webview.ProxyController.applyProxyOverride before loadUrl.
+proxy_args = [
+  "--proxy-uri=$PROXY",
+  "--ignore-certificate-errors",
+]

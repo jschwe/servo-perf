@@ -4,6 +4,7 @@
 mod cli;
 mod cmd;
 mod fixtures;
+mod instructions;
 mod ohos;
 mod proto;
 mod report;
@@ -21,5 +22,6 @@ fn main() -> Result<()> {
         cli::Command::Bench(a) => cmd::bench::run(a),
         cli::Command::Ab(a) => cmd::ab::run(a),
         cli::Command::Regression(a) => cmd::regression::run(a),
+        cli::Command::PrepareArkwebSymbols(a) => cmd::prepare_symbols::run(a),
     }
 }

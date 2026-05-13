@@ -25,6 +25,9 @@ thiserror = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "fs", "io-util", "sync"] }
 tokio-rustls = "0.26"
 toml = "0.8"
+# Pure-Rust XZ decoder for the `.gnu_debugdata` MiniDebugInfo section
+# embedded in stripped ArkWeb .so files.
+lzma-rs = "0.3"
 
 [build-dependencies]
 prost-build = "0.13"

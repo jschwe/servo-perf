@@ -25,6 +25,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::cli::OhosArgs;
+use crate::instructions::DevicePaths;
 use crate::trace::Slice;
 use crate::workload::Workload;
 
@@ -47,6 +48,19 @@ pub struct OhosTarget {
     /// Seconds to keep the warmup `aa start about:blank` alive after
     /// install so sandbox setup is paid before the first measured run.
     pub warmup_seconds: u64,
+    /// `Some(period)` enables per-iteration `hiperf record -a -e hw-instructions`
+    /// alongside the hitrace capture. The blocking hiperf invocation
+    /// replaces the iteration's host-side sleep — hiperf itself enforces
+    /// the `capture_seconds` window via its `-d` flag, so the timing is
+    /// unchanged. `None` keeps the original sleep-only behaviour.
+    pub hiperf_period: Option<u64>,
+    /// Engine-specific proxy-arg templates pulled from
+    /// `workloads/_instructions.toml` and resolved from `bundle`. Used by
+    /// [`workload_args_to_aa_params`] to emit the right launch flags when
+    /// the workload's fixture supplies a proxy URI. Empty (or no match) →
+    /// fall back to Servo's pref-style injection for backward
+    /// compatibility.
+    pub engine_proxy_args: Vec<String>,
 }
 
 impl OhosTarget {
@@ -69,6 +83,10 @@ impl OhosTarget {
             trace_level: a.ohos_trace_level.clone(),
             post_install_cooldown_seconds: a.ohos_post_install_cooldown_seconds,
             warmup_seconds: a.ohos_warmup_seconds,
+            hiperf_period: if a.with_instructions { Some(a.instructions_period) } else { None },
+            // Populated by `crate::cmd::bench::build_target` after `from_args`,
+            // since the workloads_dir / engine lookup live in that scope.
+            engine_proxy_args: Vec::new(),
         }
     }
 
@@ -259,7 +277,7 @@ impl OhosTarget {
     /// between [`Self::run_iteration`] (replay/measure) and
     /// [`OhosRecordDriver::drive`] (record).
     fn aa_start(&self, workload: &Workload, proxy_uri: Option<&str>) -> Result<()> {
-        let aa_params = workload_args_to_aa_params(workload, proxy_uri);
+        let aa_params = workload_args_to_aa_params(workload, proxy_uri, &self.engine_proxy_args);
         let mut start_args: Vec<String> = vec![
             "shell".into(),
             "aa".into(),
@@ -305,9 +323,11 @@ impl OhosTarget {
     ///   * stop the app, clear any old trace
     ///   * `hitrace --trace_begin`
     ///   * `aa start … -U <url> [--ps=…]`
-    ///   * sleep `capture_seconds`
+    ///   * blocking capture window (`hiperf record -d …` when
+    ///     `hiperf_period` is set, otherwise `sleep capture_seconds`)
     ///   * `hitrace --trace_finish -o <on-device-path>`
     ///   * `hdc file recv` → `out_dir/iter_<iter>.hitrace.txt`
+    ///   * if hiperf ran: produce + recv `iter_<iter>.stack.txt`
     pub fn run_iteration(
         &self,
         workload: &Workload,
@@ -318,6 +338,10 @@ impl OhosTarget {
         // Pre-iteration housekeeping.
         self.force_stop();
         let _ = self.hdc(&["shell", "rm", "-f", &self.trace_path_on_device]);
+        if self.hiperf_period.is_some() {
+            let _ = self.hdc(&["shell", "rm", "-f", DevicePaths::PERF_DATA]);
+            let _ = self.hdc(&["shell", "rm", "-f", DevicePaths::PERF_REPORT_TXT]);
+        }
 
         // Begin trace capture. The buffer arg matches hitrace-bench's CI
         // default — large enough for ~10 s of full-tag capture without
@@ -340,9 +364,16 @@ impl OhosTarget {
         self.aa_start(workload, proxy_uri)
             .with_context(|| format!("aa start failed for {}", self.bundle))?;
 
-        // Wait for the app to render. The capture window is fixed: too
-        // short and we miss FCP, too long and we waste seconds per iter.
-        std::thread::sleep(Duration::from_secs(self.capture_seconds));
+        // Hold the capture window open. When `--with-instructions` is on
+        // we run a blocking `hiperf record -d <secs>`; otherwise we just
+        // sleep. Either way the host returns to this line after exactly
+        // `capture_seconds` of device-side activity.
+        if let Some(period) = self.hiperf_period {
+            self.run_hiperf_record(period)
+                .context("hiperf record (--with-instructions)")?;
+        } else {
+            std::thread::sleep(Duration::from_secs(self.capture_seconds));
+        }
 
         // Thermal snapshot right after the render window — captures
         // whatever peak heat the iteration produced before `force_stop`
@@ -368,16 +399,81 @@ impl OhosTarget {
         self.hdc(&["file", "recv", &self.trace_path_on_device, &dest_str])
             .with_context(|| format!("recv {} → {}", self.trace_path_on_device, dest.display()))?;
 
+        // Generate + pull the stack-mode report when hiperf ran.
+        let stack_report = if self.hiperf_period.is_some() {
+            Some(self.process_hiperf_capture(iter, out_dir)?)
+        } else {
+            None
+        };
+
         // Stop the app so the next iteration starts cold.
         self.force_stop();
 
         Ok(RunArtifact {
             trace: dest,
+            stack_report,
             spawn_wall_ns,
             exit_wall_ns,
             thermal_before_milli_c,
             thermal_after_milli_c,
         })
+    }
+
+    /// Run `hiperf record -a -e hw-instructions -d <capture_seconds>` on
+    /// the device. The call blocks until hiperf finishes — replacing the
+    /// host-side sleep. `--exclude-hiperf` keeps the recorder's own
+    /// activity out of the sample, and `--period` is set from
+    /// `self.hiperf_period` (already validated to be `Some(_)` by the
+    /// caller).
+    fn run_hiperf_record(&self, period: u64) -> Result<()> {
+        let duration = self.capture_seconds.to_string();
+        let period_str = period.to_string();
+        self.hdc(&[
+            "shell",
+            "hiperf", "record",
+            "-a", "--exclude-hiperf",
+            "-d", &duration,
+            "-s", "dwarf",
+            "--period", &period_str,
+            "-e", "hw-instructions",
+            "-o", DevicePaths::PERF_DATA,
+        ])?;
+        Ok(())
+    }
+
+    /// On-device: convert `perf.data` to stack-mode text via
+    /// `hiperf report -s --symbol-dir …`. Pull the text back as
+    /// `out_dir/iter_<iter>.stack.txt` and return its in-memory contents
+    /// for immediate aggregation.
+    fn process_hiperf_capture(&self, iter: u32, out_dir: &Path) -> Result<String> {
+        self.hdc(&[
+            "shell",
+            "hiperf", "report",
+            "-i", DevicePaths::PERF_DATA,
+            "--symbol-dir", DevicePaths::SYMBOL_DIR,
+            "-s",
+            "-o", DevicePaths::PERF_REPORT_TXT,
+            "--limit-percent", "0.01",
+        ])
+        .context("hiperf report -s")?;
+        let dest = out_dir.join(format!("iter_{iter}.stack.txt"));
+        let dest_str = dest.to_string_lossy().to_string();
+        self.hdc(&["file", "recv", DevicePaths::PERF_REPORT_TXT, &dest_str])
+            .with_context(|| format!("recv {} → {}", DevicePaths::PERF_REPORT_TXT, dest.display()))?;
+        let text = std::fs::read_to_string(&dest)
+            .with_context(|| format!("reading {}", dest.display()))?;
+        Ok(text)
+    }
+
+    /// Push a freshly-merged `libarkweb_engine.so` to
+    /// `/data/local/tmp/symbols/`. Idempotent — safe to call before each
+    /// run as long as the host file is fresh.
+    pub fn push_arkweb_symbols(&self, host_path: &Path) -> Result<()> {
+        // `hdc shell mkdir -p` returns 0 even when the path already exists.
+        self.hdc(&["shell", "mkdir", "-p", DevicePaths::SYMBOL_DIR])?;
+        let host_str = host_path.to_string_lossy().to_string();
+        self.hdc(&["file", "send", &host_str, DevicePaths::SYMBOL_FILE])?;
+        Ok(())
     }
 }
 
@@ -385,6 +481,10 @@ impl OhosTarget {
 /// `runner::RunArtifact` but the trace file is hitrace text, not pftrace.
 pub struct RunArtifact {
     pub trace: PathBuf,
+    /// `Some(text)` when `--with-instructions` was enabled: the contents
+    /// of `iter_<iter>.stack.txt`, ready to feed into
+    /// [`crate::instructions::aggregate_inclusive`].
+    pub stack_report: Option<String>,
     pub spawn_wall_ns: u64,
     pub exit_wall_ns: u64,
     /// SoC thermal zone reading (milli-Celsius) sampled right before
@@ -467,7 +567,11 @@ fn wall_now_ns() -> u64 {
 ///   * the proxy URI (when set) is converted to two preferences so it
 ///     reaches servo without env-var inheritance, which doesn't survive
 ///     the `aa start` boundary.
-fn workload_args_to_aa_params(workload: &Workload, proxy_uri: Option<&str>) -> Vec<String> {
+fn workload_args_to_aa_params(
+    workload: &Workload,
+    proxy_uri: Option<&str>,
+    engine_proxy_args: &[String],
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
 
     // First, collect args from the workload definition. We synthesize
@@ -545,18 +649,32 @@ fn workload_args_to_aa_params(workload: &Workload, proxy_uri: Option<&str>) -> V
         out.push(arg);
     }
 
-    // Inject the proxy as preferences. Servo on OHOS reads
-    // `network_https_proxy_uri` / `network_http_proxy_uri` prefs.
+    // Inject the proxy in whichever form the resolved engine accepts.
+    // `_instructions.toml` declares a per-engine `proxy_args` template
+    // list with `$PROXY` placeholders; we expand them here. When no
+    // engine matched (e.g. the bundle isn't in `_instructions.toml`),
+    // fall back to Servo's historical pref-based injection so existing
+    // benches keep working.
     if let Some(uri) = proxy_uri {
-        out.push(format!(
-            "--psn=--pref=network_https_proxy_uri={}",
-            uri
-        ));
-        out.push(format!(
-            "--psn=--pref=network_http_proxy_uri={}",
-            uri
-        ));
-        out.push("--psn=--ignore-certificate-errors".to_string());
+        if !engine_proxy_args.is_empty() {
+            for tmpl in engine_proxy_args {
+                let expanded = tmpl.replace("$PROXY", uri);
+                if expanded.starts_with("--ps=") || expanded.starts_with("--psn=") {
+                    out.push(expanded);
+                } else if let Some(rest) = expanded.strip_prefix("--") {
+                    // Bare `--flag` or `--key=value` → wrap as `--psn=…`
+                    // so each entry survives aa start's want.parameters
+                    // dedup (see ohos-launch-with-args recipe).
+                    out.push(format!("--psn=--{}", rest));
+                } else {
+                    out.push(expanded);
+                }
+            }
+        } else {
+            out.push(format!("--psn=--pref=network_https_proxy_uri={}", uri));
+            out.push(format!("--psn=--pref=network_http_proxy_uri={}", uri));
+            out.push("--psn=--ignore-certificate-errors".to_string());
+        }
     }
 
     out
@@ -998,7 +1116,7 @@ mod tests {
             ],
             fixture: None,
         };
-        let aa = workload_args_to_aa_params(&w, Some("http://127.0.0.1:9999"));
+        let aa = workload_args_to_aa_params(&w, Some("http://127.0.0.1:9999"), &[]);
         // headless / exit dropped
         assert!(!aa.iter().any(|a| a == "--headless" || a == "--exit"));
         // viewport synthesized

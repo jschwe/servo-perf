@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use crate::cli::{BenchArgs, OhosArgs};
 use crate::fixtures::{self, FixtureHandle};
+use crate::instructions::{self, EngineConfig, InstructionsConfig};
 use crate::ohos::{self, OhosTarget};
 use crate::report::{self, ConfigResults, Iteration, IterationStatus, RunResults};
 use crate::runner::{self, Target};
@@ -24,6 +25,36 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let primary_milestone = target.primary_milestone();
     let out_dir = resolve_out(args.out.as_deref(), &w.name);
     std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+
+    // Resolve which engine the bench is exercising, so we know which list of
+    // function-name substrings to aggregate inclusive instruction counts
+    // for. Only consulted when `--with-instructions` is on (the target is
+    // OHOS). Engines whose `symbol_file` is non-empty get the merged ELF
+    // auto-pushed if a sibling file is present in `workloads/`.
+    let engine: Option<EngineConfig> = if args.ohos.with_instructions {
+        match &target {
+            Target::Ohos(ohos) => {
+                let cfg = InstructionsConfig::load(&workloads_dir)?;
+                match cfg.engine_for_bundle(&ohos.bundle) {
+                    Some(e) => {
+                        push_engine_symbols(ohos, e, &workloads_dir)?;
+                        Some(e.clone())
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: --with-instructions: no engine matches bundle {:?} in \
+                             _instructions.toml; per-function counts will be skipped",
+                            ohos.bundle
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
 
     // Local fixtures (http1/h2 servers, wpr) live on the host's
     // 127.0.0.1; on OHOS we need `hdc rport` so the device can reach
@@ -113,6 +144,17 @@ pub fn run(args: BenchArgs) -> Result<()> {
                         (a - b) as f64,
                     );
                 }
+                // Per-function inclusive instruction counts. When
+                // `--with-instructions` is off, `stack_report` is None and
+                // we leave the slot absent from the metrics map.
+                if let (Some(engine), Some(stack_text)) = (engine.as_ref(), art.stack_report.as_deref()) {
+                    let totals = instructions::aggregate_inclusive(stack_text, &engine.functions);
+                    for func in &engine.functions {
+                        if let Some(&events) = totals.get(func) {
+                            metrics.insert(format!("instructions.{func}"), events as f64);
+                        }
+                    }
+                }
                 iterations.push(Iteration {
                     index: i,
                     status: IterationStatus::Ok {
@@ -146,6 +188,23 @@ pub fn run(args: BenchArgs) -> Result<()> {
     if let Some(s) = stats::summarise(&lcp_samples) {
         summary.insert("LargestContentfulPaint".to_string(), s);
     }
+    // One summary entry per configured instruction symbol, across every
+    // iteration that resolved it.
+    if let Some(engine) = engine.as_ref() {
+        for func in &engine.functions {
+            let key = format!("instructions.{func}");
+            let samples: Vec<f64> = iterations
+                .iter()
+                .filter_map(|i| match &i.status {
+                    IterationStatus::Ok { metrics, .. } => metrics.get(&key).copied(),
+                    _ => None,
+                })
+                .collect();
+            if let Some(s) = stats::summarise(&samples) {
+                summary.insert(key, s);
+            }
+        }
+    }
 
     let mut configs: BTreeMap<String, ConfigResults> = BTreeMap::new();
     configs.insert(
@@ -171,6 +230,29 @@ fn workloads_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workloads")
 }
 
+/// If the engine declares a `symbol_file`, look for the file under
+/// `workloads/` and (if found) push it to the device's symbol-dir so
+/// hiperf's per-iteration `report -s --symbol-dir …` resolves library
+/// symbols. Missing file emits a hint but isn't fatal — the bench still
+/// captures perf.data, and the user can re-run with the file present.
+fn push_engine_symbols(target: &OhosTarget, engine: &EngineConfig, workloads_dir: &Path) -> Result<()> {
+    if engine.symbol_file.is_empty() {
+        return Ok(());
+    }
+    let host_path = workloads_dir.join(&engine.symbol_file);
+    if !host_path.exists() {
+        eprintln!(
+            "warning: engine {:?} symbol_file {:?} not found — symbols won't resolve. \
+             Run: servoperf prepare-arkweb-symbols --input <stripped-libarkweb_engine.so> \
+             --output {}",
+            engine.id, host_path, host_path.display(),
+        );
+        return Ok(());
+    }
+    eprintln!("ohos: pushing engine symbols ({} → device)", host_path.display());
+    target.push_arkweb_symbols(&host_path)
+}
+
 /// Build the [`Target`] for this run. For local mode, validates the bin
 /// exists. For OHOS mode, runs an `hdc list targets` smoke test and
 /// installs the .hap once if `--bin` is given.
@@ -180,7 +262,18 @@ pub(crate) fn build_target(ohos: &OhosArgs, bin: Option<&Path>) -> Result<Target
             .ok_or_else(|| anyhow::anyhow!("--bin is required (path to servoshell)"))?;
         return Ok(Target::Local { bin: bin.to_path_buf() });
     }
-    let target = OhosTarget::from_args(ohos);
+    let mut target = OhosTarget::from_args(ohos);
+    // Hydrate engine-specific proxy-arg templates from the global
+    // _instructions.toml. Done here (not in OhosTarget::from_args) so
+    // workloads_dir is reachable. Bench callers don't pay for this unless
+    // a workload supplies a proxy URI, but resolving once at startup
+    // keeps the per-iteration aa_start path branchless.
+    let workloads_dir = workloads_dir();
+    if let Ok(cfg) = InstructionsConfig::load(&workloads_dir) {
+        if let Some(engine) = cfg.engine_for_bundle(&target.bundle) {
+            target.engine_proxy_args = engine.proxy_args.clone();
+        }
+    }
     target.preflight()?;
     if let Some(hap) = bin {
         eprintln!("ohos: installing {} on device", hap.display());

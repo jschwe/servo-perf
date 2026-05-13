@@ -20,6 +20,14 @@ pub enum Command {
     Ab(AbArgs),
     /// Run a workload and compare against a saved baseline JSON.
     Regression(RegressionArgs),
+    /// Build an unstripped `libarkweb_engine.so` from a stripped on-device
+    /// copy by re-attaching the `.symtab`/`.strtab` carried in the
+    /// `.gnu_debugdata` MiniDebugInfo section, then push it to the device.
+    /// Required once before `bench … --with-instructions` for ArkWeb-based
+    /// targets (the on-device library has only `.dynsym`, and hiperf's
+    /// `--symbol-dir` ignores `.gnu_debugdata`).
+    #[command(name = "prepare-arkweb-symbols")]
+    PrepareArkwebSymbols(PrepareArkwebSymbolsArgs),
 }
 
 /// Flags that select / configure a HarmonyOS device target reached over
@@ -105,6 +113,48 @@ pub struct OhosArgs {
     /// unused; that's bounded by `--ohos-capture-seconds`.
     #[arg(long, default_value_t = 45)]
     pub ohos_record_seconds: u64,
+    /// Collect per-function inclusive instruction counts per iteration via
+    /// `hiperf record -a -e hw-instructions`, running in parallel with the
+    /// hitrace capture. The per-engine symbol list lives in
+    /// `workloads/_instructions.toml`; engine selection is driven by
+    /// `--ohos-bundle`. For ArkWeb-based bundles, run
+    /// `servoperf prepare-arkweb-symbols …` once before benching so hiperf
+    /// can resolve symbols in `libarkweb_engine.so`.
+    #[arg(long)]
+    pub with_instructions: bool,
+    /// hiperf sampling period (events between samples) when
+    /// `--with-instructions` is set. 100 000 retired instructions per
+    /// sample matches what the manual investigation used and produces
+    /// useful resolution without overwhelming the device.
+    #[arg(long, default_value_t = 100_000)]
+    pub instructions_period: u64,
+}
+
+#[derive(clap::Args, Clone)]
+pub struct PrepareArkwebSymbolsArgs {
+    /// Path to a stripped `libarkweb_engine.so` (the file that ships on
+    /// device, e.g. pulled via
+    /// `hdc shell cp /data/app/el1/bundle/public/com.huawei.hmos.arkwebcore/libs/arm64/libarkweb_engine.so /data/local/tmp/x && hdc file recv /data/local/tmp/x …`).
+    /// Must contain a `.gnu_debugdata` section.
+    #[arg(long)]
+    pub input: PathBuf,
+    /// Where to write the merged unstripped ELF on the host. Defaults to a
+    /// sibling of the input named `libarkweb_engine.merged.so`.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+    /// Push the merged .so to the device under
+    /// `/data/local/tmp/symbols/libarkweb_engine.so` so subsequent
+    /// `bench --with-instructions` runs find it automatically. Set to
+    /// false to write only the host file.
+    #[arg(long, default_value_t = true)]
+    pub push: bool,
+    /// `hdc` binary used for the push step.
+    #[arg(long, default_value = "hdc")]
+    pub hdc_bin: String,
+    /// `hdc -s <addr>` server forwarder (containerised agent setups). Leave
+    /// unset to use the local daemon.
+    #[arg(long)]
+    pub hdc_server: Option<String>,
 }
 
 #[derive(clap::Args, Clone)]
