@@ -4,5 +4,6 @@
 //! Keep this surface area minimal — anything else should stay private to the
 //! `servoperf` binary in `main.rs`.
 
+#[cfg(feature = "pftrace")]
 pub mod proto;
 pub mod trace;

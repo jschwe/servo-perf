@@ -31,6 +31,7 @@ pub enum Command {
     /// Dump every span above a duration threshold from a pftrace,
     /// grouped by thread. Useful when the registry-based critical-path
     /// report doesn't surface enough detail.
+    #[cfg(feature = "pftrace")]
     Dump(DumpArgs),
 }
 
@@ -201,6 +202,7 @@ pub struct AbArgs {
     pub ohos: OhosArgs,
 }
 
+#[cfg(feature = "pftrace")]
 #[derive(clap::Args, Clone)]
 pub struct DumpArgs {
     /// Path to a .pftrace file.

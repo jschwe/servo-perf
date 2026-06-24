@@ -9,13 +9,34 @@ description = "Servo startup-performance measurement tool"
 name = "servoperf"
 path = "src/main.rs"
 
+# Helper binaries that decode `.pftrace` files; only buildable with the
+# `pftrace` feature (and therefore `protoc`) available.
+[[bin]]
+name = "gen_minimal_pftrace"
+path = "src/bin/gen_minimal_pftrace.rs"
+required-features = ["pftrace"]
+
+[[bin]]
+name = "pftrace_stats"
+path = "src/bin/pftrace_stats.rs"
+required-features = ["pftrace"]
+
+[features]
+default = ["pftrace"]
+# Perfetto `.pftrace` parsing: the `dump` command, local-target critical-path
+# extraction in `bench`/`ab`, and the `gen_minimal_pftrace` / `pftrace_stats`
+# helper binaries. Compiling the bundled perfetto proto schema requires
+# `protoc` on the build host. Build with `--no-default-features` to skip it —
+# the OHOS/hitrace path and the fixture servers still build and run.
+pftrace = ["dep:prost", "dep:prost-build"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
-prost = "0.13"
+prost = { version = "0.13", optional = true }
 rand = "0.8"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
@@ -38,7 +59,7 @@ rustc-demangle = "0.1"
 cpp_demangle = "0.4"
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = { version = "0.13", optional = true }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }

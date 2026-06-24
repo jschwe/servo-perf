@@ -73,15 +73,20 @@ pub fn load_registry_named(workloads_dir: &Path, stem: &str) -> Result<SpanRegis
 
 // --- Trace parsing ------------------------------------------------------
 
+#[cfg(feature = "pftrace")]
 use crate::proto::{
     InternedData, TrackEvent,
     perfetto_protos::track_event::NameField,
     perfetto_protos::{trace_packet, Trace},
 };
+#[cfg(feature = "pftrace")]
 use prost::Message;
 use std::collections::HashMap;
 
 /// A typed value from a Perfetto debug annotation.
+// Only ever constructed by the pftrace parser; without that feature the
+// variants are unused but the type must still exist for `Slice`'s field.
+#[cfg_attr(not(feature = "pftrace"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum DebugAnnotationValue {
     Uint(u64),
@@ -106,6 +111,7 @@ pub struct Slice {
 /// Handles Perfetto's track-event protocol: BEGIN/END pairs keyed by
 /// (track_uuid, name) on the same track, with interned string names
 /// resolved via the interning tables.
+#[cfg(feature = "pftrace")]
 pub fn parse(path: &Path) -> Result<Vec<Slice>> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading pftrace at {}", path.display()))?;
@@ -191,6 +197,7 @@ pub fn parse(path: &Path) -> Result<Vec<Slice>> {
     Ok(slices)
 }
 
+#[cfg(feature = "pftrace")]
 fn update_interned(seq: u32, id: &InternedData, out: &mut HashMap<(u32, u64), String>) {
     for e in id.event_names.iter() {
         if let Some(name) = e.name.as_ref() {
@@ -199,6 +206,7 @@ fn update_interned(seq: u32, id: &InternedData, out: &mut HashMap<(u32, u64), St
     }
 }
 
+#[cfg(feature = "pftrace")]
 fn resolve_name(seq: u32, te: &TrackEvent, interned: &HashMap<(u32, u64), String>) -> String {
     match te.name_field.as_ref() {
         Some(NameField::Name(n)) => n.clone(),
@@ -210,6 +218,7 @@ fn resolve_name(seq: u32, te: &TrackEvent, interned: &HashMap<(u32, u64), String
     }
 }
 
+#[cfg(feature = "pftrace")]
 fn collect_debug_annotations(
     _seq: u32,
     te: &TrackEvent,
@@ -461,6 +470,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pftrace")]
     #[test]
     fn parse_minimal_pftrace_fixture() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))

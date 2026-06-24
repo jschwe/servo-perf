@@ -330,7 +330,14 @@ pub(crate) fn build_target(ohos: &OhosArgs, bin: Option<&Path>) -> Result<Target
 /// Pick the right parser based on which target produced the trace file.
 pub(crate) fn parse_trace(target: &Target, path: &Path) -> Result<Vec<trace::Slice>> {
     match target {
+        #[cfg(feature = "pftrace")]
         Target::Local { .. } => trace::parse(path),
+        #[cfg(not(feature = "pftrace"))]
+        Target::Local { .. } => anyhow::bail!(
+            "local-target benchmarking decodes `.pftrace` files, which requires the \
+             `pftrace` feature (and `protoc` at build time). This binary was built with \
+             `--no-default-features`; rebuild with the `pftrace` feature, or use `--ohos`."
+        ),
         Target::Ohos(_) => ohos::parse_hitrace_file(path),
     }
 }
