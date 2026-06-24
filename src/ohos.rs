@@ -558,10 +558,18 @@ fn wall_now_ns() -> u64 {
 /// by servoshell's OHOS EntryAbility.
 ///
 /// Rules:
-///   * `--key=value`               → `--ps=--key`, `value`         (two argv tokens; aa start consumes them as one key+value)
-///   * `--key value` (next item)   → `--ps=--key`, `value`
+///   * `--key=value`               → `--psn=--key=value`           (one argv token)
+///   * `--key value` (next item)   → `--psn=--key=value`           (one argv token)
 ///   * `--key`        (boolean)    → `--psn=--key`
 ///   * already-OHOS-encoded args (`--ps=…`, `--psn=…`) pass through.
+///
+/// Everything is emitted as `--psn=` (a null-valued want parameter whose
+/// *key* is the full `--flag[=value]` string). OHOS `Want.parameters` is a map
+/// decoded with `Object.entries`, so the older `--ps=--key value` form made
+/// every key-value arg share the key `--key`; repeated keys (notably multiple
+/// `--pref`, e.g. the proxy + LCP + a workload pref) then collapsed to one.
+/// Unique full-string keys via `--psn=` avoid that. servoshell's clap accepts
+/// the `--key=value` form for every option.
 ///   * `--headless` / `--exit` / `-o foo.png` are dropped — they don't
 ///     apply to the OHOS UI ability.
 ///   * the proxy URI (when set) is converted to two preferences so it
@@ -619,26 +627,25 @@ fn workload_args_to_aa_params(
         }
         if arg == "-u" {
             if let Some(ua) = iter.next() {
-                out.push("--ps=--user-agent".to_string());
-                out.push(ua);
+                out.push(format!("--psn=--user-agent={}", ua));
             }
             continue;
         }
         if let Some(rest) = arg.strip_prefix("--") {
-            if let Some(eq) = rest.find('=') {
-                let key = &rest[..eq];
-                let value = &rest[eq + 1..];
-                out.push(format!("--ps=--{}", key));
-                out.push(value.to_string());
+            if rest.contains('=') {
+                // `--key=value` → single verbatim token.
+                out.push(format!("--psn=--{}", rest));
             } else if iter
                 .peek()
                 .map(|n| !n.starts_with('-'))
                 .unwrap_or(false)
             {
+                // `--key value` (value is the next list item) → fold into one
+                // `--psn=--key=value` token so the want-parameter key is unique.
                 let value = iter.next().unwrap();
-                out.push(format!("--ps=--{}", rest));
-                out.push(value);
+                out.push(format!("--psn=--{}={}", rest, value));
             } else {
+                // boolean flag.
                 out.push(format!("--psn=--{}", rest));
             }
             continue;
@@ -1119,16 +1126,16 @@ mod tests {
         let aa = workload_args_to_aa_params(&w, Some("http://127.0.0.1:9999"), &[]);
         // headless / exit dropped
         assert!(!aa.iter().any(|a| a == "--headless" || a == "--exit"));
-        // viewport synthesized
-        assert!(aa.iter().zip(aa.iter().skip(1)).any(|(k, v)| k == "--ps=--window-size" && v == "800x600"));
+        // viewport synthesized (single --psn token)
+        assert!(aa.iter().any(|a| a == "--psn=--window-size=800x600"));
         // dpr synthesized
-        assert!(aa.iter().zip(aa.iter().skip(1)).any(|(k, v)| k == "--ps=--device-pixel-ratio" && v == "2"));
+        assert!(aa.iter().any(|a| a == "--psn=--device-pixel-ratio=2"));
         // user agent synthesized
-        assert!(aa.iter().zip(aa.iter().skip(1)).any(|(k, v)| k == "--ps=--user-agent" && v == "UA"));
+        assert!(aa.iter().any(|a| a == "--psn=--user-agent=UA"));
         // tracing_filter synthesized
-        assert!(aa.iter().any(|a| a == "--ps=--tracing-filter"));
-        // pref translated to --ps=--pref / value
-        assert!(aa.iter().zip(aa.iter().skip(1)).any(|(k, v)| k == "--ps=--pref" && v == "foo=bar"));
+        assert!(aa.iter().any(|a| a == "--psn=--tracing-filter=info"));
+        // pref → single verbatim --psn token (unique key, no collision)
+        assert!(aa.iter().any(|a| a == "--psn=--pref=foo=bar"));
         // already-OHOS-encoded passthrough
         assert!(aa.iter().any(|a| a == "--ps=--passthrough"));
         assert!(aa.iter().any(|a| a == "--psn=--flag"));
