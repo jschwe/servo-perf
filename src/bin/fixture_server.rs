@@ -32,19 +32,27 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         ));
     }
     let mode_arg = &argv[0];
-    let mode_str = mode_arg
-        .strip_prefix("--mode=")
-        .ok_or_else(|| format!("first argument must be --mode=http1 or --mode=http2, got {mode_arg:?}"))?;
+    let mode_str = mode_arg.strip_prefix("--mode=").ok_or_else(|| {
+        format!("first argument must be --mode=http1 or --mode=http2, got {mode_arg:?}")
+    })?;
     let mode = match mode_str {
         "http1" => Mode::Http1,
         "http2" => Mode::Http2,
-        other => return Err(format!("unknown --mode value {other:?} (expected http1 or http2)")),
+        other => {
+            return Err(format!(
+                "unknown --mode value {other:?} (expected http1 or http2)"
+            ))
+        }
     };
     let port: u16 = argv[1]
         .parse()
         .map_err(|e| format!("invalid port {:?}: {e}", argv[1]))?;
     let doc_root = PathBuf::from(&argv[2]);
-    Ok(Args { mode, port, doc_root })
+    Ok(Args {
+        mode,
+        port,
+        doc_root,
+    })
 }
 
 fn resolve_safe_path(doc_root: &Path, req_path: &str) -> Result<PathBuf, u16> {
@@ -89,7 +97,11 @@ fn content_type_for(path: &Path) -> &'static str {
     }
 }
 
-fn build_tls_config(cert_path: &Path, key_path: &Path, mode: Mode) -> anyhow::Result<Arc<rustls::ServerConfig>> {
+fn build_tls_config(
+    cert_path: &Path,
+    key_path: &Path,
+    mode: Mode,
+) -> anyhow::Result<Arc<rustls::ServerConfig>> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::fs::File;
     use std::io::BufReader;
@@ -99,10 +111,14 @@ fn build_tls_config(cert_path: &Path, key_path: &Path, mode: Mode) -> anyhow::Re
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
         .collect::<Result<_, _>>()
         .context("parsing cert PEM")?;
-    anyhow::ensure!(!certs.is_empty(), "no certificates found in {}", cert_path.display());
+    anyhow::ensure!(
+        !certs.is_empty(),
+        "no certificates found in {}",
+        cert_path.display()
+    );
 
-    let key_file = File::open(key_path)
-        .with_context(|| format!("opening key file {}", key_path.display()))?;
+    let key_file =
+        File::open(key_path).with_context(|| format!("opening key file {}", key_path.display()))?;
     let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut BufReader::new(key_file))
         .context("parsing key PEM")?
         .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
@@ -144,7 +160,11 @@ async fn serve(
             let ct = content_type_for(&resolved);
             let body_len = bytes.len();
             log_request(method.as_str(), &uri_path, body_len);
-            let body = if is_head { Bytes::new() } else { Bytes::from(bytes) };
+            let body = if is_head {
+                Bytes::new()
+            } else {
+                Bytes::from(bytes)
+            };
             let resp = Response::builder()
                 .status(200)
                 .header("content-type", ct)
@@ -206,7 +226,11 @@ async fn main() -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding 127.0.0.1:{}", args.port))?;
     let doc_root = Arc::new(args.doc_root);
-    let mode_str = if args.mode == Mode::Http1 { "http1" } else { "http2" };
+    let mode_str = if args.mode == Mode::Http1 {
+        "http1"
+    } else {
+        "http2"
+    };
     println!(
         "listening on https://127.0.0.1:{}/ doc_root={} mode={mode_str}",
         args.port,
@@ -223,10 +247,13 @@ async fn main() -> anyhow::Result<()> {
             };
             let io = TokioIo::new(tls);
             let _ = auto::Builder::new(TokioExecutor::new())
-                .serve_connection(io, service_fn(move |req| {
-                    let doc_root = Arc::clone(&doc_root);
-                    async move { serve(req, doc_root).await }
-                }))
+                .serve_connection(
+                    io,
+                    service_fn(move |req| {
+                        let doc_root = Arc::clone(&doc_root);
+                        async move { serve(req, doc_root).await }
+                    }),
+                )
                 .await;
         });
     }
@@ -243,11 +270,14 @@ mod arg_tests {
     #[test]
     fn parses_http1_mode() {
         let got = parse_args(&argv(&["--mode=http1", "4443", "/tmp/root"])).unwrap();
-        assert_eq!(got, Args {
-            mode: Mode::Http1,
-            port: 4443,
-            doc_root: PathBuf::from("/tmp/root"),
-        });
+        assert_eq!(
+            got,
+            Args {
+                mode: Mode::Http1,
+                port: 4443,
+                doc_root: PathBuf::from("/tmp/root"),
+            }
+        );
     }
 
     #[test]
@@ -278,8 +308,10 @@ mod arg_tests {
     #[test]
     fn rejects_wrong_argc() {
         let err = parse_args(&argv(&["--mode=http1", "4443"])).unwrap_err();
-        assert!(err.to_lowercase().contains("usage") || err.to_lowercase().contains("expected"),
-                "got: {err}");
+        assert!(
+            err.to_lowercase().contains("usage") || err.to_lowercase().contains("expected"),
+            "got: {err}"
+        );
     }
 }
 
@@ -382,29 +414,48 @@ mod mime_tests {
     use super::*;
 
     #[test]
-    fn html() { assert_eq!(content_type_for(Path::new("x.html")), "text/html"); }
+    fn html() {
+        assert_eq!(content_type_for(Path::new("x.html")), "text/html");
+    }
     #[test]
-    fn css()  { assert_eq!(content_type_for(Path::new("x.css")),  "text/css"); }
+    fn css() {
+        assert_eq!(content_type_for(Path::new("x.css")), "text/css");
+    }
     #[test]
-    fn js()   { assert_eq!(content_type_for(Path::new("x.js")),   "application/javascript"); }
+    fn js() {
+        assert_eq!(
+            content_type_for(Path::new("x.js")),
+            "application/javascript"
+        );
+    }
     #[test]
-    fn png()  { assert_eq!(content_type_for(Path::new("img.png")),"image/png"); }
+    fn png() {
+        assert_eq!(content_type_for(Path::new("img.png")), "image/png");
+    }
     #[test]
     fn jpg_and_jpeg() {
-        assert_eq!(content_type_for(Path::new("a.jpg")),  "image/jpeg");
+        assert_eq!(content_type_for(Path::new("a.jpg")), "image/jpeg");
         assert_eq!(content_type_for(Path::new("a.jpeg")), "image/jpeg");
     }
     #[test]
-    fn ico()  { assert_eq!(content_type_for(Path::new("a.ico")),  "image/x-icon"); }
+    fn ico() {
+        assert_eq!(content_type_for(Path::new("a.ico")), "image/x-icon");
+    }
     #[test]
     fn case_insensitive() {
         assert_eq!(content_type_for(Path::new("a.HTML")), "text/html");
-        assert_eq!(content_type_for(Path::new("a.PNG")),  "image/png");
+        assert_eq!(content_type_for(Path::new("a.PNG")), "image/png");
     }
     #[test]
     fn unknown_falls_back_to_octet_stream() {
-        assert_eq!(content_type_for(Path::new("a.bin")), "application/octet-stream");
-        assert_eq!(content_type_for(Path::new("noext")), "application/octet-stream");
+        assert_eq!(
+            content_type_for(Path::new("a.bin")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            content_type_for(Path::new("noext")),
+            "application/octet-stream"
+        );
     }
 }
 
@@ -441,7 +492,10 @@ mod tls_tests {
         install_provider();
         let (cert, key) = fixture_paths();
         let cfg = build_tls_config(&cert, &key, Mode::Http2).unwrap();
-        assert_eq!(cfg.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
     }
 
     #[test]
@@ -451,9 +505,12 @@ mod tls_tests {
             Path::new("/does/not/exist.pem"),
             Path::new("/does/not/exist.pem"),
             Mode::Http1,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.to_lowercase().contains("no such file") || msg.to_lowercase().contains("cert"),
-                "unexpected error message: {msg}");
+        assert!(
+            msg.to_lowercase().contains("no such file") || msg.to_lowercase().contains("cert"),
+            "unexpected error message: {msg}"
+        );
     }
 }

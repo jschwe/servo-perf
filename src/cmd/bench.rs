@@ -78,12 +78,20 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 let guard = ohos.setup_rport(&fx_def.ports_to_forward())?;
                 (Some(handle), Some(guard))
             }
-            (Some(_), Target::Local { .. }) => {
-                (Some(fixtures::spawn(&workloads_dir, &w, driver.as_ref(), &out_dir)?), None)
-            }
+            (Some(_), Target::Local { .. }) => (
+                Some(fixtures::spawn(
+                    &workloads_dir,
+                    &w,
+                    driver.as_ref(),
+                    &out_dir,
+                )?),
+                None,
+            ),
             (None, _) => (None, None),
         };
-    let proxy_uri = fx.as_ref().and_then(|h| h.proxy_uri().map(|s| s.to_string()));
+    let proxy_uri = fx
+        .as_ref()
+        .and_then(|h| h.proxy_uri().map(|s| s.to_string()));
 
     let mut iterations = Vec::with_capacity(w.iterations as usize);
     let mut fcp_samples: Vec<f64> = Vec::new();
@@ -94,8 +102,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // recording on the device, so wallclock for the whole bench is
     // bounded by max(recording_time, analyser_time) per iteration instead
     // of their sum. Joined in a single pass after the iteration loop.
-    let mut instr_jobs: Vec<(u32, JoinHandle<Result<std::collections::HashMap<String, u64>>>)> =
-        Vec::new();
+    let mut instr_jobs: Vec<(
+        u32,
+        JoinHandle<Result<std::collections::HashMap<String, u64>>>,
+    )> = Vec::new();
     for i in 0..w.iterations {
         let timeout = runner::pick_timeout(&successful_wall);
         match runner::run_once(&target, &w, i, &out_dir, proxy_uri.as_deref(), timeout) {
@@ -130,7 +140,11 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 // or image fragment), the metric is absent for that
                 // iteration; that's recorded as a missing sample so
                 // the summary's `n` reflects reality.
-                if let Some(m) = cp.milestones.iter().find(|m| m.name == "LargestContentfulPaint") {
+                if let Some(m) = cp
+                    .milestones
+                    .iter()
+                    .find(|m| m.name == "LargestContentfulPaint")
+                {
                     metrics.insert("LargestContentfulPaint".to_string(), m.ts_ms);
                     lcp_samples.push(m.ts_ms);
                 }
@@ -144,13 +158,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 if let Some(v) = art.thermal_after_milli_c {
                     metrics.insert("soc_thermal_milli_c.after".to_string(), v as f64);
                 }
-                if let (Some(b), Some(a)) =
-                    (art.thermal_before_milli_c, art.thermal_after_milli_c)
+                if let (Some(b), Some(a)) = (art.thermal_before_milli_c, art.thermal_after_milli_c)
                 {
-                    metrics.insert(
-                        "soc_thermal_milli_c.delta".to_string(),
-                        (a - b) as f64,
-                    );
+                    metrics.insert("soc_thermal_milli_c.delta".to_string(), (a - b) as f64);
                 }
                 // Per-function inclusive instruction counts run on a
                 // background thread so the next iteration's recording
@@ -182,17 +192,23 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 eprintln!("iter {i} failed: {err:#}");
                 iterations.push(Iteration {
                     index: i,
-                    status: IterationStatus::Failed { error: format!("{err:#}") },
+                    status: IterationStatus::Failed {
+                        error: format!("{err:#}"),
+                    },
                 });
             }
         }
     }
 
-    let ok = iterations.iter().filter(|i| matches!(i.status, IterationStatus::Ok { .. })).count();
+    let ok = iterations
+        .iter()
+        .filter(|i| matches!(i.status, IterationStatus::Ok { .. }))
+        .count();
     anyhow::ensure!(
         2 * ok >= iterations.len(),
         "more than 50% of iterations failed ({}/{}); aborting",
-        iterations.len() - ok, iterations.len()
+        iterations.len() - ok,
+        iterations.len()
     );
 
     // Drain background instruction-count jobs and merge each result into
@@ -252,7 +268,11 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let mut configs: BTreeMap<String, ConfigResults> = BTreeMap::new();
     configs.insert(
         "main".into(),
-        ConfigResults { bin: target.bin_label(), iterations, summary },
+        ConfigResults {
+            bin: target.bin_label(),
+            iterations,
+            summary,
+        },
     );
 
     let data = RunResults {
@@ -278,7 +298,11 @@ fn workloads_dir() -> PathBuf {
 /// hiperf's per-iteration `report -s --symbol-dir …` resolves library
 /// symbols. Missing file emits a hint but isn't fatal — the bench still
 /// captures perf.data, and the user can re-run with the file present.
-fn push_engine_symbols(target: &OhosTarget, engine: &EngineConfig, workloads_dir: &Path) -> Result<()> {
+fn push_engine_symbols(
+    target: &OhosTarget,
+    engine: &EngineConfig,
+    workloads_dir: &Path,
+) -> Result<()> {
     if engine.symbol_file.is_empty() {
         return Ok(());
     }
@@ -288,11 +312,16 @@ fn push_engine_symbols(target: &OhosTarget, engine: &EngineConfig, workloads_dir
             "warning: engine {:?} symbol_file {:?} not found — symbols won't resolve. \
              Run: servoperf prepare-arkweb-symbols --input <stripped-libarkweb_engine.so> \
              --output {}",
-            engine.id, host_path, host_path.display(),
+            engine.id,
+            host_path,
+            host_path.display(),
         );
         return Ok(());
     }
-    eprintln!("ohos: pushing engine symbols ({} → device)", host_path.display());
+    eprintln!(
+        "ohos: pushing engine symbols ({} → device)",
+        host_path.display()
+    );
     target.push_arkweb_symbols(&host_path)
 }
 
@@ -301,9 +330,10 @@ fn push_engine_symbols(target: &OhosTarget, engine: &EngineConfig, workloads_dir
 /// installs the .hap once if `--bin` is given.
 pub(crate) fn build_target(ohos: &OhosArgs, bin: Option<&Path>) -> Result<Target> {
     if !ohos.ohos {
-        let bin = bin
-            .ok_or_else(|| anyhow::anyhow!("--bin is required (path to servoshell)"))?;
-        return Ok(Target::Local { bin: bin.to_path_buf() });
+        let bin = bin.ok_or_else(|| anyhow::anyhow!("--bin is required (path to servoshell)"))?;
+        return Ok(Target::Local {
+            bin: bin.to_path_buf(),
+        });
     }
     let mut target = OhosTarget::from_args(ohos);
     // Hydrate engine-specific proxy-arg templates from the global
@@ -353,9 +383,7 @@ pub(crate) fn build_record_driver(
     ohos_record_seconds: u64,
 ) -> Box<dyn fixtures::RecordDriver> {
     match target {
-        Target::Local { bin } => {
-            Box::new(fixtures::LocalServoshellDriver { bin: bin.clone() })
-        }
+        Target::Local { bin } => Box::new(fixtures::LocalServoshellDriver { bin: bin.clone() }),
         Target::Ohos(ohos) => Box::new(crate::ohos::OhosRecordDriver {
             target: ohos.clone(),
             record_seconds: ohos_record_seconds,

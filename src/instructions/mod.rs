@@ -61,8 +61,8 @@ impl InstructionsConfig {
         let path = workloads_dir.join("_instructions.toml");
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("reading instructions config at {}", path.display()))?;
-        let cfg: InstructionsConfig = toml::from_str(&text)
-            .with_context(|| format!("parsing TOML at {}", path.display()))?;
+        let cfg: InstructionsConfig =
+            toml::from_str(&text).with_context(|| format!("parsing TOML at {}", path.display()))?;
         Ok(cfg)
     }
 
@@ -71,7 +71,9 @@ impl InstructionsConfig {
     /// collection (with a one-line stderr warning) so an unknown bundle
     /// doesn't fail the bench.
     pub fn engine_for_bundle(&self, bundle: &str) -> Option<&EngineConfig> {
-        self.engines.iter().find(|e| e.bundles.iter().any(|b| b == bundle))
+        self.engines
+            .iter()
+            .find(|e| e.bundles.iter().any(|b| b == bundle))
     }
 }
 

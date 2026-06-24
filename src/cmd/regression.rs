@@ -15,7 +15,9 @@ struct BaselineRunResults {
 }
 
 #[derive(Debug, Deserialize)]
-struct BaselineWorkload { name: String }
+struct BaselineWorkload {
+    name: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct BaselineConfig {
@@ -23,7 +25,9 @@ struct BaselineConfig {
 }
 
 #[derive(Debug, Deserialize)]
-struct BaselineSummary { p50: f64 }
+struct BaselineSummary {
+    p50: f64,
+}
 
 pub fn run(args: RegressionArgs) -> Result<()> {
     // Step 1: do a bench-style run first.
@@ -46,7 +50,9 @@ pub fn run(args: RegressionArgs) -> Result<()> {
     anyhow::ensure!(
         baseline.workload.name == args.workload,
         "baseline at {} is for workload '{}', but this run is '{}'",
-        args.baseline.display(), baseline.workload.name, args.workload,
+        args.baseline.display(),
+        baseline.workload.name,
+        args.workload,
     );
 
     // Step 3: re-read the raw.json we just wrote to compute delta against the baseline.
@@ -57,18 +63,24 @@ pub fn run(args: RegressionArgs) -> Result<()> {
     )?;
 
     let base_fcp = baseline
-        .configs.get("main")
+        .configs
+        .get("main")
         .and_then(|c| c.summary.get("FirstContentfulPaint"))
         .map(|s| s.p50);
     let new_fcp = current
-        .configs.get("main")
+        .configs
+        .get("main")
         .and_then(|c| c.summary.get("FirstContentfulPaint"))
         .map(|s| s.p50);
     let (Some(base_fcp), Some(new_fcp)) = (base_fcp, new_fcp) else {
         anyhow::bail!("missing FirstContentfulPaint summary in baseline or current run");
     };
 
-    let delta_pct = if base_fcp.abs() < f64::EPSILON { 0.0 } else { 100.0 * (new_fcp - base_fcp) / base_fcp };
+    let delta_pct = if base_fcp.abs() < f64::EPSILON {
+        0.0
+    } else {
+        100.0 * (new_fcp - base_fcp) / base_fcp
+    };
 
     eprintln!(
         "FirstContentfulPaint p50: baseline={:.1} ms, current={:.1} ms, Δ={:+.2}% (threshold {:+.1}%)",
@@ -82,7 +94,9 @@ pub fn run(args: RegressionArgs) -> Result<()> {
 }
 
 fn find_latest_out(workload: &str, explicit: Option<&Path>) -> std::path::PathBuf {
-    if let Some(p) = explicit { return p.to_path_buf(); }
+    if let Some(p) = explicit {
+        return p.to_path_buf();
+    }
     // Find the most recently created `out/<workload>-*` directory.
     let entries = std::fs::read_dir("out").ok();
     entries

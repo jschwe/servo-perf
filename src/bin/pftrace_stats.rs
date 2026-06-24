@@ -52,7 +52,9 @@ fn main() -> anyhow::Result<()> {
         let mut durs: Vec<u64> = v.iter().map(|s| s.dur_ns).collect();
         durs.sort_unstable();
         let n = durs.len();
-        if n == 0 { continue }
+        if n == 0 {
+            continue;
+        }
         let total_ns: u128 = durs.iter().map(|x| *x as u128).sum();
         let avg = total_ns as f64 / n as f64 / 1e6;
         let p = |q: f64| durs[((n as f64 * q) as usize).min(n - 1)] as f64 / 1e6;

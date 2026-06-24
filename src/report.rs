@@ -50,8 +50,8 @@ pub struct RunResults {
 
 pub fn write_json(out_dir: &Path, data: &RunResults) -> Result<()> {
     let path = out_dir.join("raw.json");
-    let file = std::fs::File::create(&path)
-        .with_context(|| format!("creating {}", path.display()))?;
+    let file =
+        std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
     serde_json::to_writer_pretty(file, data)
         .with_context(|| format!("writing JSON to {}", path.display()))?;
     Ok(())
@@ -85,12 +85,18 @@ fn repr_iteration(cfg: &ConfigResults) -> Option<&Iteration> {
     let median = fcp_values[fcp_values.len() / 2];
     cfg.iterations.iter().min_by(|a, b| {
         let fcp_a = if let IterationStatus::Ok { ref metrics, .. } = a.status {
-            metrics.get("FirstContentfulPaint").copied().unwrap_or(f64::MAX)
+            metrics
+                .get("FirstContentfulPaint")
+                .copied()
+                .unwrap_or(f64::MAX)
         } else {
             f64::MAX
         };
         let fcp_b = if let IterationStatus::Ok { ref metrics, .. } = b.status {
-            metrics.get("FirstContentfulPaint").copied().unwrap_or(f64::MAX)
+            metrics
+                .get("FirstContentfulPaint")
+                .copied()
+                .unwrap_or(f64::MAX)
         } else {
             f64::MAX
         };
@@ -116,12 +122,7 @@ fn fcp_bar(ms: f64, max: f64, width: usize) -> String {
 /// metric. Iterations that didn't produce the metric (e.g. LCP on a
 /// page without a large enough fragment) print as "—" so the chart
 /// stays aligned with the iteration list.
-fn render_per_iter_chart(
-    s: &mut String,
-    short: &str,
-    metric: &str,
-    cfg: &ConfigResults,
-) {
+fn render_per_iter_chart(s: &mut String, short: &str, metric: &str, cfg: &ConfigResults) {
     writeln!(s, "### Per-iteration {}\n", short).unwrap();
     let bar_width = 30usize;
     let max_v = cfg
@@ -143,13 +144,7 @@ fn render_per_iter_chart(
                     writeln!(s, "iter {:>2}  {} {:.0} ms", iter.index, bar, v).unwrap();
                 }
                 None => {
-                    writeln!(
-                        s,
-                        "iter {:>2}  [{}] —",
-                        iter.index,
-                        " ".repeat(bar_width)
-                    )
-                    .unwrap();
+                    writeln!(s, "iter {:>2}  [{}] —", iter.index, " ".repeat(bar_width)).unwrap();
                 }
             },
             IterationStatus::Failed { .. } => {
@@ -166,12 +161,16 @@ fn render_per_iter_chart(
 /// readability. Iterations missing the metric (read failures, local
 /// target) render as `—`.
 fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
-    fn mc_to_c(mc: f64) -> f64 { mc / 1000.0 }
+    fn mc_to_c(mc: f64) -> f64 {
+        mc / 1000.0
+    }
     let befores: Vec<f64> = cfg
         .iterations
         .iter()
         .filter_map(|i| match &i.status {
-            IterationStatus::Ok { metrics, .. } => metrics.get("soc_thermal_milli_c.before").copied(),
+            IterationStatus::Ok { metrics, .. } => {
+                metrics.get("soc_thermal_milli_c.before").copied()
+            }
             _ => None,
         })
         .collect();
@@ -179,7 +178,9 @@ fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
         .iterations
         .iter()
         .filter_map(|i| match &i.status {
-            IterationStatus::Ok { metrics, .. } => metrics.get("soc_thermal_milli_c.after").copied(),
+            IterationStatus::Ok { metrics, .. } => {
+                metrics.get("soc_thermal_milli_c.after").copied()
+            }
             _ => None,
         })
         .collect();
@@ -187,14 +188,24 @@ fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
         .iterations
         .iter()
         .filter_map(|i| match &i.status {
-            IterationStatus::Ok { metrics, .. } => metrics.get("soc_thermal_milli_c.delta").copied(),
+            IterationStatus::Ok { metrics, .. } => {
+                metrics.get("soc_thermal_milli_c.delta").copied()
+            }
             _ => None,
         })
         .collect();
 
     writeln!(s, "### SoC thermal (zone0 `soc_thermal`, 70 °C trip)\n").unwrap();
-    let min_temp = befores.iter().chain(afters.iter()).cloned().fold(f64::INFINITY, f64::min);
-    let max_temp = befores.iter().chain(afters.iter()).cloned().fold(f64::NEG_INFINITY, f64::max);
+    let min_temp = befores
+        .iter()
+        .chain(afters.iter())
+        .cloned()
+        .fold(f64::INFINITY, f64::min);
+    let max_temp = befores
+        .iter()
+        .chain(afters.iter())
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
     let max_delta = deltas.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     if min_temp.is_finite() && max_temp.is_finite() {
         let headroom_to_trip = 70.0 - mc_to_c(max_temp);
@@ -218,9 +229,18 @@ fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
     for iter in &cfg.iterations {
         let (b, a, d) = match &iter.status {
             IterationStatus::Ok { metrics, .. } => (
-                metrics.get("soc_thermal_milli_c.before").copied().map(mc_to_c),
-                metrics.get("soc_thermal_milli_c.after").copied().map(mc_to_c),
-                metrics.get("soc_thermal_milli_c.delta").copied().map(mc_to_c),
+                metrics
+                    .get("soc_thermal_milli_c.before")
+                    .copied()
+                    .map(mc_to_c),
+                metrics
+                    .get("soc_thermal_milli_c.after")
+                    .copied()
+                    .map(mc_to_c),
+                metrics
+                    .get("soc_thermal_milli_c.delta")
+                    .copied()
+                    .map(mc_to_c),
             ),
             _ => (None, None, None),
         };
@@ -254,7 +274,11 @@ fn render_instructions_section(s: &mut String, cfg: &ConfigResults) {
         return;
     }
     writeln!(s, "### Instructions (inclusive, hw-instructions)\n").unwrap();
-    writeln!(s, "| function | n | p50 (M) | mean (M) | p90 (M) | max (M) |").unwrap();
+    writeln!(
+        s,
+        "| function | n | p50 (M) | mean (M) | p90 (M) | max (M) |"
+    )
+    .unwrap();
     writeln!(s, "|---|---:|---:|---:|---:|---:|").unwrap();
     for (key, sum) in entries {
         let func = key.trim_start_matches("instructions.");
@@ -262,8 +286,14 @@ fn render_instructions_section(s: &mut String, cfg: &ConfigResults) {
         writeln!(
             s,
             "| `{}` | {} | {:.1} | {:.1} | {:.1} | {:.1} |",
-            func, sum.n, m(sum.p50), m(sum.mean), m(sum.p90), m(sum.max),
-        ).unwrap();
+            func,
+            sum.n,
+            m(sum.p50),
+            m(sum.mean),
+            m(sum.p90),
+            m(sum.max),
+        )
+        .unwrap();
     }
     writeln!(s).unwrap();
 }
@@ -290,8 +320,16 @@ fn render_markdown(data: &RunResults) -> String {
     };
     writeln!(s, "## Reproduction\n").unwrap();
     if subcommand == "ab" {
-        let base_bin = data.configs.get("base").map(|c| c.bin.display().to_string()).unwrap_or_default();
-        let patch_bin = data.configs.get("patch").map(|c| c.bin.display().to_string()).unwrap_or_default();
+        let base_bin = data
+            .configs
+            .get("base")
+            .map(|c| c.bin.display().to_string())
+            .unwrap_or_default();
+        let patch_bin = data
+            .configs
+            .get("patch")
+            .map(|c| c.bin.display().to_string())
+            .unwrap_or_default();
         writeln!(
             s,
             "```\nservoperf ab {} --base-bin={} --patch-bin={}\n```\n",
@@ -299,7 +337,12 @@ fn render_markdown(data: &RunResults) -> String {
         )
         .unwrap();
     } else {
-        let bin = data.configs.values().next().map(|c| c.bin.display().to_string()).unwrap_or_default();
+        let bin = data
+            .configs
+            .values()
+            .next()
+            .map(|c| c.bin.display().to_string())
+            .unwrap_or_default();
         writeln!(
             s,
             "```\nservoperf bench {} --bin={}\n```\n",
@@ -317,7 +360,11 @@ fn render_markdown(data: &RunResults) -> String {
             .count();
         let failed = cfg.iterations.len() - ok;
         writeln!(s, "Iterations: {} ok, {} failed.\n", ok, failed).unwrap();
-        writeln!(s, "| metric | n | min | p25 | p50 | mean | p75 | p90 | max |").unwrap();
+        writeln!(
+            s,
+            "| metric | n | min | p25 | p50 | mean | p75 | p90 | max |"
+        )
+        .unwrap();
         writeln!(s, "|---|---:|---:|---:|---:|---:|---:|---:|---:|").unwrap();
         for (metric, sum) in &cfg.summary {
             // Instruction summaries are rendered in their own section with
@@ -343,7 +390,10 @@ fn render_markdown(data: &RunResults) -> String {
         // Critical-path phase table (representative iteration).
         writeln!(s, "### Critical path\n").unwrap();
         if let Some(rep) = repr_iteration(cfg) {
-            if let IterationStatus::Ok { ref critical_path, .. } = rep.status {
+            if let IterationStatus::Ok {
+                ref critical_path, ..
+            } = rep.status
+            {
                 writeln!(s, "| phase | thread | ts (ms) | dur (ms) | flag |").unwrap();
                 writeln!(s, "|---|---|---:|---:|---|").unwrap();
                 // Collect all rows (named spans + milestones) sorted by ts_ms.
@@ -383,11 +433,7 @@ fn render_markdown(data: &RunResults) -> String {
                     if let Some(end) = prev_end {
                         let gap = ts - end;
                         if gap >= GAP_THRESHOLD_MS {
-                            writeln!(
-                                s,
-                                "| _gap_ |  | {:.1} | {:.1} |  |",
-                                end, gap
-                            ).unwrap();
+                            writeln!(s, "| _gap_ |  | {:.1} | {:.1} |  |", end, gap).unwrap();
                         }
                     }
                     let dur_str = match dur {
@@ -402,7 +448,8 @@ fn render_markdown(data: &RunResults) -> String {
                         s,
                         "| {} | {} | {:.1} | {} | {} |",
                         phase, thread, ts, dur_str, flag
-                    ).unwrap();
+                    )
+                    .unwrap();
                     // An aggregated row's `ts + dur` is meaningless as a
                     // chronology bound (the N occurrences are scattered, not
                     // contiguous). Only advance `prev_end` for single-span
@@ -425,7 +472,10 @@ fn render_markdown(data: &RunResults) -> String {
         // Flagged gaps (representative iteration).
         writeln!(s, "### Flagged gaps\n").unwrap();
         let gaps_present = repr_iteration(cfg).and_then(|rep| {
-            if let IterationStatus::Ok { ref critical_path, .. } = rep.status {
+            if let IterationStatus::Ok {
+                ref critical_path, ..
+            } = rep.status
+            {
                 if !critical_path.gaps.is_empty() {
                     Some(critical_path.gaps.clone())
                 } else {
@@ -439,7 +489,12 @@ fn render_markdown(data: &RunResults) -> String {
             writeln!(s, "| from → to | actual gap (ms) | threshold (ms) |").unwrap();
             writeln!(s, "|---|---:|---:|").unwrap();
             for g in &gaps {
-                writeln!(s, "| {} → {} | {:.1} | {:.1} |", g.from, g.to, g.actual_gap_ms, g.threshold_ms).unwrap();
+                writeln!(
+                    s,
+                    "| {} → {} | {:.1} | {:.1} |",
+                    g.from, g.to, g.actual_gap_ms, g.threshold_ms
+                )
+                .unwrap();
             }
         } else {
             writeln!(s, "None flagged.").unwrap();
@@ -547,10 +602,22 @@ mod tests {
         assert!(md.contains("FirstContentfulPaint"));
         assert!(md.contains("| 3 |"));
         // New §8.2 sections.
-        assert!(md.contains("## Reproduction"), "missing Reproduction section");
-        assert!(md.contains("### Critical path"), "missing Critical path section");
-        assert!(md.contains("### Flagged gaps"), "missing Flagged gaps section");
-        assert!(md.contains("### Per-iteration FCP"), "missing Per-iteration FCP section");
+        assert!(
+            md.contains("## Reproduction"),
+            "missing Reproduction section"
+        );
+        assert!(
+            md.contains("### Critical path"),
+            "missing Critical path section"
+        );
+        assert!(
+            md.contains("### Flagged gaps"),
+            "missing Flagged gaps section"
+        );
+        assert!(
+            md.contains("### Per-iteration FCP"),
+            "missing Per-iteration FCP section"
+        );
         assert!(md.contains("iter  0"), "missing iter 0 bar line");
     }
 }

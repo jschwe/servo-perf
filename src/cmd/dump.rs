@@ -37,10 +37,7 @@ pub fn run(args: DumpArgs) -> Result<()> {
     // top-N "many tiny slices that add up" view.
     for (thread, items) in &by_thread {
         println!("\n=== thread: {} ===", thread);
-        println!(
-            "{:<8} {:>8} {:>7}  {}",
-            "ts_ms", "dur_ms", "count", "name"
-        );
+        println!("{:<8} {:>8} {:>7}  {}", "ts_ms", "dur_ms", "count", "name");
 
         let mut seen: BTreeMap<String, (f64, u32)> = BTreeMap::new();
         for s in items {
@@ -49,7 +46,7 @@ pub fn run(args: DumpArgs) -> Result<()> {
             entry.1 += 1;
         }
         let mut unique: Vec<_> = seen.into_iter().collect();
-        unique.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+        unique.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
 
         // Print a short "top by total time" summary first.
         println!("  -- top by total duration --");
@@ -64,10 +61,7 @@ pub fn run(args: DumpArgs) -> Result<()> {
         for s in chrono.iter().take(40) {
             let ts_ms = (s.ts_ns - t0_ns) as f64 / 1_000_000.0;
             let dur_ms = s.dur_ns as f64 / 1_000_000.0;
-            println!(
-                "  {:>8.2} {:>8.2}          {}",
-                ts_ms, dur_ms, s.name
-            );
+            println!("  {:>8.2} {:>8.2}          {}", ts_ms, dur_ms, s.name);
         }
         if chrono.len() > 40 {
             println!("  ... ({} more)", chrono.len() - 40);

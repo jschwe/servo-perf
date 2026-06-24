@@ -83,7 +83,11 @@ impl OhosTarget {
             trace_level: a.ohos_trace_level.clone(),
             post_install_cooldown_seconds: a.ohos_post_install_cooldown_seconds,
             warmup_seconds: a.ohos_warmup_seconds,
-            hiperf_period: if a.with_instructions { Some(a.instructions_period) } else { None },
+            hiperf_period: if a.with_instructions {
+                Some(a.instructions_period)
+            } else {
+                None
+            },
             // Populated by `crate::cmd::bench::build_target` after `from_args`,
             // since the workloads_dir / engine lookup live in that scope.
             engine_proxy_args: Vec::new(),
@@ -102,15 +106,23 @@ impl OhosTarget {
         }
         self.force_stop();
         self.hdc(&[
-            "shell", "aa", "start",
-            "-a", &self.ability,
-            "-b", &self.bundle,
-            "-U", "about:blank",
+            "shell",
+            "aa",
+            "start",
+            "-a",
+            &self.ability,
+            "-b",
+            &self.bundle,
+            "-U",
+            "about:blank",
         ])
         .context("warmup aa start about:blank")?;
         std::thread::sleep(Duration::from_secs(self.warmup_seconds));
         self.force_stop();
-        eprintln!("ohos: warmup launch about:blank held {}s", self.warmup_seconds);
+        eprintln!(
+            "ohos: warmup launch about:blank held {}s",
+            self.warmup_seconds
+        );
         Ok(())
     }
 
@@ -210,7 +222,10 @@ impl OhosTarget {
         let out = self
             .hdc(&["shell", "cat", "/sys/class/thermal/thermal_zone0/temp"])
             .ok()?;
-        String::from_utf8_lossy(&out.stdout).trim().parse::<i64>().ok()
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<i64>()
+            .ok()
     }
 
     /// Read the current `persist.hitrace.level.threshold` via
@@ -221,7 +236,8 @@ impl OhosTarget {
     /// (`Debug` / `Info` / `Critical` / `Commercial`) parsed out of
     /// `hitrace`'s line `the current trace level threshold is X`.
     pub fn get_trace_level(&self) -> Result<String> {
-        let out = self.hdc(&["shell", "hitrace", "--get_level"])
+        let out = self
+            .hdc(&["shell", "hitrace", "--get_level"])
             .context("hitrace --get_level")?;
         let s = String::from_utf8_lossy(&out.stdout);
         // Tolerate single quotes / trailing whitespace / log prefix —
@@ -258,18 +274,27 @@ impl OhosTarget {
     /// trace contents predictable.
     pub fn guard_trace_level(&self, desired: &str) -> Result<TraceLevelGuard> {
         if desired.is_empty() {
-            return Ok(TraceLevelGuard { target: None, previous: String::new() });
+            return Ok(TraceLevelGuard {
+                target: None,
+                previous: String::new(),
+            });
         }
         let previous = self.get_trace_level()?;
         if previous.eq_ignore_ascii_case(desired) {
-            return Ok(TraceLevelGuard { target: None, previous });
+            return Ok(TraceLevelGuard {
+                target: None,
+                previous,
+            });
         }
         self.set_trace_level(desired)?;
         eprintln!(
             "ohos: hitrace level {} → {} (will restore on exit)",
             previous, desired
         );
-        Ok(TraceLevelGuard { target: Some(self.clone()), previous })
+        Ok(TraceLevelGuard {
+            target: Some(self.clone()),
+            previous,
+        })
     }
 
     /// `hdc shell aa start` with the workload's args translated into
@@ -316,7 +341,11 @@ impl OhosTarget {
                 .with_context(|| format!("hdc rport tcp:{port} tcp:{port}"))?;
             installed.push(port);
         }
-        Ok(RPortGuard { hdc_bin: self.hdc_bin.clone(), hdc_server: self.hdc_server.clone(), ports: installed })
+        Ok(RPortGuard {
+            hdc_bin: self.hdc_bin.clone(),
+            hdc_server: self.hdc_server.clone(),
+            ports: installed,
+        })
     }
 
     /// Run one iteration on the device:
@@ -347,8 +376,7 @@ impl OhosTarget {
         // default — large enough for ~10 s of full-tag capture without
         // overflow on the test devices we have access to.
         let buffer = self.trace_buffer_kib.to_string();
-        let mut begin_args: Vec<&str> =
-            vec!["shell", "hitrace", "-b", &buffer];
+        let mut begin_args: Vec<&str> = vec!["shell", "hitrace", "-b", &buffer];
         for tag in &self.trace_tags {
             begin_args.push(tag);
         }
@@ -437,13 +465,20 @@ impl OhosTarget {
         let period_str = period.to_string();
         self.hdc(&[
             "shell",
-            "hiperf", "record",
-            "-a", "--exclude-hiperf",
-            "-d", &duration,
-            "-s", "dwarf",
-            "--period", &period_str,
-            "-e", "hw-instructions",
-            "-o", DevicePaths::PERF_DATA,
+            "hiperf",
+            "record",
+            "-a",
+            "--exclude-hiperf",
+            "-d",
+            &duration,
+            "-s",
+            "dwarf",
+            "--period",
+            &period_str,
+            "-e",
+            "hw-instructions",
+            "-o",
+            DevicePaths::PERF_DATA,
         ])?;
         Ok(())
     }
@@ -618,11 +653,7 @@ fn workload_args_to_aa_params(
             if rest.contains('=') {
                 // `--key=value` → single verbatim token.
                 out.push(format!("--psn=--{}", rest));
-            } else if iter
-                .peek()
-                .map(|n| !n.starts_with('-'))
-                .unwrap_or(false)
-            {
+            } else if iter.peek().map(|n| !n.starts_with('-')).unwrap_or(false) {
                 // `--key value` (value is the next list item) → fold into one
                 // `--psn=--key=value` token so the want-parameter key is unique.
                 let value = iter.next().unwrap();
@@ -883,7 +914,13 @@ fn parse_hitrace_line(line: &str) -> Option<ParsedLine> {
     } else {
         name_or_level
     };
-    Some(ParsedLine { comm, tid, ts_ns, marker, payload })
+    Some(ParsedLine {
+        comm,
+        tid,
+        ts_ns,
+        marker,
+        payload,
+    })
 }
 
 /// Convert a `<seconds>.<sub>` timestamp string to nanoseconds.
@@ -998,12 +1035,13 @@ impl crate::fixtures::RecordDriver for OhosRecordDriver {
 fn parse_proxy_port(uri: &str) -> Result<u16> {
     let after_scheme = uri.split_once("://").map(|(_, rest)| rest).unwrap_or(uri);
     let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
-    let port_str = host_port.rsplit(':').next().ok_or_else(|| {
-        anyhow::anyhow!("proxy URI {uri:?} has no port — can't set up hdc rport")
-    })?;
-    port_str.parse::<u16>().with_context(|| {
-        format!("proxy URI {uri:?} has a non-numeric port {port_str:?}")
-    })
+    let port_str = host_port
+        .rsplit(':')
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("proxy URI {uri:?} has no port — can't set up hdc rport"))?;
+    port_str
+        .parse::<u16>()
+        .with_context(|| format!("proxy URI {uri:?} has a non-numeric port {port_str:?}"))
 }
 
 #[cfg(test)]
@@ -1044,7 +1082,8 @@ mod tests {
 
     #[test]
     fn parses_instant_event() {
-        let txt = "   servo-1  ( 1) [000] .... 5.000000: tracing_mark_write: I|1|FirstContentfulPaint\n";
+        let txt =
+            "   servo-1  ( 1) [000] .... 5.000000: tracing_mark_write: I|1|FirstContentfulPaint\n";
         let slices = parse_hitrace_text(txt);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].name, "FirstContentfulPaint");
@@ -1123,7 +1162,9 @@ mod tests {
         assert!(aa.iter().any(|a| a == "--ps=--passthrough"));
         assert!(aa.iter().any(|a| a == "--psn=--flag"));
         // proxy injected
-        assert!(aa.iter().any(|a| a.starts_with("--psn=--pref=network_https_proxy_uri=")));
+        assert!(aa
+            .iter()
+            .any(|a| a.starts_with("--psn=--pref=network_https_proxy_uri=")));
         assert!(aa.iter().any(|a| a == "--psn=--ignore-certificate-errors"));
     }
 }

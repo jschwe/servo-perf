@@ -75,9 +75,9 @@ pub fn load_registry_named(workloads_dir: &Path, stem: &str) -> Result<SpanRegis
 
 #[cfg(feature = "pftrace")]
 use crate::proto::{
-    InternedData, TrackEvent,
     perfetto_protos::track_event::NameField,
     perfetto_protos::{trace_packet, Trace},
+    InternedData, TrackEvent,
 };
 #[cfg(feature = "pftrace")]
 use prost::Message;
@@ -113,8 +113,8 @@ pub struct Slice {
 /// resolved via the interning tables.
 #[cfg(feature = "pftrace")]
 pub fn parse(path: &Path) -> Result<Vec<Slice>> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading pftrace at {}", path.display()))?;
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading pftrace at {}", path.display()))?;
 
     let trace = Trace::decode(bytes.as_slice())
         .with_context(|| format!("decoding Trace from {}", path.display()))?;
@@ -131,9 +131,7 @@ pub fn parse(path: &Path) -> Result<Vec<Slice>> {
     let mut slices = Vec::new();
     for pkt in trace.packet.iter() {
         let seq = match pkt.optional_trusted_packet_sequence_id.as_ref() {
-            Some(trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(id)) => {
-                *id
-            }
+            Some(trace_packet::OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(id)) => *id,
             None => 0,
         };
 
@@ -187,7 +185,13 @@ pub fn parse(path: &Path) -> Result<Vec<Slice>> {
                     .cloned()
                     .unwrap_or_else(|| "?".to_string());
                 let debug_annotations = collect_debug_annotations(seq, te, &interned_names);
-                slices.push(Slice { name, thread, ts_ns: ts, dur_ns: 0, debug_annotations });
+                slices.push(Slice {
+                    name,
+                    thread,
+                    ts_ns: ts,
+                    dur_ns: 0,
+                    debug_annotations,
+                });
             }
         }
     }
@@ -308,28 +312,31 @@ pub struct CriticalPathReport {
 /// — which is what the report should publish as "the LCP".
 const PICK_LATEST_PHASES: &[&str] = &["LargestContentfulPaint"];
 
-pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) -> CriticalPathReport {
+pub fn analyse(
+    slices: &[Slice],
+    registry: &SpanRegistry,
+    spawn_wall_ns: u64,
+) -> CriticalPathReport {
     // Pick the canonical slice per name. For most phases that's the
     // smallest ts_ns (the *first* time it fires). For phases listed
     // in PICK_LATEST_PHASES, it's the largest ts_ns (latest fire) —
     // see the constant's docs.
-    let first_by_name: HashMap<&str, &Slice> =
-        slices.iter().fold(HashMap::new(), |mut acc, s| {
-            let pick_latest = PICK_LATEST_PHASES.contains(&s.name.as_str());
-            acc.entry(s.name.as_str())
-                .and_modify(|existing: &mut &Slice| {
-                    let take = if pick_latest {
-                        s.ts_ns > existing.ts_ns
-                    } else {
-                        s.ts_ns < existing.ts_ns
-                    };
-                    if take {
-                        *existing = s;
-                    }
-                })
-                .or_insert(s);
-            acc
-        });
+    let first_by_name: HashMap<&str, &Slice> = slices.iter().fold(HashMap::new(), |mut acc, s| {
+        let pick_latest = PICK_LATEST_PHASES.contains(&s.name.as_str());
+        acc.entry(s.name.as_str())
+            .and_modify(|existing: &mut &Slice| {
+                let take = if pick_latest {
+                    s.ts_ns > existing.ts_ns
+                } else {
+                    s.ts_ns < existing.ts_ns
+                };
+                if take {
+                    *existing = s;
+                }
+            })
+            .or_insert(s);
+        acc
+    });
 
     // Rebase everything to the trace's earliest timestamp so ts_ms is the
     // duration-from-trace-start, not an absolute wallclock value.
@@ -343,25 +350,31 @@ pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) ->
     // tracing's Visit trait has no dedicated `record_u64`: the tracing-perfetto
     // visitor records u64 fields via `record_i64`, so the annotation value can
     // arrive as either Int or Uint. Accept both.
-    let anchor = slices.iter().find(|s| s.name == "servoshell::startup_tracing_initialized");
+    let anchor = slices
+        .iter()
+        .find(|s| s.name == "servoshell::startup_tracing_initialized");
     let anchor_wall_ns = anchor.and_then(|s| {
-        s.debug_annotations.iter().find(|(k, _)| k == "wallclock_ns").and_then(|(_, v)| {
-            match v {
+        s.debug_annotations
+            .iter()
+            .find(|(k, _)| k == "wallclock_ns")
+            .and_then(|(_, v)| match v {
                 DebugAnnotationValue::Uint(n) => Some(*n),
                 DebugAnnotationValue::Int(n) if *n >= 0 => Some(*n as u64),
                 _ => None,
-            }
-        })
+            })
     });
     if let (Some(anc), Some(wall_ns)) = (anchor, anchor_wall_ns) {
         let dur_ms = (wall_ns.saturating_sub(spawn_wall_ns)) as f64 / 1_000_000.0;
-        report.named_spans.insert(0, NamedSpanRow {
-            name: "startup::exec_to_anchor".to_string(),
-            ts_ms: 0.0,
-            dur_ms,
-            thread: "_meta".to_string(),
-            count: None,
-        });
+        report.named_spans.insert(
+            0,
+            NamedSpanRow {
+                name: "startup::exec_to_anchor".to_string(),
+                ts_ms: 0.0,
+                dur_ms,
+                thread: "_meta".to_string(),
+                count: None,
+            },
+        );
         // Diagnostic: clock-skew check.
         let skew_ms = (anc.ts_ns as i128 - wall_ns as i128) as f64 / 1_000_000.0;
         if skew_ms.abs() > 10.0 {
@@ -420,7 +433,10 @@ pub fn analyse(slices: &[Slice], registry: &SpanRegistry, spawn_wall_ns: u64) ->
             let ts_ms = rel_ms(s.ts_ns);
             let dur_ms = s.dur_ns as f64 / 1_000_000.0;
             if phase.is_milestone {
-                report.milestones.push(Milestone { name: phase.name.clone(), ts_ms });
+                report.milestones.push(Milestone {
+                    name: phase.name.clone(),
+                    ts_ms,
+                });
             } else {
                 report.named_spans.push(NamedSpanRow {
                     name: phase.name.clone(),
@@ -478,7 +494,11 @@ mod tests {
             .join("fixtures")
             .join("minimal.pftrace");
         let slices = super::parse(&path).expect("parse minimal");
-        assert_eq!(slices.len(), 2, "expected 1 span + 1 instant, got {slices:?}");
+        assert_eq!(
+            slices.len(),
+            2,
+            "expected 1 span + 1 instant, got {slices:?}"
+        );
         assert_eq!(slices[0].name, "A");
         assert_eq!(slices[0].thread, "main");
         assert_eq!(slices[0].ts_ns, 100);
@@ -524,13 +544,31 @@ flag_threshold_ms = 10
     fn simple_registry() -> SpanRegistry {
         SpanRegistry {
             phases: vec![
-                Phase { name: "A".into(), owner_thread: "main".into(), is_milestone: false, aggregate: false },
-                Phase { name: "B".into(), owner_thread: "main".into(), is_milestone: false, aggregate: false },
-                Phase { name: "FirstContentfulPaint".into(), owner_thread: "main".into(), is_milestone: true, aggregate: false },
+                Phase {
+                    name: "A".into(),
+                    owner_thread: "main".into(),
+                    is_milestone: false,
+                    aggregate: false,
+                },
+                Phase {
+                    name: "B".into(),
+                    owner_thread: "main".into(),
+                    is_milestone: false,
+                    aggregate: false,
+                },
+                Phase {
+                    name: "FirstContentfulPaint".into(),
+                    owner_thread: "main".into(),
+                    is_milestone: true,
+                    aggregate: false,
+                },
             ],
-            edges: vec![
-                Edge { from: "A".into(), to: "B".into(), expected_gap_ms: 1.0, flag_threshold_ms: 10.0 },
-            ],
+            edges: vec![Edge {
+                from: "A".into(),
+                to: "B".into(),
+                expected_gap_ms: 1.0,
+                flag_threshold_ms: 10.0,
+            }],
         }
     }
 
@@ -588,14 +626,12 @@ flag_threshold_ms = 10
         // the LATEST occurrence corresponds to the largest area —
         // which is what we want to report as "the LCP" per spec.
         let registry = SpanRegistry {
-            phases: vec![
-                Phase {
-                    name: "LargestContentfulPaint".into(),
-                    owner_thread: "main".into(),
-                    is_milestone: true,
-                    aggregate: false,
-                },
-            ],
+            phases: vec![Phase {
+                name: "LargestContentfulPaint".into(),
+                owner_thread: "main".into(),
+                is_milestone: true,
+                aggregate: false,
+            }],
             edges: vec![],
         };
         let slices = vec![
@@ -619,21 +655,40 @@ flag_threshold_ms = 10
         // should sum every "render" up to LCP, not stop at FCP.
         let registry = SpanRegistry {
             phases: vec![
-                Phase { name: "render".into(), owner_thread: "main".into(), is_milestone: false, aggregate: true },
-                Phase { name: "FirstContentfulPaint".into(), owner_thread: "main".into(), is_milestone: true, aggregate: false },
-                Phase { name: "LargestContentfulPaint".into(), owner_thread: "main".into(), is_milestone: true, aggregate: false },
+                Phase {
+                    name: "render".into(),
+                    owner_thread: "main".into(),
+                    is_milestone: false,
+                    aggregate: true,
+                },
+                Phase {
+                    name: "FirstContentfulPaint".into(),
+                    owner_thread: "main".into(),
+                    is_milestone: true,
+                    aggregate: false,
+                },
+                Phase {
+                    name: "LargestContentfulPaint".into(),
+                    owner_thread: "main".into(),
+                    is_milestone: true,
+                    aggregate: false,
+                },
             ],
             edges: vec![],
         };
         let slices = vec![
-            slice("render", 50.0, 5.0),                  // before FCP — counted
-            slice("render", 150.0, 5.0),                 // post-FCP, pre-LCP — should still be counted
+            slice("render", 50.0, 5.0),  // before FCP — counted
+            slice("render", 150.0, 5.0), // post-FCP, pre-LCP — should still be counted
             slice("FirstContentfulPaint", 100.0, 0.0),
             slice("LargestContentfulPaint", 300.0, 0.0),
-            slice("render", 350.0, 5.0),                 // post-LCP — must NOT be counted
+            slice("render", 350.0, 5.0), // post-LCP — must NOT be counted
         ];
         let r = super::analyse(&slices, &registry, 0);
-        let render = r.named_spans.iter().find(|s| s.name == "render").expect("render row");
+        let render = r
+            .named_spans
+            .iter()
+            .find(|s| s.name == "render")
+            .expect("render row");
         // 5 ms + 5 ms = 10 ms total, count 2; 350 ms occurrence excluded.
         assert!(
             (render.dur_ms - 10.0).abs() < 0.01,
@@ -648,33 +703,34 @@ flag_threshold_ms = 10
         // Two slices named "A" — the later-in-vec one has earlier ts_ns.
         // The analyser should pick the earliest by ts, not the first in
         // iteration order.
-        let slices = vec![
-            slice("A", 10.0, 2.0),
-            slice("A",  3.0, 1.0),
-        ];
+        let slices = vec![slice("A", 10.0, 2.0), slice("A", 3.0, 1.0)];
         let r = super::analyse(&slices, &simple_registry(), 0);
         assert_eq!(r.named_spans.len(), 1);
         // t0 = 3 ms (the earliest slice); the picked "A" is at 3 ms → relative 0 ms.
-        assert_eq!(r.named_spans[0].ts_ms, 0.0, "analyse should pick the earliest occurrence (rebased to t0)");
+        assert_eq!(
+            r.named_spans[0].ts_ms, 0.0,
+            "analyse should pick the earliest occurrence (rebased to t0)"
+        );
         assert_eq!(r.named_spans[0].dur_ms, 1.0);
     }
 
     #[test]
     fn analyse_synthesizes_exec_to_anchor_from_wallclock() {
-        let anchor_ts_ns = 1_000_000_000u64;       // trace event at 1.0 s wallclock
-        let anchor_wall_ns = anchor_ts_ns;          // perfetto uses wallclock, so ts == wall
-        let spawn_wall_ns = anchor_wall_ns - 800_000_000;  // spawned 800 ms earlier
+        let anchor_ts_ns = 1_000_000_000u64; // trace event at 1.0 s wallclock
+        let anchor_wall_ns = anchor_ts_ns; // perfetto uses wallclock, so ts == wall
+        let spawn_wall_ns = anchor_wall_ns - 800_000_000; // spawned 800 ms earlier
         let slices = vec![
             Slice {
                 name: "servoshell::startup_tracing_initialized".into(),
                 thread: "main".into(),
                 ts_ns: anchor_ts_ns,
                 dur_ns: 0,
-                debug_annotations: vec![
-                    ("wallclock_ns".into(), super::DebugAnnotationValue::Uint(anchor_wall_ns)),
-                ],
+                debug_annotations: vec![(
+                    "wallclock_ns".into(),
+                    super::DebugAnnotationValue::Uint(anchor_wall_ns),
+                )],
             },
-            slice("FirstContentfulPaint", 1200.0, 0.0),  // later in the trace
+            slice("FirstContentfulPaint", 1200.0, 0.0), // later in the trace
         ];
         // registry needs "FirstContentfulPaint" — simple_registry has it.
         let r = super::analyse(&slices, &simple_registry(), spawn_wall_ns);
@@ -691,17 +747,16 @@ flag_threshold_ms = 10
         // handles that too.
         let anchor_wall_ns = 1_500_000_000u64;
         let spawn_wall_ns = anchor_wall_ns - 300_000_000;
-        let slices = vec![
-            Slice {
-                name: "servoshell::startup_tracing_initialized".into(),
-                thread: "main".into(),
-                ts_ns: anchor_wall_ns,
-                dur_ns: 0,
-                debug_annotations: vec![
-                    ("wallclock_ns".into(), super::DebugAnnotationValue::Int(anchor_wall_ns as i64)),
-                ],
-            },
-        ];
+        let slices = vec![Slice {
+            name: "servoshell::startup_tracing_initialized".into(),
+            thread: "main".into(),
+            ts_ns: anchor_wall_ns,
+            dur_ns: 0,
+            debug_annotations: vec![(
+                "wallclock_ns".into(),
+                super::DebugAnnotationValue::Int(anchor_wall_ns as i64),
+            )],
+        }];
         let r = super::analyse(&slices, &simple_registry(), spawn_wall_ns);
         assert_eq!(r.named_spans[0].name, "startup::exec_to_anchor");
         assert!((r.named_spans[0].dur_ms - 300.0).abs() < 0.01);

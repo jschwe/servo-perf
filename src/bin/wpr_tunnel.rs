@@ -67,7 +67,10 @@ async fn handle(mut client: TcpStream, upstream: SocketAddr) -> Result<()> {
     let mut head = Vec::with_capacity(1024);
     let mut tmp = [0u8; 2048];
     loop {
-        let n = client.read(&mut tmp).await.context("reading request head")?;
+        let n = client
+            .read(&mut tmp)
+            .await
+            .context("reading request head")?;
         if n == 0 {
             return Ok(());
         }

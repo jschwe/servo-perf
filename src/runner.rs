@@ -76,9 +76,7 @@ pub enum RunError {
     NonZeroExit { code: i32, stderr: String },
     #[error("servoshell produced no servo.pftrace in {dir}")]
     MissingTrace { dir: PathBuf },
-    #[error(
-        "servoshell iteration hung past {timeout_s}s — killed. stderr tail:\n{stderr}"
-    )]
+    #[error("servoshell iteration hung past {timeout_s}s — killed. stderr tail:\n{stderr}")]
     Timeout { timeout_s: u64, stderr: String },
 }
 
@@ -150,7 +148,8 @@ pub fn run_once(
     // servoperf cares about LCP on every workload, so enable it
     // unconditionally here. Mirrored in
     // `crate::ohos::workload_args_to_aa_params` for the OHOS path.
-    cmd.arg("--pref").arg("largest_contentful_paint_enabled=true");
+    cmd.arg("--pref")
+        .arg("largest_contentful_paint_enabled=true");
     if let Some((w, h)) = workload.viewport {
         cmd.arg("--window-size").arg(format!("{}x{}", w, h));
     }
@@ -214,12 +213,13 @@ pub fn run_once(
     // Copy servo.pftrace out of the per-iteration cwd.
     let source = iter_cwd.join("servo.pftrace");
     if !source.is_file() {
-        anyhow::bail!(RunError::MissingTrace { dir: iter_cwd.clone() });
+        anyhow::bail!(RunError::MissingTrace {
+            dir: iter_cwd.clone()
+        });
     }
     let dest = out_dir.join(format!("iter_{iter}.pftrace"));
-    fs::copy(&source, &dest).with_context(|| {
-        format!("copying {} → {}", source.display(), dest.display())
-    })?;
+    fs::copy(&source, &dest)
+        .with_context(|| format!("copying {} → {}", source.display(), dest.display()))?;
     // Clean up the iteration cwd (but keep the pftrace outside it).
     let _ = fs::remove_dir_all(&iter_cwd);
     Ok(RunArtifact {
@@ -275,5 +275,9 @@ pub fn pick_timeout(successful_durations: &[Duration]) -> Duration {
     sorted.sort_unstable();
     let median = sorted[sorted.len() / 2];
     let ten_x = median.saturating_mul(10);
-    if ten_x > MIN { ten_x } else { MIN }
+    if ten_x > MIN {
+        ten_x
+    } else {
+        MIN
+    }
 }

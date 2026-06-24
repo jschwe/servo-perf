@@ -17,9 +17,11 @@ fn bench_localhost_simple_with_fake_servoshell() {
     let fake_crate_dir = crate_dir.join("tests").join("fake_servoshell");
     let status = Command::new("cargo")
         .current_dir(&fake_crate_dir)
-        .arg("build").arg("--release")
+        .arg("build")
+        .arg("--release")
         .env_remove("CARGO_TARGET_DIR")
-        .status().expect("cargo build fake_servoshell");
+        .status()
+        .expect("cargo build fake_servoshell");
     assert!(status.success());
 
     let fake = fake_crate_dir.join("target/release/fake_servoshell");
@@ -27,10 +29,14 @@ fn bench_localhost_simple_with_fake_servoshell() {
 
     let tmp = tempfile::tempdir().unwrap();
     let status = Command::new(env!("CARGO_BIN_EXE_servoperf"))
-        .arg("bench").arg("localhost-simple")
-        .arg("--bin").arg(&fake)
-        .arg("--iterations").arg("3")
-        .arg("--out").arg(tmp.path())
+        .arg("bench")
+        .arg("localhost-simple")
+        .arg("--bin")
+        .arg(&fake)
+        .arg("--iterations")
+        .arg("3")
+        .arg("--out")
+        .arg(tmp.path())
         .current_dir(crate_dir)
         .status()
         .expect("run servoperf bench");
@@ -63,22 +69,32 @@ fn bench_tolerates_per_iteration_crash() {
     let fake_crate_dir = crate_dir.join("tests").join("fake_servoshell");
     let status = Command::new("cargo")
         .current_dir(&fake_crate_dir)
-        .arg("build").arg("--release")
+        .arg("build")
+        .arg("--release")
         .env_remove("CARGO_TARGET_DIR")
-        .status().unwrap();
+        .status()
+        .unwrap();
     assert!(status.success());
 
     let fake = fake_crate_dir.join("target/release/fake_servoshell");
     let tmp = tempfile::tempdir().unwrap();
     let status = Command::new(env!("CARGO_BIN_EXE_servoperf"))
         .env("SERVOPERF_FAKE_MODE", "crash_on_3")
-        .arg("bench").arg("localhost-simple")
-        .arg("--bin").arg(&fake)
-        .arg("--iterations").arg("5")
-        .arg("--out").arg(tmp.path())
+        .arg("bench")
+        .arg("localhost-simple")
+        .arg("--bin")
+        .arg(&fake)
+        .arg("--iterations")
+        .arg("5")
+        .arg("--out")
+        .arg(tmp.path())
         .current_dir(crate_dir)
-        .status().unwrap();
-    assert!(status.success(), "run should succeed with a single crashed iteration");
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "run should succeed with a single crashed iteration"
+    );
 
     let raw: serde_json::Value =
         serde_json::from_reader(std::fs::File::open(tmp.path().join("raw.json")).unwrap()).unwrap();

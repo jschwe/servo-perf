@@ -26,7 +26,7 @@
 //! that we don't need to set `--set-section-type` because we write the
 //! section headers ourselves.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -44,8 +44,8 @@ const ELF64_SYM_SIZE: u64 = 24;
 /// Errors out if the file isn't a 64-bit little-endian ELF, or the section
 /// doesn't exist. Section name comparison is exact (`==`).
 pub fn read_section_bytes(elf_path: &Path, name: &str) -> Result<Vec<u8>> {
-    let bytes = fs::read(elf_path)
-        .with_context(|| format!("reading ELF {}", elf_path.display()))?;
+    let bytes =
+        fs::read(elf_path).with_context(|| format!("reading ELF {}", elf_path.display()))?;
     let (_hdr, sections, shstrtab) = parse_section_table(&bytes)
         .with_context(|| format!("parsing ELF section table from {}", elf_path.display()))?;
     for s in &sections {
@@ -82,19 +82,21 @@ pub fn merge_symbols(input: &Path, out_path: &Path) -> Result<()> {
         .iter()
         .find(|s| section_name(orig_shstrtab, s.sh_name) == ".gnu_debugdata")
         .ok_or_else(|| {
-            anyhow!(".gnu_debugdata section not found in {} — either the file \
+            anyhow!(
+                ".gnu_debugdata section not found in {} — either the file \
                      wasn't stripped or it's already unstripped (no merge needed)",
-                    input.display())
+                input.display()
+            )
         })?;
-    let dbg_bytes = &orig[dbg_section.sh_offset as usize
-        ..(dbg_section.sh_offset + dbg_section.sh_size) as usize];
+    let dbg_bytes = &orig
+        [dbg_section.sh_offset as usize..(dbg_section.sh_offset + dbg_section.sh_size) as usize];
 
     // 2. XZ → minidebug ELF.
     let mini = xz_decompress(dbg_bytes).context("decompressing .gnu_debugdata")?;
 
     // 3. Extract .symtab / .strtab raw bytes from the minidebug ELF.
-    let (_mini_hdr, mini_sections, mini_shstrtab) = parse_section_table(&mini)
-        .context("parsing minidebug ELF section table")?;
+    let (_mini_hdr, mini_sections, mini_shstrtab) =
+        parse_section_table(&mini).context("parsing minidebug ELF section table")?;
     let mini_symtab = mini_sections
         .iter()
         .find(|s| section_name(mini_shstrtab, s.sh_name) == ".symtab")
@@ -103,10 +105,10 @@ pub fn merge_symbols(input: &Path, out_path: &Path) -> Result<()> {
         .iter()
         .find(|s| section_name(mini_shstrtab, s.sh_name) == ".strtab")
         .ok_or_else(|| anyhow!(".strtab missing inside minidebug ELF"))?;
-    let symtab_bytes = &mini[mini_symtab.sh_offset as usize
-        ..(mini_symtab.sh_offset + mini_symtab.sh_size) as usize];
-    let strtab_bytes = &mini[mini_strtab.sh_offset as usize
-        ..(mini_strtab.sh_offset + mini_strtab.sh_size) as usize];
+    let symtab_bytes = &mini
+        [mini_symtab.sh_offset as usize..(mini_symtab.sh_offset + mini_symtab.sh_size) as usize];
+    let strtab_bytes = &mini
+        [mini_strtab.sh_offset as usize..(mini_strtab.sh_offset + mini_strtab.sh_size) as usize];
 
     // Heuristic for sh_info: number of leading STB_LOCAL symbols. The
     // minidebug-derived table has every symbol marked LOCAL (binding == 0),
@@ -261,7 +263,12 @@ fn parse_section_table(bytes: &[u8]) -> Result<(ElfHeader, Vec<SectionHeader>, &
     if e_shentsize != 64 {
         bail!("unexpected e_shentsize {e_shentsize} (expected 64 for ELF64)");
     }
-    let hdr = ElfHeader { e_shoff, e_shentsize, e_shnum, e_shstrndx };
+    let hdr = ElfHeader {
+        e_shoff,
+        e_shentsize,
+        e_shnum,
+        e_shstrndx,
+    };
 
     let mut sections = Vec::with_capacity(e_shnum as usize);
     for i in 0..e_shnum as u64 {
@@ -326,13 +333,25 @@ fn section_name(shstrtab: &[u8], name_off: u32) -> &str {
     std::str::from_utf8(&shstrtab[start..end]).unwrap_or("")
 }
 
-fn read_u16_le(buf: &[u8], off: usize) -> u16 { u16::from_le_bytes(buf[off..off + 2].try_into().unwrap()) }
-fn read_u32_le(buf: &[u8], off: usize) -> u32 { u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) }
-fn read_u64_le(buf: &[u8], off: usize) -> u64 { u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) }
+fn read_u16_le(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes(buf[off..off + 2].try_into().unwrap())
+}
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+fn read_u64_le(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
 
-fn write_u16_le(buf: &mut [u8], off: usize, v: u16) { buf[off..off + 2].copy_from_slice(&v.to_le_bytes()); }
-fn write_u64_le(buf: &mut [u8], off: usize, v: u64) { buf[off..off + 8].copy_from_slice(&v.to_le_bytes()); }
+fn write_u16_le(buf: &mut [u8], off: usize, v: u16) {
+    buf[off..off + 2].copy_from_slice(&v.to_le_bytes());
+}
+fn write_u64_le(buf: &mut [u8], off: usize, v: u64) {
+    buf[off..off + 8].copy_from_slice(&v.to_le_bytes());
+}
 
 fn pad_to_8(out: &mut Vec<u8>) {
-    while out.len() % 8 != 0 { out.push(0); }
+    while out.len() % 8 != 0 {
+        out.push(0);
+    }
 }

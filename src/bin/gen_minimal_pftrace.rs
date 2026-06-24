@@ -12,10 +12,9 @@ use prost::Message;
 mod proto;
 
 use proto::perfetto_protos::{
-    ThreadDescriptor, TrackDescriptor, TracePacket, TrackEvent,
-    track_event::{NameField, Type as TE},
     trace_packet::{Data, OptionalTrustedPacketSequenceId},
-    Trace,
+    track_event::{NameField, Type as TE},
+    ThreadDescriptor, Trace, TracePacket, TrackDescriptor, TrackEvent,
 };
 
 fn main() {
@@ -26,8 +25,9 @@ fn main() {
         // Thread descriptor for track 42 → "main" thread.
         {
             let mut p = TracePacket::default();
-            p.optional_trusted_packet_sequence_id =
-                Some(OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(seq));
+            p.optional_trusted_packet_sequence_id = Some(
+                OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(seq),
+            );
             let mut td = TrackDescriptor::default();
             td.uuid = Some(main_track);
             let mut thread = ThreadDescriptor::default();
@@ -59,8 +59,9 @@ fn main() {
 
 fn event(seq: u32, track: u64, ts: u64, name: &str, ty: TE) -> TracePacket {
     let mut p = TracePacket::default();
-    p.optional_trusted_packet_sequence_id =
-        Some(OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(seq));
+    p.optional_trusted_packet_sequence_id = Some(
+        OptionalTrustedPacketSequenceId::TrustedPacketSequenceId(seq),
+    );
     p.timestamp = Some(ts);
     let mut e = TrackEvent::default();
     e.track_uuid = Some(track);

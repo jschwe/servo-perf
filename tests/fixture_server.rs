@@ -38,7 +38,10 @@ impl Drop for ServerHandle {
 
 fn ensure_cert() {
     let sh = fixtures_dir().join("gen_cert.sh");
-    let status = Command::new("sh").arg(&sh).status().expect("run gen_cert.sh");
+    let status = Command::new("sh")
+        .arg(&sh)
+        .status()
+        .expect("run gen_cert.sh");
     assert!(status.success(), "gen_cert.sh failed");
 }
 

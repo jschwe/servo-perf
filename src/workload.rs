@@ -29,15 +29,9 @@ pub enum Fixture {
     /// Local static-file server over HTTP/1.1 + TLS. Used by `h1-multi`,
     /// `simple`, etc. Doc root is resolved under
     /// `<workloads_dir>/../fixtures/<doc_root>`.
-    Http1 {
-        port: u16,
-        doc_root: PathBuf,
-    },
+    Http1 { port: u16, doc_root: PathBuf },
     /// Same as `Http1` but negotiates HTTP/2 via ALPN.
-    Http2 {
-        port: u16,
-        doc_root: PathBuf,
-    },
+    Http2 { port: u16, doc_root: PathBuf },
     /// Replay a Web Page Replay archive through a local CONNECT shim so
     /// servoshell talks to a deterministic on-disk recording instead of
     /// the live origin. On first use (archive missing), a single
@@ -93,7 +87,9 @@ fn default_tracing_filter() -> String {
     // visible without flooding the trace with every per-frame TRACE span.
     "info,[{servo_profiling=true}]=trace".to_string()
 }
-fn default_iterations() -> u32 { 20 }
+fn default_iterations() -> u32 {
+    20
+}
 
 /// Load a workload from `<workloads_dir>/<name>.toml`.
 pub fn load(workloads_dir: &Path, name: &str) -> Result<Workload> {
@@ -105,7 +101,9 @@ pub fn load(workloads_dir: &Path, name: &str) -> Result<Workload> {
     if w.name != name {
         anyhow::bail!(
             "workload file {}: `name` field ({:?}) does not match filename stem ({:?})",
-            path.display(), w.name, name
+            path.display(),
+            w.name,
+            name
         );
     }
     Ok(w)
@@ -161,9 +159,15 @@ url = "https://example.test/"
     #[test]
     fn ports_to_forward_lists_relevant_host_ports() {
         // http1/http2 → fixture port (the URL hits it directly).
-        let f = Fixture::Http1 { port: 4443, doc_root: "www".into() };
+        let f = Fixture::Http1 {
+            port: 4443,
+            doc_root: "www".into(),
+        };
         assert_eq!(f.ports_to_forward(), vec![4443]);
-        let f = Fixture::Http2 { port: 4444, doc_root: "www".into() };
+        let f = Fixture::Http2 {
+            port: 4444,
+            doc_root: "www".into(),
+        };
         assert_eq!(f.ports_to_forward(), vec![4444]);
         // wpr-replay → tunnel only; servoshell never connects to wpr_port directly.
         let f = Fixture::WprReplay {
@@ -179,7 +183,9 @@ url = "https://example.test/"
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if stem.starts_with('_') {
                 continue; // registry file, not a workload
             }

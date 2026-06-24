@@ -31,41 +31,52 @@ pub fn run(args: PrepareArkwebSymbolsArgs) -> Result<()> {
         parent.join("libarkweb_engine.merged.so")
     });
 
-    eprintln!("prepare-arkweb-symbols: {} → {}", input.display(), output.display());
+    eprintln!(
+        "prepare-arkweb-symbols: {} → {}",
+        input.display(),
+        output.display()
+    );
     symbols::merge_symbols(&input, &output)
         .with_context(|| format!("merging symbols into {}", output.display()))?;
-    eprintln!("prepare-arkweb-symbols: wrote {} ({} bytes)",
+    eprintln!(
+        "prepare-arkweb-symbols: wrote {} ({} bytes)",
         output.display(),
         std::fs::metadata(&output)?.len(),
     );
 
     if args.push {
         push_to_device(&output, args.hdc_bin.as_str(), args.hdc_server.as_deref())?;
-        eprintln!("prepare-arkweb-symbols: pushed to {}", DevicePaths::SYMBOL_FILE);
+        eprintln!(
+            "prepare-arkweb-symbols: pushed to {}",
+            DevicePaths::SYMBOL_FILE
+        );
     } else {
         eprintln!(
             "prepare-arkweb-symbols: skipped device push (--push=false). \
              Push manually with: hdc file send {} {}",
-            output.display(), DevicePaths::SYMBOL_FILE,
+            output.display(),
+            DevicePaths::SYMBOL_FILE,
         );
     }
 
     Ok(())
 }
 
-fn push_to_device(host_path: &std::path::Path, hdc_bin: &str, hdc_server: Option<&str>) -> Result<()> {
-    fn run_hdc(
-        hdc_bin: &str,
-        hdc_server: Option<&str>,
-        args: &[&str],
-    ) -> Result<()> {
+fn push_to_device(
+    host_path: &std::path::Path,
+    hdc_bin: &str,
+    hdc_server: Option<&str>,
+) -> Result<()> {
+    fn run_hdc(hdc_bin: &str, hdc_server: Option<&str>, args: &[&str]) -> Result<()> {
         let mut cmd = Command::new(hdc_bin);
         if let Some(s) = hdc_server {
             cmd.args(["-s", s]);
         }
         cmd.args(args);
         cmd.stdin(Stdio::null());
-        let out = cmd.output().with_context(|| format!("running {hdc_bin} {args:?}"))?;
+        let out = cmd
+            .output()
+            .with_context(|| format!("running {hdc_bin} {args:?}"))?;
         anyhow::ensure!(
             out.status.success(),
             "hdc {:?} failed: {}",
@@ -74,9 +85,17 @@ fn push_to_device(host_path: &std::path::Path, hdc_bin: &str, hdc_server: Option
         );
         Ok(())
     }
-    run_hdc(hdc_bin, hdc_server, &["shell", "mkdir", "-p", DevicePaths::SYMBOL_DIR])?;
+    run_hdc(
+        hdc_bin,
+        hdc_server,
+        &["shell", "mkdir", "-p", DevicePaths::SYMBOL_DIR],
+    )?;
     let host_str = host_path.to_string_lossy().to_string();
-    run_hdc(hdc_bin, hdc_server, &["file", "send", &host_str, DevicePaths::SYMBOL_FILE])?;
+    run_hdc(
+        hdc_bin,
+        hdc_server,
+        &["file", "send", &host_str, DevicePaths::SYMBOL_FILE],
+    )?;
     Ok(())
 }
 

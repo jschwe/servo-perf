@@ -29,12 +29,7 @@ use crate::workload::{Fixture, Workload};
 /// lazy-loaded tail (images, async fetches, …). The caller then SIGINTs
 /// WPR to flush the archive.
 pub trait RecordDriver {
-    fn drive(
-        &self,
-        workload: &Workload,
-        handle: &FixtureHandle,
-        out_dir: &Path,
-    ) -> Result<()>;
+    fn drive(&self, workload: &Workload, handle: &FixtureHandle, out_dir: &Path) -> Result<()>;
 }
 
 /// Drives one record pass by spawning a local `servoshell` binary with
@@ -45,12 +40,7 @@ pub struct LocalServoshellDriver {
 }
 
 impl RecordDriver for LocalServoshellDriver {
-    fn drive(
-        &self,
-        workload: &Workload,
-        handle: &FixtureHandle,
-        _out_dir: &Path,
-    ) -> Result<()> {
+    fn drive(&self, workload: &Workload, handle: &FixtureHandle, _out_dir: &Path) -> Result<()> {
         run_servoshell_once(&self.bin, workload, handle)
     }
 }
@@ -203,9 +193,9 @@ fn spawn_wpr_replay(
     let wpr_bin = std::env::var_os("SERVOPERF_WPR_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            dirs_home().map(|h| h.join("bin").join("wpr")).unwrap_or_else(
-                || PathBuf::from("wpr"),
-            )
+            dirs_home()
+                .map(|h| h.join("bin").join("wpr"))
+                .unwrap_or_else(|| PathBuf::from("wpr"))
         });
     anyhow::ensure!(
         wpr_bin.is_file() || which_on_path(&wpr_bin).is_some(),
@@ -266,9 +256,7 @@ fn spawn_wpr_replay(
         // and small enough that any real-world workload trivially
         // exceeds it.
         const MIN_ARCHIVE_BYTES: u64 = 100 * 1024;
-        let archive_size = std::fs::metadata(&archive)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let archive_size = std::fs::metadata(&archive).map(|m| m.len()).unwrap_or(0);
         anyhow::ensure!(
             archive.is_file() && archive_size >= MIN_ARCHIVE_BYTES,
             "record pass produced an unexpectedly small archive at {} ({} bytes < {} expected). \
@@ -430,11 +418,10 @@ fn spawn_tunnel(tunnel_port: u16, wpr_port: u16, stderr: Stdio) -> Result<Child>
 /// rest of the bench. Writing to a regular file on disk is never
 /// flow-controlled the same way, so this deadlock can't recur.
 fn open_log(out_dir: &Path, name: &str) -> Result<Stdio> {
-    std::fs::create_dir_all(out_dir)
-        .with_context(|| format!("creating {}", out_dir.display()))?;
+    std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     let path = out_dir.join(name);
-    let file = std::fs::File::create(&path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let file =
+        std::fs::File::create(&path).with_context(|| format!("opening {}", path.display()))?;
     Ok(Stdio::from(file))
 }
 
@@ -522,11 +509,7 @@ fn preflight_port(port: u16) -> Result<()> {
     Ok(())
 }
 
-fn wait_for_accept(
-    handle: &mut FixtureHandle,
-    port: u16,
-    what: &str,
-) -> Result<()> {
+fn wait_for_accept(handle: &mut FixtureHandle, port: u16, what: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let addr = format!("127.0.0.1:{port}");
     loop {
@@ -550,10 +533,7 @@ fn sibling_binary(name: &str) -> Result<PathBuf> {
     let exe_dir = exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("servoperf binary has no parent directory"))?;
-    let candidates = [
-        exe_dir.join(name),
-        exe_dir.join("..").join(name),
-    ];
+    let candidates = [exe_dir.join(name), exe_dir.join("..").join(name)];
     candidates
         .iter()
         .find(|p| p.is_file())
@@ -611,12 +591,7 @@ mod tests {
     /// WPR-record path, which we want to know about.
     struct PanickingDriver;
     impl RecordDriver for PanickingDriver {
-        fn drive(
-            &self,
-            _: &Workload,
-            _: &FixtureHandle,
-            _: &Path,
-        ) -> Result<()> {
+        fn drive(&self, _: &Workload, _: &FixtureHandle, _: &Path) -> Result<()> {
             panic!("PanickingDriver should never be invoked in HTTP/1 or HTTP/2 fixture tests");
         }
     }

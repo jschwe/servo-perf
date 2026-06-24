@@ -35,7 +35,8 @@ pub fn run(args: AbArgs) -> Result<()> {
         Target::Ohos(ohos) => Some(ohos.guard_trace_level(&ohos.trace_level.clone())?),
         Target::Local { .. } => None,
     };
-    let driver = crate::cmd::bench::build_record_driver(&base_target, args.ohos.ohos_record_seconds);
+    let driver =
+        crate::cmd::bench::build_record_driver(&base_target, args.ohos.ohos_record_seconds);
     let (fx, _rport): (Option<FixtureHandle>, Option<crate::ohos::RPortGuard>) =
         match (w.fixture.as_ref(), &base_target) {
             (Some(fx_def), Target::Ohos(ohos)) => {
@@ -43,12 +44,20 @@ pub fn run(args: AbArgs) -> Result<()> {
                 let guard = ohos.setup_rport(&fx_def.ports_to_forward())?;
                 (Some(handle), Some(guard))
             }
-            (Some(_), Target::Local { .. }) => {
-                (Some(fixtures::spawn(&workloads_dir, &w, driver.as_ref(), &out_dir)?), None)
-            }
+            (Some(_), Target::Local { .. }) => (
+                Some(fixtures::spawn(
+                    &workloads_dir,
+                    &w,
+                    driver.as_ref(),
+                    &out_dir,
+                )?),
+                None,
+            ),
             (None, _) => (None, None),
         };
-    let proxy_uri = fx.as_ref().and_then(|h| h.proxy_uri().map(|s| s.to_string()));
+    let proxy_uri = fx
+        .as_ref()
+        .and_then(|h| h.proxy_uri().map(|s| s.to_string()));
 
     // Track successful iteration wallclock durations for adaptive timeout,
     // shared across both phases — both run the same workload.
@@ -57,7 +66,10 @@ pub fn run(args: AbArgs) -> Result<()> {
     // Phase 1: install base hap (OHOS only — local has nothing to install)
     // and run all base iterations.
     if let Target::Ohos(ohos) = &base_target {
-        eprintln!("ohos: installing {} on device (base phase)", args.base_bin.display());
+        eprintln!(
+            "ohos: installing {} on device (base phase)",
+            args.base_bin.display()
+        );
         ohos.install_hap(&args.base_bin)?;
         ohos.cooldown_after_install();
         ohos.warmup_launch()?;
@@ -76,7 +88,10 @@ pub fn run(args: AbArgs) -> Result<()> {
     // Phase 2: re-install with the patch hap (overwriting base), then run
     // all patch iterations.
     if let Target::Ohos(ohos) = &patch_target {
-        eprintln!("ohos: installing {} on device (patch phase)", args.patch_bin.display());
+        eprintln!(
+            "ohos: installing {} on device (patch phase)",
+            args.patch_bin.display()
+        );
         ohos.install_hap(&args.patch_bin)?;
         ohos.cooldown_after_install();
         ohos.warmup_launch()?;
@@ -95,11 +110,15 @@ pub fn run(args: AbArgs) -> Result<()> {
     // Abort if either phase had too many failed iterations — the report
     // would otherwise be a misleading near-empty summary.
     for (label, iters) in [("base", &base_iters), ("patch", &patch_iters)] {
-        let ok = iters.iter().filter(|i| matches!(i.status, IterationStatus::Ok { .. })).count();
+        let ok = iters
+            .iter()
+            .filter(|i| matches!(i.status, IterationStatus::Ok { .. }))
+            .count();
         anyhow::ensure!(
             2 * ok >= iters.len(),
             "{label}: more than 50% of iterations failed ({}/{}); aborting",
-            iters.len() - ok, iters.len()
+            iters.len() - ok,
+            iters.len()
         );
     }
 
@@ -141,9 +160,13 @@ pub fn run(args: AbArgs) -> Result<()> {
 
     let data = RunResults {
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        timestamp_utc: format!("@{}s",
+        timestamp_utc: format!(
+            "@{}s",
             std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)),
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ),
         workload: w,
         configs,
         deltas,
@@ -176,7 +199,14 @@ fn run_phase(
         let _ = std::fs::create_dir_all(&iter_out);
         let timeout = runner::pick_timeout(successful_wall);
         let outcome = run_and_record(
-            target, w, i, &iter_out, registry, primary_milestone, proxy_uri, timeout,
+            target,
+            w,
+            i,
+            &iter_out,
+            registry,
+            primary_milestone,
+            proxy_uri,
+            timeout,
         );
         if let Some(wall) = outcome.wall_duration {
             successful_wall.push(wall);
@@ -219,9 +249,8 @@ fn run_and_record(
 ) -> IterationOutcome {
     match runner::run_once(target, w, iter, out_dir, proxy_uri, timeout) {
         Ok(art) => {
-            let wall = std::time::Duration::from_nanos(
-                art.exit_wall_ns.saturating_sub(art.spawn_wall_ns),
-            );
+            let wall =
+                std::time::Duration::from_nanos(art.exit_wall_ns.saturating_sub(art.spawn_wall_ns));
             let iteration = match parse_trace(target, &art.pftrace) {
                 Ok(slices) => {
                     let cp = trace::analyse(&slices, registry, art.spawn_wall_ns);
@@ -233,7 +262,11 @@ fn run_and_record(
                     if let Some(m) = cp.milestones.iter().find(|m| m.name == primary_milestone) {
                         metrics.insert("FirstContentfulPaint".to_string(), m.ts_ms);
                     }
-                    if let Some(m) = cp.milestones.iter().find(|m| m.name == "LargestContentfulPaint") {
+                    if let Some(m) = cp
+                        .milestones
+                        .iter()
+                        .find(|m| m.name == "LargestContentfulPaint")
+                    {
                         metrics.insert("LargestContentfulPaint".to_string(), m.ts_ms);
                     }
                     for row in &cp.named_spans {
@@ -249,27 +282,35 @@ fn run_and_record(
                     if let (Some(b), Some(a)) =
                         (art.thermal_before_milli_c, art.thermal_after_milli_c)
                     {
-                        metrics.insert(
-                            "soc_thermal_milli_c.delta".to_string(),
-                            (a - b) as f64,
-                        );
+                        metrics.insert("soc_thermal_milli_c.delta".to_string(), (a - b) as f64);
                     }
                     Iteration {
                         index: iter,
-                        status: IterationStatus::Ok { pftrace, metrics, critical_path: cp },
+                        status: IterationStatus::Ok {
+                            pftrace,
+                            metrics,
+                            critical_path: cp,
+                        },
                     }
                 }
                 Err(err) => Iteration {
                     index: iter,
-                    status: IterationStatus::Failed { error: format!("parse: {err:#}") },
+                    status: IterationStatus::Failed {
+                        error: format!("parse: {err:#}"),
+                    },
                 },
             };
-            IterationOutcome { iteration, wall_duration: Some(wall) }
+            IterationOutcome {
+                iteration,
+                wall_duration: Some(wall),
+            }
         }
         Err(err) => IterationOutcome {
             iteration: Iteration {
                 index: iter,
-                status: IterationStatus::Failed { error: format!("run: {err:#}") },
+                status: IterationStatus::Failed {
+                    error: format!("run: {err:#}"),
+                },
             },
             wall_duration: None,
         },
@@ -295,8 +336,12 @@ fn workloads_dir() -> PathBuf {
 fn build_ab_targets(args: &AbArgs) -> Result<(Target, Target)> {
     if !args.ohos.ohos {
         return Ok((
-            Target::Local { bin: args.base_bin.clone() },
-            Target::Local { bin: args.patch_bin.clone() },
+            Target::Local {
+                bin: args.base_bin.clone(),
+            },
+            Target::Local {
+                bin: args.patch_bin.clone(),
+            },
         ));
     }
     let base = OhosTarget::from_args(&args.ohos);
@@ -316,8 +361,12 @@ fn bin_label(target: &Target, hap_or_bin: &Path) -> PathBuf {
 }
 
 fn resolve_out(explicit: Option<&Path>, workload_name: &str) -> PathBuf {
-    if let Some(p) = explicit { return p.to_path_buf(); }
+    if let Some(p) = explicit {
+        return p.to_path_buf();
+    }
     let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     PathBuf::from("out").join(format!("{}-{}", workload_name, ts))
 }

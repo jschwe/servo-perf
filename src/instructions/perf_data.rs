@@ -63,11 +63,8 @@ pub fn aggregate_inclusive_from_perf_data(
     engine: &EngineConfig,
     workloads_dir: &Path,
 ) -> Result<HashMap<String, u64>> {
-    let mut totals: HashMap<String, u64> = engine
-        .functions
-        .iter()
-        .map(|t| (t.clone(), 0u64))
-        .collect();
+    let mut totals: HashMap<String, u64> =
+        engine.functions.iter().map(|t| (t.clone(), 0u64)).collect();
 
     if engine.symbol_file.is_empty() {
         // Caller's already warned about this; produce empty results so the
@@ -135,7 +132,9 @@ pub fn aggregate_inclusive_from_perf_data(
                     EventRecord::Sample(s) => {
                         let Some(pid) = s.pid else { continue };
                         let Some(period) = s.period else { continue };
-                        let Some(mappings) = mmaps_by_pid.get(&pid) else { continue };
+                        let Some(mappings) = mmaps_by_pid.get(&pid) else {
+                            continue;
+                        };
 
                         // The sample's IP is the leaf frame; the callchain is
                         // a list of caller IPs above it. We process the IP +
@@ -144,32 +143,37 @@ pub fn aggregate_inclusive_from_perf_data(
                         let mut matched_for_this_sample: Vec<bool> =
                             vec![false; engine.functions.len()];
 
-                        let mut process_ip = |ip: u64,
-                                              symbols: &SymbolIndex,
-                                              mappings: &[Mapping],
-                                              matched: &mut [bool]| {
-                            let Some(mapping) = find_mapping(mappings, ip) else { return };
-                            if mapping.basename != symbol_basename {
-                                return;
-                            }
-                            let file_offset = ip - mapping.start + mapping.page_offset;
-                            let Some(name) = symbols.lookup(file_offset) else { return };
-                            for (i, t) in engine.functions.iter().enumerate() {
-                                if matched[i] {
-                                    // Already credited this sample for this target —
-                                    // matches the dedup semantics noted in module
-                                    // docs (avoid runaway counts on recursion).
-                                    continue;
+                        let mut process_ip =
+                            |ip: u64,
+                             symbols: &SymbolIndex,
+                             mappings: &[Mapping],
+                             matched: &mut [bool]| {
+                                let Some(mapping) = find_mapping(mappings, ip) else {
+                                    return;
+                                };
+                                if mapping.basename != symbol_basename {
+                                    return;
                                 }
-                                if name.contains(t.as_str()) {
-                                    if let Some(slot) = totals.get_mut(t) {
-                                        *slot += period;
+                                let file_offset = ip - mapping.start + mapping.page_offset;
+                                let Some(name) = symbols.lookup(file_offset) else {
+                                    return;
+                                };
+                                for (i, t) in engine.functions.iter().enumerate() {
+                                    if matched[i] {
+                                        // Already credited this sample for this target —
+                                        // matches the dedup semantics noted in module
+                                        // docs (avoid runaway counts on recursion).
+                                        continue;
                                     }
-                                    matched[i] = true;
-                                    break;
+                                    if name.contains(t.as_str()) {
+                                        if let Some(slot) = totals.get_mut(t) {
+                                            *slot += period;
+                                        }
+                                        matched[i] = true;
+                                        break;
+                                    }
                                 }
-                            }
-                        };
+                            };
 
                         if let Some(ip) = s.ip {
                             process_ip(ip, &symbols, mappings, &mut matched_for_this_sample);
@@ -269,8 +273,8 @@ impl SymbolIndex {
     /// file-offset space, so lookups at runtime are a single binary
     /// search.
     fn load(elf_path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(elf_path)
-            .with_context(|| format!("reading {}", elf_path.display()))?;
+        let bytes =
+            std::fs::read(elf_path).with_context(|| format!("reading {}", elf_path.display()))?;
         let elf = object::File::parse(bytes.as_slice())
             .with_context(|| format!("parsing ELF {}", elf_path.display()))?;
 
@@ -279,7 +283,9 @@ impl SymbolIndex {
         // (.bss etc) have no file backing so we skip them.
         let mut section_map: Vec<(u64, u64, i64)> = Vec::new(); // (vaddr_start, vaddr_end, file_off - vaddr)
         for section in elf.sections() {
-            let Some((file_off, file_size)) = section.file_range() else { continue };
+            let Some((file_off, file_size)) = section.file_range() else {
+                continue;
+            };
             if file_size == 0 {
                 continue;
             }
@@ -379,9 +385,18 @@ mod tests {
 
     #[test]
     fn sym_basename_strips_merged_suffix() {
-        assert_eq!(sym_basename_from_path("libarkweb_engine.merged.so"), "libarkweb_engine.so");
-        assert_eq!(sym_basename_from_path("libservoshell.symbols.so"), "libservoshell.so");
-        assert_eq!(sym_basename_from_path("libcompletely.unique.so"), "libcompletely.unique.so");
+        assert_eq!(
+            sym_basename_from_path("libarkweb_engine.merged.so"),
+            "libarkweb_engine.so"
+        );
+        assert_eq!(
+            sym_basename_from_path("libservoshell.symbols.so"),
+            "libservoshell.so"
+        );
+        assert_eq!(
+            sym_basename_from_path("libcompletely.unique.so"),
+            "libcompletely.unique.so"
+        );
     }
 
     #[test]
@@ -409,9 +424,21 @@ mod tests {
     fn symbol_index_binary_search_in_range() {
         let idx = SymbolIndex {
             entries: vec![
-                SymbolEntry { start: 0x1000, end: 0x1100, name: "low".into() },
-                SymbolEntry { start: 0x1200, end: 0x1300, name: "mid".into() },
-                SymbolEntry { start: 0x1400, end: 0x1500, name: "high".into() },
+                SymbolEntry {
+                    start: 0x1000,
+                    end: 0x1100,
+                    name: "low".into(),
+                },
+                SymbolEntry {
+                    start: 0x1200,
+                    end: 0x1300,
+                    name: "mid".into(),
+                },
+                SymbolEntry {
+                    start: 0x1400,
+                    end: 0x1500,
+                    name: "high".into(),
+                },
             ],
         };
         // In range.

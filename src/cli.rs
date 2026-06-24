@@ -3,7 +3,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "servoperf", version, about = "Measure Servo startup performance")]
+#[command(
+    name = "servoperf",
+    version,
+    about = "Measure Servo startup performance"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
