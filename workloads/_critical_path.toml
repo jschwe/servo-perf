@@ -13,6 +13,111 @@ owner_thread = "main"
 name = "HeadlessWindow::new"
 owner_thread = "main"
 
+# Sub-spans inside SoftwareRenderingContext::new (called from HeadlessWindow::new),
+# used to localise where the ~133 ms goes during headless startup.
+[[phase]]
+name = "surfman::Connection::new"
+owner_thread = "main"
+
+[[phase]]
+name = "surfman::create_software_adapter"
+owner_thread = "main"
+
+[[phase]]
+name = "SurfmanRenderingContext::new"
+owner_thread = "main"
+
+[[phase]]
+name = "surfman::create_device"
+owner_thread = "main"
+
+[[phase]]
+name = "surfman::create_context_descriptor"
+owner_thread = "main"
+
+[[phase]]
+name = "surfman::create_context"
+owner_thread = "main"
+
+[[phase]]
+name = "gleam::load_with"
+owner_thread = "main"
+
+[[phase]]
+name = "glow::from_loader_function"
+owner_thread = "main"
+
+[[phase]]
+name = "surfman::create_surface"
+owner_thread = "main"
+
+[[phase]]
+name = "surfman::bind_surface"
+owner_thread = "main"
+
+[[phase]]
+name = "surfman::make_current"
+owner_thread = "main"
+
+[[phase]]
+name = "surfman::create_attached_swap_chain"
+owner_thread = "main"
+
+# Inner spans inside surfman 0.12.0 (local-patched), to attribute the
+# 133 ms cost of HeadlessWindow::new further. The Connection::new chain
+# tries Wayland/X11 first, then falls back to the surfaceless-Mesa path.
+[[phase]]
+name = "wayland::Connection::new"
+owner_thread = "main"
+
+[[phase]]
+name = "x11::Connection::new"
+owner_thread = "main"
+
+[[phase]]
+name = "generic::Connection::new"
+owner_thread = "main"
+
+[[phase]]
+name = "eglGetPlatformDisplay"
+owner_thread = "main"
+
+[[phase]]
+name = "eglInitialize"
+owner_thread = "main"
+
+[[phase]]
+name = "generic::create_context"
+owner_thread = "main"
+
+[[phase]]
+name = "EGLBackedContext::new"
+owner_thread = "main"
+
+[[phase]]
+name = "EGLBackedContext::make_current"
+owner_thread = "main"
+
+[[phase]]
+name = "Gl::from_loader_function"
+owner_thread = "main"
+
+[[phase]]
+name = "generic::create_surface"
+owner_thread = "main"
+
+[[phase]]
+name = "generic::create_generic_surface"
+owner_thread = "main"
+
+[[phase]]
+name = "temporarily_make_context_current"
+owner_thread = "main"
+
+[[phase]]
+name = "EGLBackedSurface::new_generic"
+owner_thread = "main"
+
 [[phase]]
 name = "Servo::new"
 owner_thread = "main"

@@ -28,6 +28,10 @@ pub enum Command {
     /// `--symbol-dir` ignores `.gnu_debugdata`).
     #[command(name = "prepare-arkweb-symbols")]
     PrepareArkwebSymbols(PrepareArkwebSymbolsArgs),
+    /// Dump every span above a duration threshold from a pftrace,
+    /// grouped by thread. Useful when the registry-based critical-path
+    /// report doesn't surface enough detail.
+    Dump(DumpArgs),
 }
 
 /// Flags that select / configure a HarmonyOS device target reached over
@@ -195,6 +199,19 @@ pub struct AbArgs {
     pub out: Option<PathBuf>,
     #[command(flatten)]
     pub ohos: OhosArgs,
+}
+
+#[derive(clap::Args, Clone)]
+pub struct DumpArgs {
+    /// Path to a .pftrace file.
+    pub pftrace: PathBuf,
+    /// Minimum slice duration to print (ms).
+    #[arg(long, default_value_t = 1.0)]
+    pub min_dur_ms: f64,
+    /// Only print slices starting before this timestamp (ms from t=0).
+    /// Default 700 ms — covers up to FCP on mossel WPR replay.
+    #[arg(long, default_value_t = 700.0)]
+    pub until_ms: f64,
 }
 
 #[derive(clap::Args, Clone)]

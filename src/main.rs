@@ -21,6 +21,7 @@ fn main() -> Result<()> {
     match args.command {
         cli::Command::Bench(a) => cmd::bench::run(a),
         cli::Command::Ab(a) => cmd::ab::run(a),
+        cli::Command::Dump(a) => cmd::dump::run(a),
         cli::Command::Regression(a) => cmd::regression::run(a),
         cli::Command::PrepareArkwebSymbols(a) => cmd::prepare_symbols::run(a),
     }

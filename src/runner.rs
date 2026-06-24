@@ -254,8 +254,20 @@ fn collect_stderr_tail(child: &mut std::process::Child) -> String {
 /// 20 s floor keeps the first few iterations (no history) reasonable;
 /// the 10× factor tolerates transient slowness without letting a truly
 /// hung run stall forever.
+///
+/// `SERVOPERF_TIMEOUT_S` env var, if set to a positive integer, pins the
+/// timeout to that many seconds regardless of history. Useful when
+/// wrapping servoshell in a heavy profiler (e.g. callgrind) where
+/// iterations legitimately take minutes.
 pub fn pick_timeout(successful_durations: &[Duration]) -> Duration {
     const MIN: Duration = Duration::from_secs(20);
+    if let Ok(v) = std::env::var("SERVOPERF_TIMEOUT_S") {
+        if let Ok(n) = v.parse::<u64>() {
+            if n > 0 {
+                return Duration::from_secs(n);
+            }
+        }
+    }
     if successful_durations.is_empty() {
         return MIN;
     }
