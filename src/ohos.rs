@@ -399,9 +399,16 @@ impl OhosTarget {
         self.hdc(&["file", "recv", &self.trace_path_on_device, &dest_str])
             .with_context(|| format!("recv {} → {}", self.trace_path_on_device, dest.display()))?;
 
-        // Generate + pull the stack-mode report when hiperf ran.
-        let stack_report = if self.hiperf_period.is_some() {
-            Some(self.process_hiperf_capture(iter, out_dir)?)
+        // Pull perf.data so it can be processed off-device on the host,
+        // potentially in parallel with the next iteration. The on-device
+        // `hiperf report -s` step is retired in favour of the in-process
+        // Rust parser in [`crate::instructions::perf_data`].
+        let perf_data = if self.hiperf_period.is_some() {
+            let dest = out_dir.join(format!("iter_{iter}.perf.data"));
+            let dest_str = dest.to_string_lossy().to_string();
+            self.hdc(&["file", "recv", DevicePaths::PERF_DATA, &dest_str])
+                .with_context(|| format!("recv {} → {}", DevicePaths::PERF_DATA, dest.display()))?;
+            Some(dest)
         } else {
             None
         };
@@ -411,7 +418,7 @@ impl OhosTarget {
 
         Ok(RunArtifact {
             trace: dest,
-            stack_report,
+            perf_data,
             spawn_wall_ns,
             exit_wall_ns,
             thermal_before_milli_c,
@@ -441,30 +448,6 @@ impl OhosTarget {
         Ok(())
     }
 
-    /// On-device: convert `perf.data` to stack-mode text via
-    /// `hiperf report -s --symbol-dir …`. Pull the text back as
-    /// `out_dir/iter_<iter>.stack.txt` and return its in-memory contents
-    /// for immediate aggregation.
-    fn process_hiperf_capture(&self, iter: u32, out_dir: &Path) -> Result<String> {
-        self.hdc(&[
-            "shell",
-            "hiperf", "report",
-            "-i", DevicePaths::PERF_DATA,
-            "--symbol-dir", DevicePaths::SYMBOL_DIR,
-            "-s",
-            "-o", DevicePaths::PERF_REPORT_TXT,
-            "--limit-percent", "0.01",
-        ])
-        .context("hiperf report -s")?;
-        let dest = out_dir.join(format!("iter_{iter}.stack.txt"));
-        let dest_str = dest.to_string_lossy().to_string();
-        self.hdc(&["file", "recv", DevicePaths::PERF_REPORT_TXT, &dest_str])
-            .with_context(|| format!("recv {} → {}", DevicePaths::PERF_REPORT_TXT, dest.display()))?;
-        let text = std::fs::read_to_string(&dest)
-            .with_context(|| format!("reading {}", dest.display()))?;
-        Ok(text)
-    }
-
     /// Push a freshly-merged `libarkweb_engine.so` to
     /// `/data/local/tmp/symbols/`. Idempotent — safe to call before each
     /// run as long as the host file is fresh.
@@ -481,10 +464,10 @@ impl OhosTarget {
 /// `runner::RunArtifact` but the trace file is hitrace text, not pftrace.
 pub struct RunArtifact {
     pub trace: PathBuf,
-    /// `Some(text)` when `--with-instructions` was enabled: the contents
-    /// of `iter_<iter>.stack.txt`, ready to feed into
-    /// [`crate::instructions::aggregate_inclusive`].
-    pub stack_report: Option<String>,
+    /// `Some(path)` when `--with-instructions` was enabled: the
+    /// pulled-from-device perf.data for this iteration, parsed by
+    /// [`crate::instructions::aggregate_inclusive_from_perf_data`].
+    pub perf_data: Option<PathBuf>,
     pub spawn_wall_ns: u64,
     pub exit_wall_ns: u64,
     /// SoC thermal zone reading (milli-Celsius) sampled right before

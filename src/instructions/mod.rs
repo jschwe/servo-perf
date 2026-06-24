@@ -17,9 +17,11 @@
 //! `servoperf prepare-arkweb-symbols` before benching.
 
 mod parse;
+mod perf_data;
 pub mod symbols;
 
 pub use parse::aggregate_inclusive;
+pub use perf_data::aggregate_inclusive_from_perf_data;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

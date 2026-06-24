@@ -2,6 +2,7 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use crate::cli::{BenchArgs, OhosArgs};
@@ -88,6 +89,13 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let mut fcp_samples: Vec<f64> = Vec::new();
     let mut lcp_samples: Vec<f64> = Vec::new();
     let mut successful_wall: Vec<std::time::Duration> = Vec::new();
+    // Per-iteration handles for the background instruction-count
+    // aggregation. Each handle runs while the next iteration is
+    // recording on the device, so wallclock for the whole bench is
+    // bounded by max(recording_time, analyser_time) per iteration instead
+    // of their sum. Joined in a single pass after the iteration loop.
+    let mut instr_jobs: Vec<(u32, JoinHandle<Result<std::collections::HashMap<String, u64>>>)> =
+        Vec::new();
     for i in 0..w.iterations {
         let timeout = runner::pick_timeout(&successful_wall);
         match runner::run_once(&target, &w, i, &out_dir, proxy_uri.as_deref(), timeout) {
@@ -144,16 +152,22 @@ pub fn run(args: BenchArgs) -> Result<()> {
                         (a - b) as f64,
                     );
                 }
-                // Per-function inclusive instruction counts. When
-                // `--with-instructions` is off, `stack_report` is None and
-                // we leave the slot absent from the metrics map.
-                if let (Some(engine), Some(stack_text)) = (engine.as_ref(), art.stack_report.as_deref()) {
-                    let totals = instructions::aggregate_inclusive(stack_text, &engine.functions);
-                    for func in &engine.functions {
-                        if let Some(&events) = totals.get(func) {
-                            metrics.insert(format!("instructions.{func}"), events as f64);
-                        }
-                    }
+                // Per-function inclusive instruction counts run on a
+                // background thread so the next iteration's recording
+                // starts immediately. Results are joined at the end of
+                // the iteration loop and merged into this iteration's
+                // metrics map.
+                if let (Some(engine), Some(perf_data)) = (engine.as_ref(), art.perf_data.clone()) {
+                    let engine = engine.clone();
+                    let workloads_dir_owned = workloads_dir.clone();
+                    let handle = std::thread::spawn(move || {
+                        instructions::aggregate_inclusive_from_perf_data(
+                            &perf_data,
+                            &engine,
+                            &workloads_dir_owned,
+                        )
+                    });
+                    instr_jobs.push((i, handle));
                 }
                 iterations.push(Iteration {
                     index: i,
@@ -180,6 +194,35 @@ pub fn run(args: BenchArgs) -> Result<()> {
         "more than 50% of iterations failed ({}/{}); aborting",
         iterations.len() - ok, iterations.len()
     );
+
+    // Drain background instruction-count jobs and merge each result into
+    // the corresponding iteration's metrics map. A job's failure is
+    // logged but doesn't fail the run — the timing metrics already
+    // succeeded, and the user can re-run with `--with-instructions` if
+    // they need the counts.
+    for (idx, handle) in instr_jobs {
+        let result = match handle.join() {
+            Ok(r) => r,
+            Err(_) => {
+                eprintln!("iter {idx}: instruction aggregator panicked");
+                continue;
+            }
+        };
+        let totals = match result {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("iter {idx}: instruction aggregator failed: {e:#}");
+                continue;
+            }
+        };
+        if let Some(it) = iterations.iter_mut().find(|it| it.index == idx) {
+            if let IterationStatus::Ok { metrics, .. } = &mut it.status {
+                for (func, events) in totals {
+                    metrics.insert(format!("instructions.{func}"), events as f64);
+                }
+            }
+        }
+    }
 
     let mut summary: BTreeMap<String, stats::Summary> = BTreeMap::new();
     if let Some(s) = stats::summarise(&fcp_samples) {

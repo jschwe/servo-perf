@@ -28,6 +28,14 @@ toml = "0.8"
 # Pure-Rust XZ decoder for the `.gnu_debugdata` MiniDebugInfo section
 # embedded in stripped ArkWeb .so files.
 lzma-rs = "0.3"
+# Host-side perf.data parsing — replaces the on-device `hiperf report -s`
+# step so analysis can run in parallel with the next iteration's capture.
+linux-perf-data = "0.11"
+# ELF parsing for offset→symbol lookup in the unstripped .so we pair with
+# each engine's perf.data.
+object = { version = "0.36", features = ["read"] }
+rustc-demangle = "0.1"
+cpp_demangle = "0.4"
 
 [build-dependencies]
 prost-build = "0.13"

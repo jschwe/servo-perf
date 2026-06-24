@@ -31,21 +31,36 @@ bundles = [
   "org.servo.servo.base",
   "org.servo.servo.patch",
 ]
-# Symbols are present in the installed .so (release-with-symbols build),
-# nothing to merge.
-symbol_file = ""
+# Stage the unstripped libservoshell.so whose BuildID matches the
+# installed bundle (e.g. copied from
+# `target/aarch64-unknown-linux-ohos/release/libservoshell.so` in the
+# servo worktree that produced the .hap). Host-side perf.data parsing
+# needs it to resolve sample IPs to function names.
+symbol_file = "libservoshell.symbols.so"
 # Inclusive instruction counts for these symbols are exported as
 # per-iteration metrics named `instructions.<func>`.
 functions = [
-  # Trait-impl methods stay v0-mangled in hiperf's text output, so the
-  # match has to use the `$LT$ … $GT$` form. `Layout$GT$::reflow` picks
-  # up `<LayoutThread as Layout>::reflow` without colliding with
-  # `LayoutThread::handle_reflow`.
-  "Layout$GT$::reflow",
-  # `<T>::method` notation lands in the report demangled but with the
-  # closing angle bracket retained.
+  # Host-side path uses rustc_demangle, which gives readable trait-impl
+  # output: `<layout::…::LayoutThread as layout_api::Layout>::reflow`.
+  # The `Layout>::reflow` substring matches that and isn't found in any
+  # other reflow-related symbol (handle_reflow has no `>` in its name).
+  "Layout>::reflow",
   "Window>::reflow",
   "LayoutThread::handle_reflow",
+  # Vsync paths. `on_vsync_cb` fires per OHOS vsync callback (every frame
+  # under the legacy per-frame-resubscribe path; only when an observer
+  # asks under the on-demand path). `Paint::perform_updates` covers the
+  # main-thread paint/update turn that vsync triggers.
+  "on_vsync_cb",
+  "Paint::perform_updates",
+  # --- d41bb930 investigation: localize the +15% reflow regression ---
+  # Reflow sub-phases (all run under handle_reflow):
+  "build_display_list",
+  "build_stacking_context_tree",
+  "handle_animated_image",
+  # The rendering-opportunity parent (sibling: update_active_frames):
+  "update_the_rendering",
+  "update_active_frames",
 ]
 # Servoperf injects these flags (one per line) when the workload uses a
 # fixture-side proxy (e.g. wpr-replay). `$PROXY` is replaced with the
