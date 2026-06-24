@@ -240,9 +240,9 @@ fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
 /// Render per-function inclusive instruction summaries when the run was
 /// invoked with `--with-instructions`. Quietly skipped otherwise.
 ///
-/// Counts come from hiperf's stack-mode report, aggregated by
-/// [`crate::instructions::aggregate_inclusive`] and stored on each
-/// iteration under the key `instructions.<func>`. The summary row is
+/// Counts come from the iteration's perf.data, aggregated by
+/// [`crate::instructions::aggregate_inclusive_from_perf_data`] and stored
+/// on each iteration under the key `instructions.<func>`. The summary row is
 /// computed in `cmd::bench` and lives at the same key in `cfg.summary`.
 fn render_instructions_section(s: &mut String, cfg: &ConfigResults) {
     let entries: Vec<(&String, &Summary)> = cfg

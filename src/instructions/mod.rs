@@ -4,7 +4,7 @@
 //! iteration runs `hiperf record` in parallel with the existing hitrace
 //! capture (same time window, same device), then post-processes the perf.data
 //! into per-function inclusive instruction counts using
-//! [`crate::instructions::parse`].
+//! [`crate::instructions::perf_data`].
 //!
 //! Engine selection (which set of function-name substrings to aggregate) is
 //! driven by `workloads/_instructions.toml`. The bundle name configured via
@@ -16,11 +16,9 @@
 //! ELF suitable for `hiperf report --symbol-dir`. Run once via
 //! `servoperf prepare-arkweb-symbols` before benching.
 
-mod parse;
 mod perf_data;
 pub mod symbols;
 
-pub use parse::aggregate_inclusive;
 pub use perf_data::aggregate_inclusive_from_perf_data;
 
 use anyhow::{Context, Result};
