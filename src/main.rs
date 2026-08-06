@@ -4,6 +4,7 @@
 mod cli;
 mod cmd;
 mod fixtures;
+mod fps;
 mod instructions;
 mod ohos;
 #[cfg(feature = "pftrace")]
@@ -11,6 +12,7 @@ mod proto;
 mod report;
 mod runner;
 mod stats;
+mod threads;
 mod trace;
 mod workload;
 

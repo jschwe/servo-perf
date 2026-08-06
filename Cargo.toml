@@ -56,6 +56,9 @@ linux-perf-data = "0.11"
 # each engine's perf.data.
 object = { version = "0.36", features = ["read"] }
 rustc-demangle = "0.1"
+# Scenario workloads extract page-reported values (e.g. an animation's
+# completion time) from device log text with a per-metric pattern.
+regex = "1"
 cpp_demangle = "0.4"
 
 [build-dependencies]

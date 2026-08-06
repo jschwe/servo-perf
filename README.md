@@ -125,6 +125,91 @@ archive, then re-run with `--ohos`.
 
 TOML files in [`workloads/`](workloads/). Each names a URL and optional local fixture. To add one: copy an existing TOML, adjust, rerun.
 
+### Scenario workloads
+
+Most workloads are measured by a page-load milestone (FCP/LCP from the trace).
+A workload that instead needs to be measured *while it renders* — an
+animation, a game, anything with a steady-state frame rate — adds a
+`[scenario]` block. The iteration lifecycle is unchanged; what changes is that
+the device's presented-frame ring is sampled throughout the window and the app
+log is captured at the end. See [`workloads/candle.toml`](workloads/candle.toml).
+
+```toml
+[scenario]
+surface = "ServoDemoSurface"   # `hidumper -s RenderService -a "fps <name>"`
+capture_seconds = 30           # overrides --ohos-capture-seconds
+sample_interval_seconds = 3    # ring holds ~384 frames; samples must overlap
+```
+
+This always reports `presented.fps`, `presented.frames`, `presented.span_s`
+and `frame_time_ms.p50/p95/p99` — raw numbers that assume nothing about which
+frames "count".
+
+**Post-processing is opt-in per workload**, because no single interpretation
+suits every scenario:
+
+```toml
+[[scenario.post_processing]]
+kind = "exclude-idle-gaps"
+gap_ms = 80.0
+```
+
+`exclude-idle-gaps` drops inter-frame intervals of at least `gap_ms` from both
+the frame count and the elapsed time, adding `presented.fps_active` next to
+the unfiltered `presented.fps`. That is right for an animation that idles
+between bursts, and **wrong** for a continuously-rendering workload such as a
+WebGPU game, where a 100 ms frame is a dropped frame and excluding it would
+flatter the result. Omit the block there and read `presented.fps` with the
+frame-time percentiles.
+
+Picking `gap_ms` is a judgement call, so the tool checks it: `frames_near_gap`
+counts frames within a factor of two below the threshold, and the report warns
+when they exceed 10% of the run — the sign that genuine slow frames are being
+censored as idle.
+
+Two further options answer "why is this workload not faster":
+
+```toml
+refresh_hz = 60      # bin frame intervals against the panel's refresh
+thread_cpu = true    # sample /proc thread CPU across the window
+```
+
+`refresh_hz` adds `frame_time_ms.vsync{1,2,3,4plus}_pct`: how many refresh
+intervals each frame occupied. A workload sitting at 99% "next vsync" is
+*capped* by the display, not by its own work, and its frame time says nothing
+about how much headroom it has — that only shows up by making the workload
+heavier. The reported `frame_time_ms.p10/p25/p50/p75` exist for the same
+reason: a page alternating 16.7/33.3 ms and one uniformly at 25 ms have similar
+medians and need opposite fixes.
+
+`thread_cpu` adds a CPU-milliseconds-per-presented-frame table per thread,
+**with the thread count**, which is the part that makes it interpretable: 26 ms
+across four canvas workers is 6.6 ms of wall clock and fits inside a 16.7 ms
+frame, whereas 21 ms on a single thread cannot. Divide by `threads` to get the
+floor that group puts under the frame time, and read `busy` (share of one core)
+to tell a saturated thread from a blocked one.
+
+Note it divides by *presented* frames while the CPU counters cover the whole
+window, so on a workload that alternates bursts with idle — `candle` spends a
+third of its window idle — the per-frame figures blend both phases. For
+per-frame costs that mean what they say, use a workload that renders
+continuously (`fullviewport`).
+
+Pages that report their own numbers (via `console.log`, which reaches hilog on
+OHOS) can export them as metrics:
+
+```toml
+[[scenario.log_metric]]
+name = "chart_rebuild_ms"
+pattern = 'init_to_finished_ms=([0-9.]+)'
+aggregate = "median"   # or mean / min / max / first / last / count
+```
+
+The first capture group is parsed as a number, once per match, and reduced by
+`aggregate` to the single value stored for that iteration. Work-normalized
+metrics like this are worth having: they stay comparable when frame rate moves
+for reasons unrelated to the change under test.
+
 ## Tests
 
 ```bash

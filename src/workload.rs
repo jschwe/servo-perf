@@ -18,6 +18,138 @@ pub struct Workload {
     #[serde(default)]
     pub servoshell_args: Vec<String>,
     pub fixture: Option<Fixture>,
+    /// Present for workloads measured over a render window rather than by a
+    /// page-load milestone. See [`Scenario`].
+    pub scenario: Option<Scenario>,
+}
+
+/// A workload that is measured while it renders, not while it loads.
+///
+/// The iteration lifecycle is unchanged — launch, hold the window open, stop —
+/// but the device's presented-frame ring is sampled throughout and the app's
+/// log is captured at the end, so the metrics describe steady-state rendering
+/// instead of startup milestones.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Scenario {
+    /// RenderService surface to sample. servoshell's is `ServoDemoSurface`;
+    /// `hidumper -s RenderService -a "fps <name>"` lists what a device has.
+    pub surface: String,
+    /// Length of the render window. Overrides `--ohos-capture-seconds`,
+    /// which is sized for page loads and is usually far too short here.
+    pub capture_seconds: Option<u64>,
+    /// How often to sample the frame ring. The ring holds ~384 presents, so
+    /// this must be short enough that consecutive samples overlap: at 60 fps
+    /// that is under 6 s. `presented.lost_sample_windows` reports when it
+    /// wasn't.
+    #[serde(default = "default_sample_interval_seconds")]
+    pub sample_interval_seconds: u64,
+    /// Optional reinterpretations of the frame timeline, applied on top of
+    /// the always-reported raw metrics. Empty for workloads where every
+    /// frame interval is meaningful.
+    #[serde(default)]
+    pub post_processing: Vec<PostProcessing>,
+    /// Values scraped out of the device log, for pages that report their own
+    /// numbers (`console.log` reaches hilog on OHOS).
+    #[serde(default)]
+    pub log_metric: Vec<LogMetric>,
+    /// Display refresh rate the frame timeline is binned against, to report how
+    /// many refresh intervals each frame occupied. Set this to what the panel
+    /// is actually running at, which on an LTPO display is not always its
+    /// maximum.
+    #[serde(default = "default_refresh_hz")]
+    pub refresh_hz: f64,
+    /// Sample per-thread CPU time across the render window and report
+    /// CPU-milliseconds per presented frame. Off by default: it costs two
+    /// `/proc` walks per iteration and only matters when the question is which
+    /// thread a frame is waiting on.
+    #[serde(default)]
+    pub thread_cpu: bool,
+}
+
+fn default_refresh_hz() -> f64 {
+    60.0
+}
+
+/// An optional post-processing step over the presented-frame timeline.
+///
+/// Each step is opt-in per workload because there is no interpretation that
+/// suits every scenario: an animation that idles between bursts needs its
+/// idle time excluded to show animation cadence, whereas a continuously
+/// rendering workload (a WebGPU game, say) must keep long frames in the
+/// average — there a 100 ms frame is the very thing being measured.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum PostProcessing {
+    /// Treat inter-frame intervals of at least `gap_ms` as idle and drop them
+    /// from both the frame count and the elapsed time, reporting
+    /// `presented.fps_active` alongside the unfiltered `presented.fps`.
+    ///
+    /// Pick `gap_ms` above the workload's slowest genuine frame:
+    /// `presented.frames_near_gap` counts frames within a factor of two below
+    /// the threshold, which is the warning sign that it is set too low and
+    /// slow frames are being censored as idle.
+    ExcludeIdleGaps { gap_ms: f64 },
+}
+
+/// One value extracted from the device log per iteration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogMetric {
+    /// Key this lands under in the iteration's metrics map.
+    pub name: String,
+    /// Regular expression whose first capture group parses as a number.
+    pub pattern: String,
+    /// How to reduce multiple matches within one iteration to one value.
+    #[serde(default)]
+    pub aggregate: LogAggregate,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LogAggregate {
+    #[default]
+    Median,
+    Mean,
+    Min,
+    Max,
+    First,
+    Last,
+    Count,
+}
+
+impl LogAggregate {
+    /// Reduce one iteration's matches. `None` when there were none, which
+    /// leaves the metric absent for that iteration rather than reporting a
+    /// zero that would drag the summary down.
+    pub fn apply(&self, mut values: Vec<f64>) -> Option<f64> {
+        if values.is_empty() {
+            return None;
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some(match self {
+            Self::Median => values[values.len() / 2],
+            Self::Mean => values.iter().sum::<f64>() / values.len() as f64,
+            Self::Min => values[0],
+            Self::Max => values[values.len() - 1],
+            // `First`/`Last` are in emission order, which sorting destroyed;
+            // both are recovered from the extremes only when the caller wants
+            // them, so keep the unsorted semantics explicit here.
+            Self::First | Self::Last => unreachable!("handled by apply_ordered"),
+            Self::Count => values.len() as f64,
+        })
+    }
+
+    /// Reduce matches keeping emission order, which `First`/`Last` need.
+    pub fn apply_ordered(&self, values: Vec<f64>) -> Option<f64> {
+        match self {
+            Self::First => values.first().copied(),
+            Self::Last => values.last().copied(),
+            _ => self.apply(values),
+        }
+    }
+}
+
+fn default_sample_interval_seconds() -> u64 {
+    3
 }
 
 /// A background server that needs to be running while a workload's
@@ -112,6 +244,33 @@ pub fn load(workloads_dir: &Path, name: &str) -> Result<Workload> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loads_candle_scenario_workload() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
+        let w = load(&dir, "candle").expect("load candle");
+        let s = w.scenario.expect("candle declares a scenario");
+        assert_eq!(s.surface, "ServoDemoSurface");
+        assert_eq!(s.capture_seconds, Some(30));
+        assert_eq!(
+            s.post_processing,
+            vec![PostProcessing::ExcludeIdleGaps { gap_ms: 80.0 }]
+        );
+        let names: Vec<&str> = s.log_metric.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["chart_rebuild_ms", "raf_fps"]);
+        for m in &s.log_metric {
+            regex::Regex::new(&m.pattern).expect("log_metric pattern compiles");
+        }
+    }
+
+    #[test]
+    fn page_load_workloads_declare_no_scenario() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
+        assert!(load(&dir, "wikipedia")
+            .expect("load wikipedia")
+            .scenario
+            .is_none());
+    }
 
     #[test]
     fn loads_h2_multi_workload() {

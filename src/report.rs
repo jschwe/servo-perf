@@ -155,6 +155,163 @@ fn render_per_iter_chart(s: &mut String, short: &str, metric: &str, cfg: &Config
     writeln!(s).unwrap();
 }
 
+/// Presented-frame metrics for scenario workloads. Rendered only when the
+/// run produced them, so page-load reports are unchanged.
+///
+/// The unfiltered `presented.fps` is listed first and any post-processed
+/// interpretation after it, so a reader always sees what the device actually
+/// presented before seeing a number that reinterprets it.
+/// Per-thread CPU cost, when the scenario asked for it.
+///
+/// The row to read against `frame_time_ms.p50`: a thread whose CPU per frame
+/// approaches the frame time is the one the frame is waiting on, and the sum
+/// over all threads against the frame time says how much parallelism is
+/// actually being had.
+fn render_thread_cpu_section(s: &mut String, cfg: &ConfigResults) {
+    const PREFIX: &str = "thread_cpu_ms_per_frame.";
+    let mut keys: Vec<&String> = cfg
+        .iterations
+        .iter()
+        .filter_map(|i| match &i.status {
+            IterationStatus::Ok { metrics, .. } => Some(metrics),
+            _ => None,
+        })
+        .flat_map(|m| m.keys())
+        .filter(|k| k.starts_with(PREFIX))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        return;
+    }
+
+    let median = |key: &str| -> Option<f64> {
+        let v: Vec<f64> = cfg
+            .iterations
+            .iter()
+            .filter_map(|i| match &i.status {
+                IterationStatus::Ok { metrics, .. } => metrics.get(key).copied(),
+                _ => None,
+            })
+            .collect();
+        crate::stats::summarise(&v).map(|s| s.p50)
+    };
+
+    let mut rows: Vec<(String, f64)> = keys
+        .iter()
+        .filter(|k| k.as_str() != "thread_cpu_ms_per_frame.total")
+        .filter_map(|k| median(k).map(|v| (k[PREFIX.len()..].to_string(), v)))
+        .collect();
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    writeln!(s, "### CPU per presented frame, by thread\n").unwrap();
+    writeln!(
+        s,
+        "`CPU ms/frame` divided by `threads` is the floor this group puts under the frame time; \
+         `busy` is how much of one core it kept.\n"
+    )
+    .unwrap();
+    writeln!(s, "| thread | CPU ms/frame | threads | per thread | busy |").unwrap();
+    writeln!(s, "|---|---:|---:|---:|---:|").unwrap();
+    for (name, v) in &rows {
+        let n = median(&format!("thread_count.{name}"))
+            .unwrap_or(1.0)
+            .max(1.0);
+        let busy = median(&format!("thread_core_pct.{name}")).unwrap_or(0.0);
+        writeln!(
+            s,
+            "| {name} | {v:.2} | {n:.0} | {:.2} | {busy:.0}% |",
+            v / n
+        )
+        .unwrap();
+    }
+    if let Some(total) = median("thread_cpu_ms_per_frame.total") {
+        writeln!(s, "| **all threads** | **{total:.2}** | | | |").unwrap();
+    }
+    writeln!(s).unwrap();
+}
+
+fn render_scenario_section(s: &mut String, cfg: &ConfigResults) {
+    const ROWS: &[(&str, &str, &str)] = &[
+        ("presented.fps", "Presented fps", ""),
+        ("presented.fps_active", "…excluding idle gaps", ""),
+        ("frame_time_ms.p10", "Frame time p10", " ms"),
+        ("frame_time_ms.p25", "Frame time p25", " ms"),
+        ("frame_time_ms.p50", "Frame time p50", " ms"),
+        ("frame_time_ms.p75", "Frame time p75", " ms"),
+        ("frame_time_ms.p95", "Frame time p95", " ms"),
+        ("frame_time_ms.p99", "Frame time p99", " ms"),
+        ("presented.idle_pct", "Idle share", " %"),
+        ("presented.frames", "Frames presented", ""),
+        ("presented.frames_near_gap", "Frames near the idle gap", ""),
+        ("presented.window_coverage_pct", "Window coverage", " %"),
+        ("presented.lost_sample_windows", "Lost sample windows", ""),
+        (
+            "frame_time_ms.vsync1_pct",
+            "…presented at the next vsync",
+            " %",
+        ),
+        ("frame_time_ms.vsync2_pct", "…one vsync late", " %"),
+        ("frame_time_ms.vsync3_pct", "…two vsyncs late", " %"),
+        (
+            "frame_time_ms.vsync4plus_pct",
+            "…three or more vsyncs late",
+            " %",
+        ),
+    ];
+
+    let samples = |key: &str| -> Vec<f64> {
+        cfg.iterations
+            .iter()
+            .filter_map(|i| match &i.status {
+                IterationStatus::Ok { metrics, .. } => metrics.get(key).copied(),
+                _ => None,
+            })
+            .collect()
+    };
+
+    writeln!(s, "### Presented frames\n").unwrap();
+    writeln!(s, "| metric | p50 | min | max | n |").unwrap();
+    writeln!(s, "|---|---|---|---|---|").unwrap();
+    for (key, label, unit) in ROWS {
+        let v = samples(key);
+        if v.is_empty() {
+            continue;
+        }
+        let Some(sum) = crate::stats::summarise(&v) else {
+            continue;
+        };
+        writeln!(
+            s,
+            "| {label} | {:.2}{unit} | {:.2} | {:.2} | {} |",
+            sum.p50,
+            v.iter().cloned().fold(f64::INFINITY, f64::min),
+            v.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            v.len()
+        )
+        .unwrap();
+    }
+    writeln!(s).unwrap();
+
+    render_thread_cpu_section(s, cfg);
+
+    // Frames sitting just under the idle threshold are the ones the filter
+    // would censor next; a large share means the threshold is too low for
+    // this workload and `presented.fps_active` is flattering it.
+    let near: f64 = samples("presented.frames_near_gap").iter().sum();
+    let total: f64 = samples("presented.frames").iter().sum();
+    if total > 0.0 && near / total > 0.1 {
+        writeln!(
+            s,
+            "> {:.0}% of frames fall within a factor of two below the idle-gap \
+             threshold. Raise `gap_ms` for this workload, or read \
+             `presented.fps` rather than `presented.fps_active`.\n",
+            100.0 * near / total
+        )
+        .unwrap();
+    }
+}
+
 /// Append a "Thermal" section with a min/max/peak-delta summary and a
 /// per-iteration before/after/Δ table. Values are stored as milli-Celsius
 /// in the metrics map; the section converts to °C with one decimal for
@@ -523,6 +680,14 @@ fn render_markdown(data: &RunResults) -> String {
         }) {
             render_thermal_section(&mut s, cfg);
         }
+
+        // Scenario workloads only: what the display actually showed.
+        if cfg.iterations.iter().any(|i| {
+            matches!(&i.status, IterationStatus::Ok { metrics, .. }
+                if metrics.contains_key("presented.fps"))
+        }) {
+            render_scenario_section(&mut s, cfg);
+        }
     }
 
     if !data.deltas.is_empty() {
@@ -555,6 +720,7 @@ mod tests {
             device_pixel_ratio: None,
             servoshell_args: vec![],
             fixture: None,
+            scenario: None,
         }
     }
 

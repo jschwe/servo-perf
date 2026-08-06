@@ -96,6 +96,14 @@ pub struct RunArtifact {
     /// Path to the per-iteration perf.data pulled from the device, OHOS-only
     /// and only when `--with-instructions` was passed. Empty otherwise.
     pub perf_data: Option<PathBuf>,
+    /// Presented-frame ring dumps sampled during the render window. Only
+    /// populated for OHOS scenario workloads.
+    pub fps_dumps: Vec<String>,
+    /// Device log captured at the end of a scenario iteration.
+    pub log: Option<String>,
+    /// Raw `/proc` thread-CPU samples bracketing the render window, when the
+    /// scenario asked for them.
+    pub thread_cpu: Option<(String, String)>,
 }
 
 /// Run a single iteration against `target`. Returns a [`RunArtifact`]
@@ -129,6 +137,9 @@ pub fn run_once(
                 thermal_before_milli_c: art.thermal_before_milli_c,
                 thermal_after_milli_c: art.thermal_after_milli_c,
                 perf_data: art.perf_data,
+                fps_dumps: art.fps_dumps,
+                log: art.log,
+                thread_cpu: art.thread_cpu,
             });
         }
     };
@@ -229,6 +240,11 @@ pub fn run_once(
         thermal_before_milli_c: None,
         thermal_after_milli_c: None,
         perf_data: None,
+        // Scenario metrics are sourced from device-side services that have
+        // no local-target equivalent.
+        fps_dumps: Vec::new(),
+        thread_cpu: None,
+        log: None,
     })
 }
 

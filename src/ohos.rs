@@ -312,7 +312,10 @@ impl OhosTarget {
             "-b".into(),
             self.bundle.clone(),
             "-U".into(),
-            workload.url.clone(),
+            // `hdc shell` joins argv into one remote command line, so shell
+            // metacharacters in the URL (e.g. parentheses in Wikipedia paths)
+            // must be quoted for the device-side shell.
+            format!("'{}'", workload.url),
         ];
         start_args.extend(aa_params);
         let start_args_ref: Vec<&str> = start_args.iter().map(String::as_str).collect();
@@ -388,6 +391,12 @@ impl OhosTarget {
         // runs; the metric just won't appear in raw.json for this iter.
         let thermal_before_milli_c = self.read_soc_thermal_milli_c();
 
+        // Scenario workloads scrape their own numbers out of the log, so the
+        // buffer starts empty for every iteration.
+        if workload.scenario.is_some() {
+            let _ = self.hdc(&["shell", "hilog", "-r"]);
+        }
+
         let spawn_wall_ns = wall_now_ns();
         self.aa_start(workload, proxy_uri)
             .with_context(|| format!("aa start failed for {}", self.bundle))?;
@@ -396,12 +405,49 @@ impl OhosTarget {
         // we run a blocking `hiperf record -d <secs>`; otherwise we just
         // sleep. Either way the host returns to this line after exactly
         // `capture_seconds` of device-side activity.
-        if let Some(period) = self.hiperf_period {
+        //
+        // A scenario workload additionally samples the presented-frame ring
+        // throughout that window; the ring only holds ~384 entries, so the
+        // samples have to be interleaved with the wait rather than taken at
+        // the end. When hiperf is also recording, its blocking call runs in
+        // the scope's main thread while sampling proceeds alongside it.
+        let window = self.scenario_capture_seconds(workload);
+        let mut fps_dumps = Vec::new();
+        let mut thread_cpu = None;
+        if let Some(scenario) = workload.scenario.as_ref() {
+            // Take the opening thread-CPU sample only once the app has a pid,
+            // so the window measured is steady-state rendering rather than
+            // process start-up.
+            let cpu_before = scenario
+                .thread_cpu
+                .then(|| self.sample_thread_cpu())
+                .flatten();
+            std::thread::scope(|scope| -> Result<()> {
+                let sampler = scope.spawn(|| self.sample_frame_ring(scenario, window));
+                if let Some(period) = self.hiperf_period {
+                    self.run_hiperf_record(period)
+                        .context("hiperf record (--with-instructions)")?;
+                }
+                fps_dumps = sampler.join().unwrap_or_default();
+                Ok(())
+            })?;
+            if let Some(before) = cpu_before {
+                thread_cpu = self.sample_thread_cpu().map(|after| (before, after));
+            }
+        } else if let Some(period) = self.hiperf_period {
             self.run_hiperf_record(period)
                 .context("hiperf record (--with-instructions)")?;
         } else {
-            std::thread::sleep(Duration::from_secs(self.capture_seconds));
+            std::thread::sleep(Duration::from_secs(window));
         }
+
+        // Pull the log before `force_stop`, while the app's lines are still
+        // in the buffer.
+        let log = workload.scenario.as_ref().and_then(|_| {
+            self.hdc(&["shell", "hilog", "-x"])
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        });
 
         // Thermal snapshot right after the render window — captures
         // whatever peak heat the iteration produced before `force_stop`
@@ -445,13 +491,68 @@ impl OhosTarget {
         self.force_stop();
 
         Ok(RunArtifact {
+            thread_cpu,
             trace: dest,
+            fps_dumps,
+            log,
             perf_data,
             spawn_wall_ns,
             exit_wall_ns,
             thermal_before_milli_c,
             thermal_after_milli_c,
         })
+    }
+
+    /// Length of one iteration's render window: the workload's scenario
+    /// setting when it has one, else the CLI-wide `--ohos-capture-seconds`.
+    fn scenario_capture_seconds(&self, workload: &Workload) -> u64 {
+        workload
+            .scenario
+            .as_ref()
+            .and_then(|s| s.capture_seconds)
+            .unwrap_or(self.capture_seconds)
+    }
+
+    /// Sample the surface's presented-frame ring every
+    /// `sample_interval_seconds` until `window` seconds have elapsed.
+    ///
+    /// Sampling starts after the first interval so the app has drawn
+    /// something, and a final sample is always taken at the end of the
+    /// window. Failed samples are skipped rather than aborting the
+    /// iteration: a short timeline still yields metrics, and
+    /// `presented.lost_sample_windows` reports the resulting holes.
+    fn sample_frame_ring(&self, scenario: &crate::workload::Scenario, window: u64) -> Vec<String> {
+        let interval = scenario.sample_interval_seconds.max(1);
+        let arg = format!("fps {}", scenario.surface);
+        let mut dumps = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(window);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            std::thread::sleep(remaining.min(Duration::from_secs(interval)));
+            if let Ok(out) = self.hdc(&["shell", "hidumper", "-s", "RenderService", "-a", &arg]) {
+                dumps.push(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+        }
+        dumps
+    }
+
+    /// Walk `/proc/<pid>/task` and return one raw thread-CPU sample.
+    ///
+    /// `None` when the app has no pid yet or the walk failed, which just
+    /// leaves the per-thread breakdown out of this iteration rather than
+    /// failing it.
+    fn sample_thread_cpu(&self) -> Option<String> {
+        let out = self.hdc(&["shell", "pidof", &self.bundle]).ok()?;
+        let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let script = crate::threads::SAMPLE_COMMAND.replace("{pid}", &pid);
+        let out = self.hdc(&["shell", &script]).ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// Run `hiperf record -a -e hw-instructions -d <capture_seconds>` on
@@ -499,6 +600,16 @@ impl OhosTarget {
 /// `runner::RunArtifact` but the trace file is hitrace text, not pftrace.
 pub struct RunArtifact {
     pub trace: PathBuf,
+    /// Raw `hidumper` frame-ring dumps sampled during the render window, in
+    /// sample order. Empty unless the workload declares a
+    /// [`crate::workload::Scenario`].
+    pub fps_dumps: Vec<String>,
+    /// Device log captured after the render window, for scenario workloads
+    /// that scrape page-reported values out of it.
+    pub log: Option<String>,
+    /// `/proc` thread-CPU samples from the two ends of the render window, for
+    /// scenario workloads that set `thread_cpu`.
+    pub thread_cpu: Option<(String, String)>,
     /// `Some(path)` when `--with-instructions` was enabled: the
     /// pulled-from-device perf.data for this iteration, parsed by
     /// [`crate::instructions::aggregate_inclusive_from_perf_data`].
@@ -1144,6 +1255,7 @@ mod tests {
                 "--psn=--flag".into(),
             ],
             fixture: None,
+            scenario: None,
         };
         let aa = workload_args_to_aa_params(&w, Some("http://127.0.0.1:9999"), &[]);
         // headless / exit dropped

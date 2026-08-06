@@ -581,6 +581,7 @@ mod tests {
             device_pixel_ratio: None,
             servoshell_args: vec![],
             fixture: Some(fx),
+            scenario: None,
         }
     }
 

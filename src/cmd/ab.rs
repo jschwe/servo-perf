@@ -284,6 +284,17 @@ fn run_and_record(
                     {
                         metrics.insert("soc_thermal_milli_c.delta".to_string(), (a - b) as f64);
                     }
+                    // Presented-frame and page-reported metrics for scenario
+                    // workloads; a no-op for page-load ones.
+                    crate::fps::merge_scenario_metrics(
+                        &mut metrics,
+                        w,
+                        &art.fps_dumps,
+                        art.log.as_deref(),
+                        art.thread_cpu
+                            .as_ref()
+                            .map(|(b, a)| (b.as_str(), a.as_str())),
+                    );
                     Iteration {
                         index: iter,
                         status: IterationStatus::Ok {

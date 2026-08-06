@@ -1,0 +1,45 @@
+name = "candle"
+url = "https://127.0.0.1:4443/candle.html"
+iterations = 8
+servoshell_args = ["--ignore-certificate-errors"]
+
+# An ECharts candlestick chart that rebuilds itself on a timer, so every
+# cycle replays chart layout, canvas drawing and text measurement. Unlike the
+# page-load workloads this one is measured while it renders: the metrics come
+# from the presented-frame ring and from the numbers the page logs itself.
+[scenario]
+surface = "ServoDemoSurface"
+capture_seconds = 30
+sample_interval_seconds = 3
+
+# The chart idles between rebuild cycles, so roughly a third of the wall time
+# carries no animation at all. Excluding those gaps reports the cadence during
+# animation, which is what a canvas change moves. `presented.fps` is still
+# reported unfiltered next to it.
+#
+# A continuously-rendering workload should NOT declare this: there a long
+# frame is a dropped frame and dropping it from the average hides the problem.
+[[scenario.post_processing]]
+kind = "exclude-idle-gaps"
+gap_ms = 80.0
+
+# The page wraps `echarts.init` and reports how long each rebuild took to
+# reach its `finished` event. Wall-clock per unit of work, so unlike fps it is
+# insensitive to how many frames the device managed to present.
+[[scenario.log_metric]]
+name = "chart_rebuild_ms"
+pattern = 'init_to_finished_ms=([0-9.]+)'
+aggregate = "median"
+
+# Frames the page itself observed via requestAnimationFrame, as a cross-check
+# on the presented-frame numbers: the two diverge when frames are being
+# coalesced or dropped after script produced them.
+[[scenario.log_metric]]
+name = "raf_fps"
+pattern = 'INSTRUMENT: t=[0-9]+s fps=([0-9]+)'
+aggregate = "median"
+
+[fixture]
+kind = "http1"
+port = 4443
+doc_root = "candle"
