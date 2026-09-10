@@ -63,6 +63,10 @@ pub struct OhosTarget {
     /// the workload's fixture supplies a proxy URI. Empty (or no match) →
     /// fall back to Servo's pref-style injection for backward
     /// compatibility.
+    /// Engine-specific launch flags, applied on every run. Engine-scoped
+    /// because they are app-specific: servoshell exits on a flag it does not
+    /// know, so a wrapper-app flag in a shared workload would kill it.
+    pub engine_launch_args: Vec<String>,
     pub engine_proxy_args: Vec<String>,
 }
 
@@ -95,6 +99,7 @@ impl OhosTarget {
             },
             // Populated by `crate::cmd::bench::build_target` after `from_args`,
             // since the workloads_dir / engine lookup live in that scope.
+            engine_launch_args: Vec::new(),
             engine_proxy_args: Vec::new(),
         }
     }
@@ -229,6 +234,19 @@ impl OhosTarget {
     /// the first page of every library we stage, so this costs milliseconds
     /// instead of pulling 150-300 MB. `None` when the file is missing or has
     /// no build id — the caller decides whether that is fatal.
+    /// The first of `candidates` that exists on the device.
+    pub fn first_existing(&self, candidates: &[String]) -> Option<String> {
+        for path in candidates {
+            let probe = format!("ls {path} >/dev/null 2>&1 && echo yes");
+            if let Ok(out) = self.hdc(&["shell", &probe]) {
+                if String::from_utf8_lossy(&out.stdout).contains("yes") {
+                    return Some(path.clone());
+                }
+            }
+        }
+        None
+    }
+
     pub fn remote_build_id(&self, device_path: &str) -> Option<String> {
         let tmp = "/data/local/tmp/servoperf_elfhdr.bin";
         let dd = format!("dd if={device_path} of={tmp} bs=4096 count=4 2>/dev/null");
@@ -458,7 +476,12 @@ impl OhosTarget {
     /// between [`Self::run_iteration`] (replay/measure) and
     /// [`OhosRecordDriver::drive`] (record).
     fn aa_start(&self, workload: &Workload, proxy_uri: Option<&str>) -> Result<()> {
-        let aa_params = workload_args_to_aa_params(workload, proxy_uri, &self.engine_proxy_args);
+        let aa_params = workload_args_to_aa_params(
+            workload,
+            proxy_uri,
+            &self.engine_launch_args,
+            &self.engine_proxy_args,
+        );
         let mut start_args: Vec<String> = vec![
             "shell".into(),
             "aa".into(),
@@ -1187,6 +1210,7 @@ fn wall_now_ns() -> u64 {
 fn workload_args_to_aa_params(
     workload: &Workload,
     proxy_uri: Option<&str>,
+    engine_launch_args: &[String],
     engine_proxy_args: &[String],
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -1214,6 +1238,7 @@ fn workload_args_to_aa_params(
     let mut iter = workload
         .servoshell_args
         .iter()
+        .chain(engine_launch_args.iter())
         .chain(synthetic.iter())
         .cloned()
         .peekable();
@@ -1756,14 +1781,22 @@ mod tests {
             scenario: None,
             steps: vec![],
         };
-        let args = super::workload_args_to_aa_params(&w, None, &[]);
+        // Engine-scoped now: a workload is shared by every engine, and
+        // servoshell exits on an argument it does not recognise, so a
+        // wrapper-app flag in the workload killed every servoshell iteration.
+        w.servoshell_args = vec!["--ignore-certificate-errors".into()];
+        let engine_args = vec!["--chrome=none".to_string()];
+        let args = super::workload_args_to_aa_params(&w, None, &engine_args, &[]);
         assert!(
             args.iter().any(|a| a == "--psn=--chrome=none"),
             "expected --psn=--chrome=none, got {args:?}"
         );
-        w.servoshell_args.clear();
-        let args = super::workload_args_to_aa_params(&w, None, &[]);
-        assert!(!args.iter().any(|a| a.contains("chrome")));
+        // The same workload against an engine that does not want it.
+        let args = super::workload_args_to_aa_params(&w, None, &[], &[]);
+        assert!(
+            !args.iter().any(|a| a.contains("chrome")),
+            "a workload must not carry another engine's flags: {args:?}"
+        );
     }
 
     #[test]
@@ -1915,7 +1948,7 @@ mod tests {
             scenario: None,
             steps: vec![],
         };
-        let aa = workload_args_to_aa_params(&w, Some("http://127.0.0.1:9999"), &[]);
+        let aa = workload_args_to_aa_params(&w, Some("http://127.0.0.1:9999"), &[], &[]);
         // headless / exit dropped
         assert!(!aa.iter().any(|a| a == "--headless" || a == "--exit"));
         // viewport synthesized (single --psn token)

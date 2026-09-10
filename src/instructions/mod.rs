@@ -66,14 +66,26 @@ pub struct EngineConfig {
     /// bench also reports `instructions.per_reflow`.
     #[serde(default)]
     pub reflow_instructions: Option<String>,
+    /// Launch flags this engine's app understands, injected on every run.
+    ///
+    /// Engine-scoped rather than per workload because they are app-specific:
+    /// servoshell's argument parser exits on a flag it does not know, so a
+    /// wrapper-app flag in a shared workload silently kills every servoshell
+    /// iteration.
+    #[serde(default)]
+    pub launch_args: Vec<String>,
     /// Where this engine's library lives on the device, so its build id can
     /// be checked against the staged symbol file before a run.
     ///
-    /// Unset skips the check, and the run then trusts that the staged file is
-    /// the build that is installed — which is exactly the assumption that
+    /// A list, because the path is device-specific — the arkwebcore bundle is
+    /// named differently on an OpenHarmony board and a HarmonyOS phone — and
+    /// one checkout drives both. The first that exists is used.
+    ///
+    /// Empty skips the check, and the run then trusts that the staged file is
+    /// the build that is installed, which is exactly the assumption that
     /// produces confident wrong attributions after a rebuild.
     #[serde(default)]
-    pub device_library: Option<String>,
+    pub device_library: Vec<String>,
     /// Named sums over several `functions` patterns, for reporting a phase
     /// that no single symbol covers — Servo's paint prep is a stacking-context
     /// tree plus a display list, for instance.
@@ -264,7 +276,8 @@ mod tests {
             reflow_spans: vec!["performLayout".into()],
             reflow_instructions: None,
             groups: vec![],
-            device_library: None,
+            launch_args: vec![],
+            device_library: vec![],
         };
         let mut slices = vec![
             slice_at("H:LocalFrameView::performLayout", 50), // before the window
@@ -297,7 +310,8 @@ mod tests {
             reflow_spans: vec!["LocalFrameView::performLayout".into()],
             reflow_instructions: None,
             groups: vec![],
-            device_library: None,
+            launch_args: vec![],
+            device_library: vec![],
         };
         let slices = vec![
             slice("H:LocalFrameView::performLayout"),
@@ -320,7 +334,8 @@ mod tests {
             reflow_spans: vec![],
             reflow_instructions: None,
             groups: vec![],
-            device_library: None,
+            launch_args: vec![],
+            device_library: vec![],
         };
         assert!(
             count_reflow_spans_in(&reflow_span_starts(&[slice("a")], &engine), None).is_empty()
