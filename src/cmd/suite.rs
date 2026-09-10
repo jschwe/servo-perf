@@ -379,6 +379,16 @@ fn write_comparison(
                 let sp = samples.and_then(|v| crate::stats::spread(v));
                 stats.push(sp);
                 match (&sp, samples) {
+                    // One iteration: the value is real, the uncertainty is
+                    // unknown. Say so rather than implying either.
+                    (None, Some(values)) if values.len() == 1 => {
+                        write!(s, " {} (n=1) |", format_metric(metric, values[0])).unwrap();
+                        notes.push(format!(
+                            "`{metric}` on {}/{}: one iteration, so nothing can be said about \
+                             its spread and no difference involving it is resolvable.",
+                            leg.id, w.name
+                        ));
+                    }
                     (Some(sp), Some(values)) => {
                         let flag = if sp.cv > 0.20 { " ⚠" } else { "" };
                         write!(

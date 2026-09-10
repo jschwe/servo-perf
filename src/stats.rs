@@ -121,7 +121,11 @@ pub struct Spread {
 
 pub fn spread(samples: &[f64]) -> Option<Spread> {
     let mut xs: Vec<f64> = samples.iter().copied().filter(|v| v.is_finite()).collect();
-    if xs.is_empty() {
+    // A single sample has no dispersion to report. Returning zeros would be
+    // read as *certainty*: a comparison whose noise floor is 0 marks every
+    // difference as significant, and a leg cut short by failures or a
+    // cancellation would look the cleanest in the report.
+    if xs.len() < 2 {
         return None;
     }
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -132,11 +136,7 @@ pub fn spread(samples: &[f64]) -> Option<Spread> {
     } else {
         (xs[n / 2 - 1] + xs[n / 2]) / 2.0
     };
-    let sd = if n > 1 {
-        (xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0)).sqrt()
-    } else {
-        0.0
-    };
+    let sd = (xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0)).sqrt();
     let cv = if mean != 0.0 { sd / mean.abs() } else { 0.0 };
     let sem = sd / (n as f64).sqrt();
     let resolvable = if mean != 0.0 {
@@ -199,6 +199,19 @@ pub fn outliers(samples: &[f64]) -> Vec<usize> {
 #[cfg(test)]
 mod spread_tests {
     use super::*;
+
+    #[test]
+    fn one_sample_reports_no_spread_rather_than_no_uncertainty() {
+        // The trap: zeros here read as certainty downstream, and every delta
+        // clears a noise floor of 0.
+        assert!(spread(&[42.0]).is_none());
+        assert!(spread(&[]).is_none());
+        assert!(
+            spread(&[f64::NAN, 42.0]).is_none(),
+            "one finite value is one sample"
+        );
+        assert!(spread(&[42.0, 43.0]).is_some());
+    }
 
     #[test]
     fn spread_reports_scale_free_dispersion() {
