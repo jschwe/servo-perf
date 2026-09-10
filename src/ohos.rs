@@ -223,6 +223,26 @@ impl OhosTarget {
         Some(host)
     }
 
+    /// Read the GNU build id of a library on the device.
+    ///
+    /// Copies only the first 16 KB: the `PT_NOTE` holding the build id sits in
+    /// the first page of every library we stage, so this costs milliseconds
+    /// instead of pulling 150-300 MB. `None` when the file is missing or has
+    /// no build id — the caller decides whether that is fatal.
+    pub fn remote_build_id(&self, device_path: &str) -> Option<String> {
+        let tmp = "/data/local/tmp/servoperf_elfhdr.bin";
+        let dd = format!("dd if={device_path} of={tmp} bs=4096 count=4 2>/dev/null");
+        self.hdc(&["shell", &dd]).ok()?;
+        let local = std::env::temp_dir().join("servoperf_elfhdr.bin");
+        let local_str = local.to_string_lossy().to_string();
+        let recv = self.hdc(&["file", "recv", tmp, &local_str]);
+        let _ = self.hdc(&["shell", "rm", "-f", tmp]);
+        recv.ok()?;
+        let bytes = std::fs::read(&local).ok()?;
+        let _ = std::fs::remove_file(&local);
+        crate::instructions::symbols::build_id_from_elf_prefix(&bytes)
+    }
+
     /// Run one `hdc shell <command>` on the device, for a caller that has a
     /// command string rather than an argv (a suite leg's `setup`). The string
     /// reaches the device's shell verbatim.

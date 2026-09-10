@@ -37,6 +37,9 @@ bundles = [
 # servo worktree that produced the .hap). Host-side perf.data parsing
 # needs it to resolve sample IPs to function names.
 symbol_file = "libservoshell.symbols.so"
+# Path inside the installed bundle; adjust if your hap lays out differently.
+# Clearing it skips the build-id check, at the cost of trusting the staging.
+device_library = "/data/storage/el1/bundle/libs/arm64/libservoshell.so"
 # Inclusive instruction counts for these symbols are exported as
 # per-iteration metrics named `instructions.<func>`.
 functions = [
@@ -122,6 +125,10 @@ bundles = [
 # result. Path here is host-side; the device-side push target is fixed at
 # /data/local/tmp/symbols/libarkweb_engine.so.
 symbol_file = "libarkweb_engine.merged.so"
+# Checked against the staged symbol file's build id before a run: a stale
+# staging resolves every sample against the old layout and reports plausible
+# wrong numbers rather than failing.
+device_library = "/data/storage/el1/bundle/arkwebcore/libs/arm64/libarkweb_engine.so"
 functions = [
   "WebFrameWidgetImpl::UpdateLifecycle",
   "LocalFrameView::UpdateAllLifecyclePhases",
@@ -184,6 +191,7 @@ bundles = []
 # device — check `/proc/<pid>/maps` for the library that is actually mapped.
 # Stage it under workloads/ with this name.
 symbol_file = "libservo_arkweb.symbols.so"
+device_library = "/system/lib64/libservo_arkweb.so"
 functions = [
   # Patterns are matched against rustc-demangled names. An inherent method
   # renders as `Type::method` under legacy mangling and `<Type>::method` under

@@ -355,3 +355,116 @@ fn pad_to_8(out: &mut Vec<u8>) {
         out.push(0);
     }
 }
+
+/// Read the GNU build id out of an ELF prefix, via the program headers.
+///
+/// Deliberately not via the section table: a stripped device library can drop
+/// its section headers while always keeping the loadable `PT_NOTE`, and the
+/// note sits in the first page of every library we stage (offset 0x2a8 and
+/// 0x2c4 in the two real ones), so a 16 KB prefix is enough. That is what
+/// makes it affordable to check the *device's* copy before a run rather than
+/// pulling 150-300 MB.
+///
+/// Length varies by linker setting — Servo's OHOS build emits 8 bytes, the
+/// ArkWeb engine and the servo-arkweb shim 20 — so callers must compare, not
+/// assume a width.
+pub fn build_id_from_elf_prefix(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 64 || &bytes[..4] != b"\x7fELF" || bytes[4] != 2 {
+        return None; // not a 64-bit ELF
+    }
+    let little = bytes[5] == 1;
+    let u16_at = |o: usize| -> u16 {
+        let b = [bytes[o], bytes[o + 1]];
+        if little {
+            u16::from_le_bytes(b)
+        } else {
+            u16::from_be_bytes(b)
+        }
+    };
+    let u32_at = |o: usize| -> u32 {
+        let b = [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
+        if little {
+            u32::from_le_bytes(b)
+        } else {
+            u32::from_be_bytes(b)
+        }
+    };
+    let u64_at = |o: usize| -> u64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&bytes[o..o + 8]);
+        if little {
+            u64::from_le_bytes(b)
+        } else {
+            u64::from_be_bytes(b)
+        }
+    };
+
+    let phoff = u64_at(0x20) as usize;
+    let phentsize = u16_at(0x36) as usize;
+    let phnum = u16_at(0x38) as usize;
+    for i in 0..phnum {
+        let ph = phoff.checked_add(i.checked_mul(phentsize)?)?;
+        if ph + 56 > bytes.len() {
+            break;
+        }
+        if u32_at(ph) != 4 {
+            continue; // PT_NOTE
+        }
+        let off = u64_at(ph + 0x08) as usize;
+        let size = u64_at(ph + 0x20) as usize;
+        let end = off.checked_add(size)?;
+        if end > bytes.len() {
+            continue; // note beyond the prefix we were given
+        }
+        let notes = &bytes[off..end];
+        let mut pos = 0usize;
+        while pos + 12 <= notes.len() {
+            let namesz = u32_at(off + pos) as usize;
+            let descsz = u32_at(off + pos + 4) as usize;
+            let ntype = u32_at(off + pos + 8);
+            pos += 12;
+            let name_end = pos.checked_add(namesz)?;
+            if name_end > notes.len() {
+                break;
+            }
+            let name = &notes[pos..name_end];
+            pos = name_end.checked_add(3)? & !3;
+            let desc_end = pos.checked_add(descsz)?;
+            if desc_end > notes.len() {
+                break;
+            }
+            // NT_GNU_BUILD_ID, owner "GNU\0".
+            if ntype == 3 && name.starts_with(b"GNU") {
+                return Some(
+                    notes[pos..desc_end]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect(),
+                );
+            }
+            pos = desc_end.checked_add(3)? & !3;
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod build_id_tests {
+    #[test]
+    fn rejects_things_that_are_not_a_64_bit_elf() {
+        assert_eq!(super::build_id_from_elf_prefix(b"not an elf"), None);
+        let mut fake = vec![0u8; 128];
+        fake[..4].copy_from_slice(b"\x7fELF");
+        fake[4] = 1; // 32-bit
+        assert_eq!(super::build_id_from_elf_prefix(&fake), None);
+    }
+
+    #[test]
+    fn a_64_bit_elf_without_a_note_has_no_build_id() {
+        let mut fake = vec![0u8; 128];
+        fake[..4].copy_from_slice(b"\x7fELF");
+        fake[4] = 2; // 64-bit
+        fake[5] = 1; // little endian
+        assert_eq!(super::build_id_from_elf_prefix(&fake), None);
+    }
+}
