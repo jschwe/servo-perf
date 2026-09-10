@@ -45,7 +45,9 @@ pub fn requested() -> bool {
     REQUESTED.load(Ordering::SeqCst)
 }
 
-/// Ask for a stop from code rather than a signal.
+/// Ask for a stop from code rather than a signal. Used by the tests that
+/// exercise the cancellation paths without raising a real signal.
+#[cfg(test)]
 pub fn request() {
     REQUESTED.store(true, Ordering::SeqCst);
 }
@@ -74,6 +76,13 @@ fn run_cleanups() {
     for (_, f) in taken.iter().rev() {
         f();
     }
+}
+
+/// Reset the flag between tests. The flag is process-wide by design, so a
+/// test that sets it has to put it back.
+#[cfg(test)]
+pub fn clear_for_test() {
+    REQUESTED.store(false, Ordering::SeqCst);
 }
 
 #[cfg(test)]
