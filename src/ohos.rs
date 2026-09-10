@@ -768,6 +768,7 @@ impl OhosTarget {
     fn run_hiperf_record(&self, period: u64, window_seconds: u64) -> Result<()> {
         let duration = window_seconds.to_string();
         let period_str = period.to_string();
+        let started = Instant::now();
         let out = self.hdc(&[
             "shell",
             "hiperf",
@@ -786,6 +787,16 @@ impl OhosTarget {
             "-o",
             DevicePaths::PERF_DATA,
         ])?;
+        // hiperf reports argument and setup failures on stdout and still exits
+        // 0. With --with-instructions this call *is* the capture window, so a
+        // failure that returns immediately leaves the iteration recorded as a
+        // success over a window of nearly nothing.
+        let stdout_all = String::from_utf8_lossy(&out.stdout);
+        if let Some(reason) = hiperf_capture_failure(&stdout_all, started.elapsed(), window_seconds)
+        {
+            anyhow::bail!("{reason}");
+        }
+
         // hiperf reports sample loss on stdout and still exits 0. A lossy
         // capture understates every instruction count, so surface it rather
         // than letting it pass as a clean run — with the total, because the
@@ -1225,6 +1236,39 @@ fn workload_args_to_aa_params(
     out
 }
 
+/// Decide whether a `hiperf record` call actually captured anything.
+///
+/// With `--with-instructions` this call *is* the capture window, so a failure
+/// that returns immediately would otherwise be recorded as a successful
+/// iteration over a window of nearly nothing — every instruction count near
+/// zero, with no warning. hiperf exits 0 in these cases and reports on stdout,
+/// and not always with the word `error`: an unsupported event gives
+/// "`<name> event is not supported by the kernel.`" followed by
+/// "`subcommand 'record' failed`".
+///
+/// The wall time is the check that does not depend on message wording.
+fn hiperf_capture_failure(stdout: &str, elapsed: Duration, window_seconds: u64) -> Option<String> {
+    if let Some(line) = stdout
+        .lines()
+        .find(|l| l.contains("error:") || l.contains("failed"))
+    {
+        return Some(format!(
+            "hiperf record refused the capture: {}",
+            line.trim()
+        ));
+    }
+    // Two seconds of slack for process start-up and the hdc round trip.
+    if elapsed + Duration::from_secs(2) < Duration::from_secs(window_seconds) {
+        return Some(format!(
+            "hiperf record returned after {:.1}s of an intended {window_seconds}s window — the \
+             capture did not run. Check the event is supported (`hiperf list`), that no other \
+             session holds the PMU, and that the output path is writable.",
+            elapsed.as_secs_f64(),
+        ));
+    }
+    None
+}
+
 /// Pull the first number following `label` in hiperf's summary lines
 /// (`[ Sample records: N, ... ]`, `[ Sample lost: N, ... ]`). `None` when the
 /// label is absent (older hiperf builds).
@@ -1582,6 +1626,26 @@ fn parse_proxy_port(uri: &str) -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_capture_that_did_not_run_is_not_a_successful_iteration() {
+        // Real hiperf output for an unsupported event — note it says neither
+        // "error:" nor anything else conventional, and exits 0.
+        let refused = "hw-not-a-real-event event is not supported by the kernel.\n\
+                       subcommand 'record' failed\n";
+        assert!(super::hiperf_capture_failure(refused, Duration::from_millis(80), 20).is_some());
+
+        // A short return with no message at all is still a failed capture.
+        let quiet = super::hiperf_capture_failure("", Duration::from_millis(50), 20);
+        assert!(quiet.unwrap().contains("did not run"));
+
+        // A real capture: full window, and the usual summary.
+        let ok = "[ Sample records: 164628, Non sample records: 427983 ]\n\
+                  [ Sample lost: 0, Non sample lost: 0 ]\n";
+        assert!(super::hiperf_capture_failure(ok, Duration::from_secs(21), 20).is_none());
+        // Slack covers a capture that ends a shade early.
+        assert!(super::hiperf_capture_failure(ok, Duration::from_millis(19_500), 20).is_none());
+    }
+
     /// The device's wakelock is a toggle, not a counter, so a nested guard
     /// must not release it — the outer scope is still relying on it.
     #[test]
