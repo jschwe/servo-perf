@@ -455,6 +455,13 @@ fn write_comparison(
         writeln!(s).unwrap();
     }
 
+    if crate::cancel::requested() {
+        notes.push(
+            "the campaign was interrupted, so some cells hold fewer iterations than the \
+             suite asked for — check each cell's n before comparing them"
+                .to_string(),
+        );
+    }
     if !notes.is_empty() {
         writeln!(s, "## Notes\n").unwrap();
         notes.sort();
