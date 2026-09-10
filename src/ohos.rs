@@ -314,7 +314,9 @@ impl OhosTarget {
         }
         match found {
             Some((dir, temp)) => {
-                eprintln!("ohos: thermal zone {wanted_type} = {dir} (currently {temp} m°C)");
+                if crate::log_once::first_time(&format!("thermal:{wanted_type}={dir}")) {
+                    eprintln!("ohos: thermal zone {wanted_type} = {dir} (currently {temp} m°C)");
+                }
                 self.thermal_zone = Some(dir);
             }
             None => {
@@ -388,10 +390,12 @@ impl OhosTarget {
             });
         }
         self.set_trace_level(desired)?;
-        eprintln!(
-            "ohos: hitrace level {} → {} (will restore on exit)",
-            previous, desired
-        );
+        if crate::log_once::first_time(&format!("trace-level:{previous}->{desired}")) {
+            eprintln!(
+                "ohos: hitrace level {} → {} (restored after each run)",
+                previous, desired
+            );
+        }
         // Also restore if the run is abandoned: leaving a device at Debug
         // costs every later capture volume it does not need.
         let (t, p) = (self.clone(), previous.clone());

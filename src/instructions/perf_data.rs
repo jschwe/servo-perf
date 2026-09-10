@@ -91,7 +91,9 @@ pub fn aggregate_inclusive_from_perf_data(
     // "libarkweb_engine.so" or "libservoshell.so"). Pre-compute the symbol
     // file's basename for the same comparison.
     let symbol_basename = sym_basename_from_path(&engine.symbol_file);
-    if symbolizer.has_inline_info() {
+    if symbolizer.has_inline_info()
+        && crate::log_once::first_time(&format!("dwarf:{}", sym_path.display()))
+    {
         eprintln!(
             "instructions: {} carries DWARF; inlined functions are attributed",
             sym_path.display()
