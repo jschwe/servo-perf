@@ -24,6 +24,9 @@ pub enum Command {
     Ab(AbArgs),
     /// Run a workload and compare against a saved baseline JSON.
     Regression(RegressionArgs),
+    /// Run a whole measurement matrix — every workload of a suite against
+    /// every engine leg — from a checked-in `suites/<name>.toml`.
+    Suite(SuiteArgs),
     /// Build an unstripped `libarkweb_engine.so` from a stripped on-device
     /// copy by re-attaching the `.symtab`/`.strtab` carried in the
     /// `.gnu_debugdata` MiniDebugInfo section, then push it to the device.
@@ -215,6 +218,33 @@ pub struct PrepareArkwebSymbolsArgs {
     /// unset to use the local daemon.
     #[arg(long)]
     pub hdc_server: Option<String>,
+}
+
+#[derive(clap::Args, Clone)]
+pub struct SuiteArgs {
+    /// Suite name (looked up in tools/servoperf/suites/).
+    pub suite: String,
+    /// Restrict the run to these leg ids, comma-separated.
+    #[arg(long)]
+    pub legs: Option<String>,
+    /// Restrict the run to these workloads, comma-separated.
+    #[arg(long)]
+    pub only: Option<String>,
+    /// Override every workload's repetition count, for a smoke run.
+    #[arg(long)]
+    pub iterations: Option<u32>,
+    /// Root output directory. Each cell lands in `<out>/<leg>-<workload>/`.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// `.hap` to install once before each leg, as for `bench --bin`.
+    #[arg(long)]
+    pub bin: Option<PathBuf>,
+    /// Do not pause for a manual engine switch on legs without a `setup`
+    /// command — assume the device is already on the right engine.
+    #[arg(long)]
+    pub assume_yes: bool,
+    #[command(flatten)]
+    pub ohos: OhosArgs,
 }
 
 #[derive(clap::Args, Clone)]

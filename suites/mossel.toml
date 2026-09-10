@@ -1,0 +1,82 @@
+# The mossel campaign: five site pages, load and scroll, against each engine.
+#
+# Run with:  servoperf suite mossel --ohos --ohos-bundle org.openharmonyrs.arkwebtest
+#
+# Every setting here is a knob you are meant to turn. The values are the ones
+# measured to work on a PLR-class phone; see docs/reflow-benchmark.md §6 for
+# what each one trades off.
+
+name = "mossel"
+
+[defaults]
+# Repetitions per workload. 15 keeps the median stable against the page's own
+# load-to-load variance, which dominates the sampling error.
+iterations = 15
+# Capture window per iteration. Keep it near the page's load time — hitrace's
+# ring discards the oldest records, so a longer window drops the load burst.
+capture_seconds = 20
+# Retired instructions between samples. 1000000 was loss-free on PLR-AL00;
+# a slower board wants 250000. Lower means finer resolution, more overhead.
+instructions_period = 1000000
+# `nweb` carries ArkWeb's Blink layout markers; without it reflow.count is 0.
+trace_tags = "app,nweb"
+with_instructions = true
+
+# --- Engine legs, run in order -------------------------------------------
+# `setup` is an `hdc shell` command run once before the leg. Fill in whatever
+# your image uses to select the web engine; leave it out and the run pauses to
+# let you switch by hand.
+
+[[leg]]
+id = "arkweb"
+engine = "arkweb"
+# setup = "param set <engine-param> <arkweb-value>"
+# Blink emits its markers regardless of the threshold, so leave the device's
+# trace level alone on this leg.
+trace_level = ""
+
+[[leg]]
+id = "servo"
+engine = "servo-arkweb"
+# setup = "param set <engine-param> <servo-value>"
+
+# --- The matrix ----------------------------------------------------------
+# Trim this list to shorten a run; `--only` does the same from the command
+# line without editing the file.
+
+[[workload]]
+name = "mossel-index"
+
+[[workload]]
+name = "mossel-sort"
+
+[[workload]]
+name = "mossel-articles"
+
+[[workload]]
+name = "mossel-cart"
+
+[[workload]]
+name = "mossel-user"
+
+[[workload]]
+name = "mossel-index-scroll"
+# The scroll workloads carry their own window in `[scenario]`; it needs to be
+# long enough for the page to settle before the first swipe.
+capture_seconds = 20
+
+[[workload]]
+name = "mossel-sort-scroll"
+capture_seconds = 20
+
+[[workload]]
+name = "mossel-articles-scroll"
+capture_seconds = 20
+
+[[workload]]
+name = "mossel-cart-scroll"
+capture_seconds = 20
+
+[[workload]]
+name = "mossel-user-scroll"
+capture_seconds = 20

@@ -177,6 +177,14 @@ impl OhosTarget {
         Ok(out)
     }
 
+    /// Run one `hdc shell <command>` on the device, for a caller that has a
+    /// command string rather than an argv (a suite leg's `setup`). The string
+    /// reaches the device's shell verbatim.
+    pub fn shell(&self, command: &str) -> Result<String> {
+        let out = self.hdc(&["shell", command])?;
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// Smoke-test the connection: a device must be listed, and `hdc
     /// shell` must work. Called once before iteration starts.
     pub fn preflight(&self) -> Result<()> {
