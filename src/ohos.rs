@@ -180,6 +180,49 @@ impl OhosTarget {
         Ok(out)
     }
 
+    /// The bundle's main-process pid, or `None` when it is not running.
+    fn app_pid(&self) -> Option<u32> {
+        let out = self.hdc(&["shell", "pidof", &self.bundle]).ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .next()
+            .and_then(|p| p.trim().parse().ok())
+    }
+
+    /// Wait briefly for the app to appear after `aa start`.
+    fn wait_for_app_pid(&self) -> Option<u32> {
+        for _ in 0..30 {
+            if let Some(pid) = self.app_pid() {
+                return Some(pid);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        None
+    }
+
+    /// Newest faultlog filename for this bundle, or `None` when there is
+    /// none. Compared before and after an iteration: a change means the
+    /// device wrote a new crash or freeze report for our app, which is a more
+    /// reliable signal than timestamp arithmetic against device-local time.
+    fn newest_faultlog(&self) -> Option<String> {
+        let cmd = format!(
+            "ls -t /data/log/faultlog/faultlogger/ 2>/dev/null | grep {} | head -1",
+            self.bundle
+        );
+        let out = self.hdc(&["shell", &cmd]).ok()?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Copy a faultlog next to the iteration's other artefacts.
+    fn pull_faultlog(&self, name: &str, out_dir: &Path, iter: u32) -> Option<PathBuf> {
+        let device = format!("/data/log/faultlog/faultlogger/{name}");
+        let host = out_dir.join(format!("iter_{iter}.faultlog.txt"));
+        self.hdc(&["file", "recv", &device, &host.to_string_lossy()])
+            .ok()?;
+        Some(host)
+    }
+
     /// Run one `hdc shell <command>` on the device, for a caller that has a
     /// command string rather than an argv (a suite leg's `setup`). The string
     /// reaches the device's shell verbatim.
@@ -459,15 +502,12 @@ impl OhosTarget {
         if let Some(line) = begin_out.lines().find(|l| l.contains("error:")) {
             anyhow::bail!("hitrace --trace_begin refused the capture: {}", line.trim());
         }
-        // An abandoned run must not leave the recording open: the next
-        // `--trace_begin` on this device then fails with `OpenRecording
-        // failed, errorCode(1103)` and nothing says why.
-        let trace_cleanup = {
-            let t = self.clone();
-            crate::cancel::register_cleanup(move || {
-                let _ = t.hdc(&["shell", "hitrace", "--trace_finish", "-o", "/dev/null"]);
-            })
-        };
+        // An open recording must not outlive the iteration by any path — not
+        // an interrupt, not an early return. The next `--trace_begin` on this
+        // device would fail with `OpenRecording failed, errorCode(1103)` and
+        // nothing would say why. The guard closes it on drop; the normal path
+        // disarms it and finishes the trace properly.
+        let mut recording = TraceRecordingGuard::arm(self.clone());
 
         // Thermal snapshot immediately before launch — anchors the
         // per-iteration delta. If the read fails the iteration still
@@ -480,9 +520,14 @@ impl OhosTarget {
             let _ = self.hdc(&["shell", "hilog", "-r"]);
         }
 
+        // Remember the newest crash report so a new one is attributable to
+        // this iteration rather than to a previous run or another app.
+        let faultlog_before = self.newest_faultlog();
+
         let spawn_wall_ns = wall_now_ns();
         self.aa_start(workload, proxy_uri)
             .with_context(|| format!("aa start failed for {}", self.bundle))?;
+        let pid_at_start = self.wait_for_app_pid();
 
         // Hold the capture window open. When `--with-instructions` is on
         // we run a blocking `hiperf record -d <secs>`; otherwise we just
@@ -538,6 +583,27 @@ impl OhosTarget {
             Ok(())
         })?;
 
+        // Did the app survive its own measurement? Nothing above notices a
+        // crash: the window elapses on a timer, hitrace and hiperf keep
+        // recording an empty device, and the iteration would otherwise be
+        // reported as a success whose metrics are merely "missing" — which
+        // quietly drags every median that follows.
+        if let Some(reason) = classify_liveness(pid_at_start, self.app_pid()) {
+            let mut detail = reason;
+            if let Some(name) = self.newest_faultlog() {
+                if Some(&name) != faultlog_before.as_ref() {
+                    match self.pull_faultlog(&name, out_dir, iter) {
+                        Some(path) => {
+                            detail = format!("{detail}; {name} saved to {}", path.display())
+                        }
+                        None => detail = format!("{detail}; see {name} on the device"),
+                    }
+                }
+            }
+            self.force_stop();
+            anyhow::bail!("{detail}");
+        }
+
         // Pull the log before `force_stop`, while the app's lines are still
         // in the buffer.
         let log = workload.scenario.as_ref().and_then(|_| {
@@ -561,9 +627,8 @@ impl OhosTarget {
             "-o",
             &self.trace_path_on_device,
         ];
-        let finish = self.hdc(&stop_args).context("hitrace --trace_finish");
-        crate::cancel::unregister_cleanup(trace_cleanup);
-        finish?;
+        recording.disarm();
+        self.hdc(&stop_args).context("hitrace --trace_finish")?;
         let exit_wall_ns = wall_now_ns();
 
         // Pull the trace text back to the host.
@@ -879,6 +944,61 @@ fn build_step_schedule(steps: &[crate::workload::Step], window: Duration) -> Vec
     }
     schedule.sort_by_key(|(at, _)| *at);
     schedule
+}
+
+/// Did the app survive its own measurement?
+///
+/// A gone pid is a crash or an outside kill; a *changed* pid is the app having
+/// died and been respawned, which reads as success from every other angle
+/// because something with the right name is running at the end.
+fn classify_liveness(before: Option<u32>, after: Option<u32>) -> Option<String> {
+    match (before, after) {
+        (Some(_), None) => Some("the app exited during the capture".to_string()),
+        (Some(before), Some(now)) if before != now => Some(format!(
+            "the app restarted during the capture (pid {before} → {now})"
+        )),
+        (None, _) => Some("the app never started".to_string()),
+        _ => None,
+    }
+}
+
+/// Closes an in-flight hitrace recording if the iteration leaves by any path
+/// other than the normal one — an error return, a panic, or an interrupt.
+///
+/// A leaked recording is not a lost iteration but a lost *run*: every later
+/// `--trace_begin` fails with `OpenRecording failed, errorCode(1103)`, a
+/// message that names neither the cause nor the culprit.
+struct TraceRecordingGuard {
+    target: Option<OhosTarget>,
+    cleanup: u64,
+}
+
+impl TraceRecordingGuard {
+    fn arm(target: OhosTarget) -> Self {
+        let t = target.clone();
+        let cleanup = crate::cancel::register_cleanup(move || {
+            let _ = t.hdc(&["shell", "hitrace", "--trace_finish", "-o", "/dev/null"]);
+        });
+        TraceRecordingGuard {
+            target: Some(target),
+            cleanup,
+        }
+    }
+
+    /// The caller is about to finish the trace itself.
+    fn disarm(&mut self) {
+        crate::cancel::unregister_cleanup(self.cleanup);
+        self.target = None;
+    }
+}
+
+impl Drop for TraceRecordingGuard {
+    fn drop(&mut self) {
+        crate::cancel::unregister_cleanup(self.cleanup);
+        if let Some(t) = self.target.take() {
+            let _ = t.hdc(&["shell", "hitrace", "--trace_finish", "-o", "/dev/null"]);
+        }
+    }
 }
 
 /// Releases the SCREEN wakelock taken by
@@ -1414,6 +1534,21 @@ fn parse_proxy_port(uri: &str) -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn liveness_classification() {
+        assert_eq!(super::classify_liveness(Some(42), Some(42)), None);
+        assert!(super::classify_liveness(Some(42), None)
+            .unwrap()
+            .contains("exited"));
+        // A respawn is the case that would otherwise pass as a clean run.
+        assert!(super::classify_liveness(Some(42), Some(99))
+            .unwrap()
+            .contains("restarted"));
+        assert!(super::classify_liveness(None, Some(1))
+            .unwrap()
+            .contains("never started"));
+    }
+
     /// `--chrome=none` has to arrive as the want parameter the test app
     /// reads (`--chrome`), not as a bare positional or a split pair.
     #[test]
