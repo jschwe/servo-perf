@@ -1,6 +1,7 @@
 // tools/servoperf/src/main.rs
 //! servoperf — Servo startup-performance workflow.
 
+mod cancel;
 mod cli;
 mod cmd;
 mod cpufreq;
@@ -22,6 +23,7 @@ use anyhow::Result;
 use clap::Parser;
 
 fn main() -> Result<()> {
+    cancel::install();
     let args = cli::Cli::parse();
     match args.command {
         cli::Command::Bench(a) => cmd::bench::run(a),

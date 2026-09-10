@@ -120,6 +120,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
         JoinHandle<Result<std::collections::HashMap<String, u64>>>,
     )> = Vec::new();
     for i in 0..w.iterations {
+        if crate::cancel::requested() {
+            eprintln!("bench: cancelled after {i} iteration(s); writing what was collected");
+            break;
+        }
         let timeout = runner::pick_timeout(&successful_wall);
         match runner::run_once(&target, &w, i, &out_dir, proxy_uri.as_deref(), timeout) {
             Ok(art) => {
@@ -250,7 +254,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         .filter(|i| matches!(i.status, IterationStatus::Ok { .. }))
         .count();
     anyhow::ensure!(
-        2 * ok >= iterations.len(),
+        crate::cancel::requested() || 2 * ok >= iterations.len(),
         "more than 50% of iterations failed ({}/{}); aborting",
         iterations.len() - ok,
         iterations.len()

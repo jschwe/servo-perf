@@ -121,7 +121,7 @@ pub fn run(args: AbArgs) -> Result<()> {
             .filter(|i| matches!(i.status, IterationStatus::Ok { .. }))
             .count();
         anyhow::ensure!(
-            2 * ok >= iters.len(),
+            crate::cancel::requested() || 2 * ok >= iters.len(),
             "{label}: more than 50% of iterations failed ({}/{}); aborting",
             iters.len() - ok,
             iters.len()
@@ -202,6 +202,10 @@ fn run_phase(
     let mut fcp = Vec::new();
     let mut lcp = Vec::new();
     for i in 0..w.iterations {
+        if crate::cancel::requested() {
+            eprintln!("{label}: cancelled after {i} iteration(s)");
+            break;
+        }
         let iter_out = out_dir.join(format!("{label}_{i}_cwd"));
         let _ = std::fs::create_dir_all(&iter_out);
         let timeout = runner::pick_timeout(successful_wall);

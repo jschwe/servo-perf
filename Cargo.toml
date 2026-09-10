@@ -63,6 +63,7 @@ cpp_demangle = "0.4"
 addr2line = "0.24"
 rustc-hash = "2"
 gimli = { version = "0.31", default-features = false, features = ["read", "std", "endian-reader"] }
+ctrlc = "3"
 
 [build-dependencies]
 prost-build = { version = "0.13", optional = true }
