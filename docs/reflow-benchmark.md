@@ -302,6 +302,7 @@ half failures aborts.
 | symptom | cause |
 | --- | --- |
 | every `instructions.*` is 0 | symbol file missing or misnamed (step 2) |
+| one `instructions.*` or a group is 0 | the run says which of the two causes it is: `matched no symbol` means the pattern is wrong (rustc renders an inherent method as `<Type>::method` — the `>` is part of the name), while `resolved to a symbol but no sample landed in it` means the phase did not run or was inlined away |
 | `reflow.count` is 0 | engine build emits no spans; `nweb` missing from the tags; or the ring buffer wrapped past the load |
 | `reflow.count` is 1-6 on a real page | capture window too long for the buffer — shorten it |
 | counts look plausible but the engine is wrong | a stale process kept the previous engine; force-stop before switching |
