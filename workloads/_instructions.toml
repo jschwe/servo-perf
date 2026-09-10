@@ -128,7 +128,12 @@ symbol_file = "libarkweb_engine.merged.so"
 # Checked against the staged symbol file's build id before a run: a stale
 # staging resolves every sample against the old layout and reports plausible
 # wrong numbers rather than failing.
-device_library = "/data/storage/el1/bundle/arkwebcore/libs/arm64/libarkweb_engine.so"
+# The installed-bundle path, not the `/data/storage/...` sandbox one: that
+# resolves only inside the app's own mount namespace, so an `hdc shell` cannot
+# read it. The bundle name differs by image (com.ohos.arkwebcore here,
+# com.huawei.hmos.arkwebcore on a HarmonyOS phone) — adjust if the check
+# reports it cannot read the path.
+device_library = "/data/app/el1/bundle/public/com.ohos.arkwebcore/libs/arm64/libarkweb_engine.so"
 functions = [
   "WebFrameWidgetImpl::UpdateLifecycle",
   "LocalFrameView::UpdateAllLifecyclePhases",
