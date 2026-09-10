@@ -123,6 +123,17 @@ side per workload — totals, `reflow.count`, and a `per_reflow` for each
 grouping, with a percentage column when there are exactly two legs. A failing
 cell is reported and the run continues.
 
+Each cell reads `median ±cv (n)`, because a median alone cannot say whether a
+difference between legs is a result. A delta in **bold** exceeds the combined
+standard error of the two legs; one marked *within noise* does not, and
+repeating the campaign will move it. Cells whose spread passes 20% are flagged
+`⚠` and get a note saying what size of difference is resolvable at that `n`, so
+"raise `iterations`" is a judgement about the effect you are chasing rather
+than a guess. Iterations far from their median — Tukey's far-out rule *and* at
+least 25% off, so tight metrics do not raise false alarms — are named
+individually rather than trimmed: an outlier is usually evidence about the run,
+a thermal step or a page served from cache.
+
 servoperf holds a screen wakelock for the whole run — across every cell and
 every engine-switch prompt, since those gaps are exactly when the screen would
 sleep, and a screen-off backgrounds and then *freezes* the app, silently

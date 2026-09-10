@@ -7,6 +7,7 @@
 //! one bad workload does not cost the campaign.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -292,8 +293,8 @@ fn write_comparison(
 ) -> Result<()> {
     use std::fmt::Write as _;
 
-    // Metric -> leg id -> workload -> median across iterations.
-    let mut cells: std::collections::BTreeMap<String, Vec<(String, String, f64)>> =
+    // metric -> (leg, workload) -> the iteration values behind it.
+    let mut cells: std::collections::BTreeMap<String, HashMap<(String, String), Vec<f64>>> =
         Default::default();
     for leg in legs {
         for w in workloads {
@@ -311,32 +312,43 @@ fn write_comparison(
                 continue;
             };
             for cfg in configs.values() {
-                let Some(summary) = cfg.get("summary").and_then(|s| s.as_object()) else {
+                let Some(iters) = cfg.get("iterations").and_then(|i| i.as_array()) else {
                     continue;
                 };
-                for (metric, stats) in summary {
-                    if !is_headline_metric(metric) {
-                        continue;
-                    }
-                    let Some(p50) = stats.get("p50").and_then(|v| v.as_f64()) else {
+                for it in iters {
+                    let Some(metrics) = it
+                        .get("ok")
+                        .and_then(|o| o.get("metrics"))
+                        .and_then(|m| m.as_object())
+                    else {
                         continue;
                     };
-                    cells.entry(metric.clone()).or_default().push((
-                        leg.id.clone(),
-                        w.name.clone(),
-                        p50,
-                    ));
+                    for (metric, value) in metrics {
+                        if !is_headline_metric(metric) {
+                            continue;
+                        }
+                        let Some(v) = value.as_f64() else { continue };
+                        cells
+                            .entry(metric.clone())
+                            .or_default()
+                            .entry((leg.id.clone(), w.name.clone()))
+                            .or_default()
+                            .push(v);
+                    }
                 }
             }
         }
     }
 
     let mut s = String::new();
+    let mut notes: Vec<String> = Vec::new();
     writeln!(s, "# servoperf suite `{}` — comparison\n", suite.name).unwrap();
     writeln!(
         s,
-        "Median across iterations. Instruction counts unless the metric says \
-         otherwise; milestones are milliseconds and `reflow.count` is a count.\n"
+        "Each cell is `median ±cv (n)` across iterations — the spread is there \
+         because a median alone cannot say whether a difference between legs is \
+         a result. Instruction counts unless the metric says otherwise; \
+         milestones are milliseconds and `reflow.count` is a count.\n"
     )
     .unwrap();
     if cells.is_empty() {
@@ -361,22 +373,69 @@ fn write_comparison(
         .unwrap();
         for w in workloads {
             write!(s, "| {} |", w.name).unwrap();
-            let mut values: Vec<Option<f64>> = Vec::new();
+            let mut stats: Vec<Option<crate::stats::Spread>> = Vec::new();
             for leg in legs {
-                let v = rows
-                    .iter()
-                    .find(|(l, wn, _)| l == &leg.id && wn == &w.name)
-                    .map(|(_, _, v)| *v);
-                values.push(v);
-                match v {
-                    Some(v) => write!(s, " {} |", format_metric(metric, v)).unwrap(),
-                    None => write!(s, " — |").unwrap(),
+                let samples = rows.get(&(leg.id.clone(), w.name.clone()));
+                let sp = samples.and_then(|v| crate::stats::spread(v));
+                stats.push(sp);
+                match (&sp, samples) {
+                    (Some(sp), Some(values)) => {
+                        let flag = if sp.cv > 0.20 { " ⚠" } else { "" };
+                        write!(
+                            s,
+                            " {} ±{:.0}%{} (n={}) |",
+                            format_metric(metric, sp.median),
+                            100.0 * sp.cv,
+                            flag,
+                            sp.n
+                        )
+                        .unwrap();
+                        if sp.cv > 0.20 {
+                            notes.push(format!(
+                                "`{}` on {}/{}: spread is {:.0}%, so at n={} only differences \
+                                 above ~{:.0}% can be told from noise — raise `iterations` if \
+                                 the effect you are chasing is smaller than that.",
+                                metric,
+                                leg.id,
+                                w.name,
+                                100.0 * sp.cv,
+                                sp.n,
+                                100.0 * sp.resolvable
+                            ));
+                        }
+                        for i in crate::stats::outliers(values) {
+                            notes.push(format!(
+                                "`{}` on {}/{}: iteration {} is {:.1}x the median — check its \
+                                 thermals, whether the page came from cache, and the run's \
+                                 failed-iteration count.",
+                                metric,
+                                leg.id,
+                                w.name,
+                                i,
+                                if sp.median != 0.0 {
+                                    values[i] / sp.median
+                                } else {
+                                    0.0
+                                }
+                            ));
+                        }
+                    }
+                    _ => write!(s, " — |").unwrap(),
                 }
             }
             if legs.len() == 2 {
-                match (values[0], values[1]) {
-                    (Some(a), Some(b)) if a > 0.0 => {
-                        write!(s, " {:+.1}% |", 100.0 * (b - a) / a).unwrap()
+                match (stats[0], stats[1]) {
+                    (Some(a), Some(b)) if a.mean != 0.0 => {
+                        let delta = 100.0 * (b.mean - a.mean) / a.mean;
+                        // Two standard errors on each side, combined: below
+                        // this the two legs are not distinguishable at this n.
+                        let noise =
+                            100.0 * 2.0 * (a.sem.powi(2) + b.sem.powi(2)).sqrt() / a.mean.abs();
+                        if delta.abs() < noise {
+                            write!(s, " {delta:+.1}% (within noise, ±{noise:.1}%) |").unwrap();
+                        } else {
+                            write!(s, " **{delta:+.1}%** |").unwrap();
+                        }
                     }
                     _ => write!(s, " — |").unwrap(),
                 }
@@ -386,14 +445,26 @@ fn write_comparison(
         writeln!(s).unwrap();
     }
 
+    if !notes.is_empty() {
+        writeln!(s, "## Notes\n").unwrap();
+        notes.sort();
+        notes.dedup();
+        for n in &notes {
+            writeln!(s, "- {n}").unwrap();
+        }
+        writeln!(s).unwrap();
+    }
+
     writeln!(
         s,
-        "Read `instructions.per_reflow.*` in preference to the totals: numerator \
-         and denominator co-vary, so the ratio cancels most of the load-to-load \
-         variance that makes the totals swing. Compare `layout_proper` against \
-         `layout_proper` — the groupings are defined per engine in \
-         `workloads/_instructions.toml` so that they mean the same phase on both \
-         sides."
+        "A delta in **bold** is larger than the combined standard error of the two \
+         legs; one marked *within noise* is not, and repeating the campaign will \
+         move it. Read `instructions.per_reflow.*` in preference to the totals: \
+         numerator and denominator co-vary, so the ratio cancels most of the \
+         load-to-load variance that makes the totals swing. Compare \
+         `layout_proper` against `layout_proper` — the groupings are defined per \
+         engine in `workloads/_instructions.toml` so that they mean the same \
+         phase on both sides."
     )
     .unwrap();
 
