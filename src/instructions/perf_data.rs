@@ -303,6 +303,23 @@ fn explain_zeros(
     }
 }
 
+/// Collapse `>::` to `::` so a pattern matches under either name-mangling
+/// scheme.
+///
+/// rustc demangles an *inherent* method as `Type::method` under the legacy
+/// scheme and `<Type>::method` under v0, and the two forms are mutually
+/// exclusive as substrings — a pattern written against one silently reports
+/// zero against the other. Trait-impl methods (`<A as B>::m`) render the same
+/// either way and keep matching, since the raw form is tried too.
+fn normalize_symbol(name: &str) -> String {
+    name.replace(">::", "::")
+}
+
+/// Does `name` contain `pattern`, under either mangling?
+fn name_matches(name: &str, pattern: &str, normalized_pattern: &str) -> bool {
+    name.contains(pattern) || normalize_symbol(name).contains(normalized_pattern)
+}
+
 /// Pull the basename out of an mmap path. The path field is null-terminated
 /// in the wire format but we work with the raw byte slice — easier than
 /// hauling around a string.
@@ -370,7 +387,10 @@ impl SymbolIndex {
     /// renders inherent methods in), and a symbol that exists but never had a
     /// sample land in it.
     fn matches_any(&self, pattern: &str) -> bool {
-        self.entries.iter().any(|e| e.name.contains(pattern))
+        let normalized = normalize_symbol(pattern);
+        self.entries
+            .iter()
+            .any(|e| name_matches(&e.name, pattern, &normalized))
     }
 
     /// Build a file-offset → demangled-name lookup table.
@@ -513,6 +533,35 @@ fn demangle_name(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The same pattern has to work whichever mangling the build used: rustc
+    /// renders an inherent method as `Type::method` (legacy) or
+    /// `<Type>::method` (v0), and the two are mutually exclusive as
+    /// substrings.
+    #[test]
+    fn patterns_match_under_either_mangling() {
+        let v0 = "<script::dom::window::window::Window>::reflow";
+        let legacy = "script::dom::window::window::Window::reflow";
+        for pattern in ["Window>::reflow", "Window::reflow"] {
+            let n = super::normalize_symbol(pattern);
+            assert!(super::name_matches(v0, pattern, &n), "v0 vs {pattern}");
+            assert!(
+                super::name_matches(legacy, pattern, &n),
+                "legacy vs {pattern}"
+            );
+        }
+        // A trait impl renders the same either way and must still match.
+        let trait_impl = "<layout::layout_impl::LayoutThread as layout_api::Layout>::reflow";
+        let n = super::normalize_symbol("Layout>::reflow");
+        assert!(super::name_matches(trait_impl, "Layout>::reflow", &n));
+        // And an unrelated symbol still must not.
+        let n = super::normalize_symbol("Window::reflow");
+        assert!(!super::name_matches(
+            "<script::dom::window::window::Window>::handle_pending_images",
+            "Window::reflow",
+            &n
+        ));
+    }
+
     #[test]
     fn symbol_presence_separates_a_typo_from_a_cold_symbol() {
         let idx = super::SymbolIndex {
@@ -522,11 +571,12 @@ mod tests {
                 name: "<layout::layout_impl::LayoutThread>::handle_reflow".into(),
             }],
         };
-        // The form rustc actually emits.
+        // Either mangling of the same method resolves.
         assert!(idx.matches_any("LayoutThread>::handle_reflow"));
-        // The form that looks right and matches nothing — the `>` is part of
-        // an inherent method's demangled name.
-        assert!(!idx.matches_any("LayoutThread::handle_reflow"));
+        assert!(idx.matches_any("LayoutThread::handle_reflow"));
+        // A pattern for something that is not there does not, which is what
+        // lets a zero be reported as "not found" rather than "not run".
+        assert!(!idx.matches_any("LayoutThread>::build_display_list"));
     }
 
     /// The test binary itself is built with debug info, so it doubles as a
@@ -841,10 +891,11 @@ impl MatchCache {
             scratch_match.funcs.clear();
             scratch_match.groups.clear();
             for name in scratch_names.iter() {
+                let normalized_name = normalize_symbol(name);
                 // One frame credits at most one function pattern — the first
                 // that matches — mirroring the symbol-table path.
                 for (i, t) in engine.functions.iter().enumerate() {
-                    if name.contains(t.as_str()) {
+                    if name.contains(t.as_str()) || normalized_name.contains(&normalize_symbol(t)) {
                         let i = i as u16;
                         if !scratch_match.funcs.contains(&i) {
                             scratch_match.funcs.push(i);
@@ -857,7 +908,9 @@ impl MatchCache {
                     if scratch_match.groups.contains(&g) {
                         continue;
                     }
-                    if group.functions.iter().any(|f| name.contains(f.as_str())) {
+                    if group.functions.iter().any(|f| {
+                        name.contains(f.as_str()) || normalized_name.contains(&normalize_symbol(f))
+                    }) {
                         scratch_match.groups.push(g);
                     }
                 }
