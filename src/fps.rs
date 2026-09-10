@@ -377,18 +377,36 @@ pub fn merge_scenario_metrics(
     // Per-thread CPU cost, normalized by the frames those threads produced.
     // Uses the raw frame count rather than the active one: the CPU counters
     // span the whole window, idle time included.
+    //
+    // Skipped without a frame count: dividing by zero frames produced a full
+    // table of `thread_cpu_ms_per_frame.* = 0.0`, which in a two-leg run sits
+    // beside the other leg's real numbers and reads as a thread that costs
+    // nothing rather than a surface name that was wrong.
     if let Some((before, after)) = thread_cpu {
         let frames = metrics.get("presented.frames").copied().unwrap_or(0.0);
-        let costs = crate::threads::costs(
-            &crate::threads::parse_sample(before),
-            &crate::threads::parse_sample(after),
-            frames,
-        );
-        for cost in costs.iter().take(THREAD_CPU_ROWS) {
-            metrics.insert(
-                format!("thread_cpu_ms_per_frame.{}", cost.name),
-                cost.cpu_ms_per_frame,
+        if frames <= 0.0 {
+            eprintln!(
+                "warning: no presented frames, so per-frame thread CPU is not reported for \
+                 {:?} — the surface name is the usual cause",
+                workload.name
             );
+            return;
+        }
+        let before_sample = crate::threads::parse_sample(before);
+        // Under `thread_cpu_from_start` the opening sample is a wall-clock
+        // reading with no thread rows, so every lookup misses and the "delta"
+        // is the whole absolute counter. Report that under names that say so
+        // rather than under per-frame ones that would be a lie.
+        let from_start = crate::threads::is_wall_clock_only(&before_sample);
+        let costs =
+            crate::threads::costs(&before_sample, &crate::threads::parse_sample(after), frames);
+        let prefix = if from_start {
+            "thread_cpu_ms_since_start_per_frame"
+        } else {
+            "thread_cpu_ms_per_frame"
+        };
+        for cost in costs.iter().take(THREAD_CPU_ROWS) {
+            metrics.insert(format!("{prefix}.{}", cost.name), cost.cpu_ms_per_frame);
             // Without the thread count the per-frame figure is ambiguous:
             // 20 ms on one thread is a hard serial floor on frame time, while
             // 20 ms across four is 5 ms of wall clock.
@@ -396,7 +414,7 @@ pub fn merge_scenario_metrics(
             metrics.insert(format!("thread_core_pct.{}", cost.name), cost.core_pct);
         }
         let total: f64 = costs.iter().map(|c| c.cpu_ms_per_frame).sum();
-        metrics.insert("thread_cpu_ms_per_frame.total".to_string(), total);
+        metrics.insert(format!("{prefix}.total"), total);
 
         // Same threads, counted from process start. Page-load workloads spend
         // most of their CPU before the opening sample can be taken, so the
