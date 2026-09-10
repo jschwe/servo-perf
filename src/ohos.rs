@@ -1331,6 +1331,33 @@ fn parse_proxy_port(uri: &str) -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
+    /// `--chrome=none` has to arrive as the want parameter the test app
+    /// reads (`--chrome`), not as a bare positional or a split pair.
+    #[test]
+    fn chrome_flag_survives_the_aa_start_encoding() {
+        let mut w = crate::workload::Workload {
+            name: "w".into(),
+            url: "https://example.com/".into(),
+            tracing_filter: "info".into(),
+            iterations: 1,
+            user_agent: None,
+            viewport: None,
+            device_pixel_ratio: None,
+            servoshell_args: vec!["--ignore-certificate-errors".into(), "--chrome=none".into()],
+            fixture: None,
+            scenario: None,
+            steps: vec![],
+        };
+        let args = super::workload_args_to_aa_params(&w, None, &[]);
+        assert!(
+            args.iter().any(|a| a == "--psn=--chrome=none"),
+            "expected --psn=--chrome=none, got {args:?}"
+        );
+        w.servoshell_args.clear();
+        let args = super::workload_args_to_aa_params(&w, None, &[]);
+        assert!(!args.iter().any(|a| a.contains("chrome")));
+    }
+
     #[test]
     fn parses_hiperf_summary_counts() {
         let out = "[ hiperf record: Captured 32.4 MB perf data. ]\n\
