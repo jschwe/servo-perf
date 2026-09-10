@@ -125,17 +125,41 @@ fn prepare_leg(leg: &Leg, args: &SuiteArgs, suite: &Suite) -> Result<()> {
         }
         None => {
             eprint!(
-                "suite: switch the device to the {} engine ({}), then press Enter: ",
+                "suite: switch the device to the {} engine ({}), then press Enter \
+                 (Ctrl-C to stop): ",
                 leg.id, leg.engine
             );
             std::io::stderr().flush().ok();
-            let mut line = String::new();
-            std::io::stdin()
-                .read_line(&mut line)
-                .context("reading confirmation from stdin")?;
+            wait_for_enter_or_cancel();
         }
     }
     Ok(())
+}
+
+/// Block until the operator presses Enter, or until a stop is asked for.
+///
+/// A plain `read_line` would swallow the interrupt: the signal handler sets the
+/// flag but nothing reads it until Enter arrives, so Ctrl-C at the prompt looks
+/// like a hang. Reading on a side thread lets the wait notice the flag instead —
+/// and there is nothing to wind down at this point, the leg has not started.
+fn wait_for_enter_or_cancel() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::stdin().read_line(&mut line);
+        // The receiver is gone if we were cancelled; that is not an error.
+        let _ = tx.send(());
+    });
+    loop {
+        if crate::cancel::requested() {
+            eprintln!();
+            return;
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 /// Layer the suite's settings over the command line's device flags. Anything
@@ -211,6 +235,17 @@ fn now_stamp() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The prompt must notice a cancellation without an Enter to unblock it,
+    /// or Ctrl-C at the engine switch looks like a hang.
+    #[test]
+    fn the_engine_prompt_returns_when_cancelled() {
+        crate::cancel::request();
+        let t = std::time::Instant::now();
+        super::wait_for_enter_or_cancel();
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        crate::cancel::clear_for_test();
+    }
+
     #[test]
     fn metrics_render_in_their_own_units() {
         assert_eq!(
