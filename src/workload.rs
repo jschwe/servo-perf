@@ -21,6 +21,27 @@ pub struct Workload {
     /// Present for workloads measured over a render window rather than by a
     /// page-load milestone. See [`Scenario`].
     pub scenario: Option<Scenario>,
+    /// Device-side actions injected into the capture window. See [`Step`].
+    #[serde(default)]
+    pub steps: Vec<Step>,
+}
+
+/// One device-side action executed inside the capture window, so a workload
+/// can measure the app *doing* something rather than only loading.
+///
+/// The command runs as `hdc shell <run>`; `uitest uiInput` is the OHOS-native
+/// event injector and needs no cooperation from the app under test.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Step {
+    /// Milliseconds after `aa start` at which to run the command. Steps
+    /// scheduled past the end of the capture window are skipped with a
+    /// warning rather than silently dropped.
+    pub after_ms: u64,
+    /// Repeat every `every_ms` until the window ends. Omit to run once.
+    #[serde(default)]
+    pub every_ms: Option<u64>,
+    /// Shell command, e.g. `uitest uiInput swipe 540 2200 540 600 600`.
+    pub run: String,
 }
 
 /// A workload that is measured while it renders, not while it loads.
@@ -64,6 +85,13 @@ pub struct Scenario {
     /// thread a frame is waiting on.
     #[serde(default)]
     pub thread_cpu: bool,
+    /// Count CPU from process start instead of across the window, and skip the
+    /// opening `/proc` walk. Set this for cold-start page loads: the work being
+    /// measured happens before an opening sample could be taken anyway, and
+    /// walking ~100 `/proc/<pid>/task/*` entries while the page is loading
+    /// costs enough device CPU to more than double the measured first paint.
+    #[serde(default)]
+    pub thread_cpu_from_start: bool,
 }
 
 fn default_refresh_hz() -> f64 {

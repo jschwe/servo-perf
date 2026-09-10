@@ -19,7 +19,15 @@
 //!    `target/.../release/libservoshell.so` whose BuildID matches the
 //!    installed bundle). Iterate `.symtab`, keep `STT_FUNC` symbols, store
 //!    each as a `(virt_start, virt_end, demangled_name)` triple sorted by
-//!    `virt_start` for binary search.
+//!    `virt_start` for binary search. When the library also carries
+//!    `.debug_info`, an addr2line context is built alongside it so an address
+//!    resolves to the whole inline chain rather than to whichever function
+//!    the compiler folded the code into — without it an inlined boundary
+//!    reports **0**, which reads as "this phase is free" rather than "this
+//!    measurement is blind". Build the library with `debug = 1`: that is the
+//!    cheapest level carrying `DW_AT_linkage_name`, so inline frames demangle
+//!    to the same `<Type>::method` form the symbol-table path produces and
+//!    existing patterns keep matching.
 //! 2. Stream the perf.data once, accumulating two pieces of state:
 //!    - per-PID interval list of `MMAP2` mappings (address range +
 //!      page-offset + path basename) so an IP can be resolved to a
@@ -63,8 +71,12 @@ pub fn aggregate_inclusive_from_perf_data(
     engine: &EngineConfig,
     workloads_dir: &Path,
 ) -> Result<HashMap<String, u64>> {
-    let mut totals: HashMap<String, u64> =
-        engine.functions.iter().map(|t| (t.clone(), 0u64)).collect();
+    let mut totals: HashMap<String, u64> = engine
+        .functions
+        .iter()
+        .map(|t| (t.clone(), 0u64))
+        .chain(engine.groups.iter().map(|g| (g.name.clone(), 0u64)))
+        .collect();
 
     if engine.symbol_file.is_empty() {
         // Caller's already warned about this; produce empty results so the
@@ -73,12 +85,23 @@ pub fn aggregate_inclusive_from_perf_data(
     }
 
     let sym_path = workloads_dir.join(&engine.symbol_file);
-    let symbols = SymbolIndex::load(&sym_path)
+    let symbolizer = Symbolizer::load(&sym_path)
         .with_context(|| format!("loading symbols from {}", sym_path.display()))?;
     // The DSO basename hiperf records under MMAP2's path field (e.g.
     // "libarkweb_engine.so" or "libservoshell.so"). Pre-compute the symbol
     // file's basename for the same comparison.
     let symbol_basename = sym_basename_from_path(&engine.symbol_file);
+    if symbolizer.has_inline_info() {
+        eprintln!(
+            "instructions: {} carries DWARF; inlined functions are attributed",
+            sym_path.display()
+        );
+    }
+    // Reused across samples so the hot loop allocates nothing.
+    let mut cache = MatchCache::new();
+    let mut scratch_names: Vec<String> = Vec::new();
+    let mut scratch_match = AddressMatch::default();
+    let mut frame_ips: Vec<u64> = Vec::with_capacity(64);
 
     let file = File::open(perf_data_path)
         .with_context(|| format!("opening {}", perf_data_path.display()))?;
@@ -136,47 +159,23 @@ pub fn aggregate_inclusive_from_perf_data(
                             continue;
                         };
 
-                        // The sample's IP is the leaf frame; the callchain is
-                        // a list of caller IPs above it. We process the IP +
-                        // every callchain entry as a single set of frames.
-                        // Match each frame against the target list once.
+                        // The sample's IP is the leaf frame; the callchain
+                        // is a list of caller IPs above it. Every frame — and,
+                        // where DWARF is available, every function inlined
+                        // into it — is matched against the target list, each
+                        // target credited at most once per sample so recursion
+                        // cannot run the count away.
                         let mut matched_for_this_sample: Vec<bool> =
                             vec![false; engine.functions.len()];
+                        // Groups are credited independently of the per-symbol
+                        // targets, and once per sample: a chain containing two
+                        // members of the same group counts once, so nesting
+                        // does not double-count.
+                        let mut matched_groups: Vec<bool> = vec![false; engine.groups.len()];
 
-                        let mut process_ip =
-                            |ip: u64,
-                             symbols: &SymbolIndex,
-                             mappings: &[Mapping],
-                             matched: &mut [bool]| {
-                                let Some(mapping) = find_mapping(mappings, ip) else {
-                                    return;
-                                };
-                                if mapping.basename != symbol_basename {
-                                    return;
-                                }
-                                let file_offset = ip - mapping.start + mapping.page_offset;
-                                let Some(name) = symbols.lookup(file_offset) else {
-                                    return;
-                                };
-                                for (i, t) in engine.functions.iter().enumerate() {
-                                    if matched[i] {
-                                        // Already credited this sample for this target —
-                                        // matches the dedup semantics noted in module
-                                        // docs (avoid runaway counts on recursion).
-                                        continue;
-                                    }
-                                    if name.contains(t.as_str()) {
-                                        if let Some(slot) = totals.get_mut(t) {
-                                            *slot += period;
-                                        }
-                                        matched[i] = true;
-                                        break;
-                                    }
-                                }
-                            };
-
+                        frame_ips.clear();
                         if let Some(ip) = s.ip {
-                            process_ip(ip, &symbols, mappings, &mut matched_for_this_sample);
+                            frame_ips.push(ip);
                         }
                         if let Some(chain) = s.callchain {
                             for idx in 0..chain.len() {
@@ -188,7 +187,44 @@ pub fn aggregate_inclusive_from_perf_data(
                                 if ip >= 0xffff_ffff_ffff_ff00 {
                                     continue;
                                 }
-                                process_ip(ip, &symbols, mappings, &mut matched_for_this_sample);
+                                frame_ips.push(ip);
+                            }
+                        }
+
+                        for &ip in frame_ips.iter() {
+                            let Some(mapping) = find_mapping(mappings, ip) else {
+                                continue;
+                            };
+                            if mapping.basename != symbol_basename {
+                                continue;
+                            }
+                            let file_offset = ip - mapping.start + mapping.page_offset;
+                            let hit = cache.get(
+                                file_offset,
+                                &symbolizer,
+                                engine,
+                                &mut scratch_names,
+                                &mut scratch_match,
+                            );
+                            for &i in &hit.funcs {
+                                let i = i as usize;
+                                if matched_for_this_sample[i] {
+                                    continue;
+                                }
+                                if let Some(slot) = totals.get_mut(&engine.functions[i]) {
+                                    *slot += period;
+                                }
+                                matched_for_this_sample[i] = true;
+                            }
+                            for &g in &hit.groups {
+                                let g = g as usize;
+                                if matched_groups[g] {
+                                    continue;
+                                }
+                                if let Some(slot) = totals.get_mut(&engine.groups[g].name) {
+                                    *slot += period;
+                                }
+                                matched_groups[g] = true;
                             }
                         }
                     }
@@ -335,6 +371,33 @@ impl SymbolIndex {
         Ok(SymbolIndex { entries })
     }
 
+    /// File-offset → vaddr map, the inverse of the rewrite [`Self::load`]
+    /// performs. DWARF is addressed in vaddr space, so an inline lookup has
+    /// to undo the translation the symtab path bakes in.
+    fn offset_to_vaddr_map(elf: &object::File) -> Vec<(u64, u64, i64)> {
+        let mut map: Vec<(u64, u64, i64)> = Vec::new();
+        for section in elf.sections() {
+            let Some((file_off, file_size)) = section.file_range() else {
+                continue;
+            };
+            if file_size == 0 {
+                continue;
+            }
+            let vaddr = section.address();
+            if vaddr == 0 {
+                // Not mapped at runtime (debug sections); no IP lands here.
+                continue;
+            }
+            map.push((
+                file_off,
+                file_off + file_size,
+                vaddr as i64 - file_off as i64,
+            ));
+        }
+        map.sort_by_key(|s| s.0);
+        map
+    }
+
     /// Return the demangled name covering `offset`, or `None` when no
     /// symbol covers it (function body in a section with no symbol, or
     /// an address outside the library's text).
@@ -375,6 +438,57 @@ fn demangle_name(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The test binary itself is built with debug info, so it doubles as a
+    /// DWARF fixture: some address in it must expand to more than one frame,
+    /// or inline attribution is silently not working.
+    #[test]
+    fn dwarf_symbolizer_expands_inline_frames() {
+        let exe = std::env::current_exe().unwrap();
+        let sym = match super::Symbolizer::load(&exe) {
+            Ok(s) => s,
+            Err(_) => return, // stripped build; nothing to assert
+        };
+        if !sym.has_inline_info() {
+            return;
+        }
+        let len = std::fs::metadata(&exe).unwrap().len();
+        let mut names = Vec::new();
+        let mut deepest = 0usize;
+        let mut single = 0usize;
+        let step = (len / 20_000).max(4);
+        for off in (0..len).step_by(step as usize) {
+            sym.names_at(off, &mut names);
+            deepest = deepest.max(names.len());
+            if names.len() == 1 {
+                single += 1;
+            }
+            if deepest >= 2 && single > 0 {
+                break;
+            }
+        }
+        assert!(
+            deepest >= 2,
+            "no address expanded to an inline chain — inline attribution is not working"
+        );
+        assert!(
+            single > 0,
+            "expected some addresses to resolve to one frame"
+        );
+    }
+
+    #[test]
+    fn file_offsets_map_back_to_vaddrs() {
+        // .text at file 0x1000 mapped to vaddr 0x2000, plus a section mapped 1:1.
+        let map = [(0x1000u64, 0x2000u64, 0x1000i64), (0x9000, 0xa000, 0)];
+        assert_eq!(super::vaddr_for(&map, 0x1000), Some(0x2000));
+        assert_eq!(super::vaddr_for(&map, 0x1fff), Some(0x2fff));
+        assert_eq!(super::vaddr_for(&map, 0x9500), Some(0x9500));
+        // Before the first section, between two, and past the end: unmapped.
+        assert_eq!(super::vaddr_for(&map, 0x0100), None);
+        assert_eq!(super::vaddr_for(&map, 0x5000), None);
+        assert_eq!(super::vaddr_for(&map, 0xffff), None);
+    }
+
     use super::*;
 
     #[test]
@@ -452,5 +566,226 @@ mod tests {
         assert_eq!(idx.lookup(0x0fff), None);
         // Above last.
         assert_eq!(idx.lookup(0x1500), None);
+    }
+}
+
+/// Resolves a file offset in the engine library to the names of every
+/// function active at that address — the containing function plus, when the
+/// library carries DWARF, the chain of functions inlined into it.
+///
+/// Without inline information an inlined boundary resolves to whichever
+/// function it was folded into, so its own metric reports **0**. A zero reads
+/// as "this phase is free" rather than "this measurement is blind", which is
+/// the failure this type exists to remove.
+struct Symbolizer {
+    symtab: SymbolIndex,
+    dwarf: Option<DwarfIndex>,
+}
+
+struct DwarfIndex {
+    ctx: addr2line::Context<gimli::EndianArcSlice<gimli::RunTimeEndian>>,
+    /// `(file_off_start, file_off_end, vaddr - file_off)`, sorted by start.
+    offset_to_vaddr: Vec<(u64, u64, i64)>,
+}
+
+impl Symbolizer {
+    fn load(elf_path: &Path) -> Result<Self> {
+        let symtab = SymbolIndex::load(elf_path)?;
+        let bytes =
+            std::fs::read(elf_path).with_context(|| format!("reading {}", elf_path.display()))?;
+        let elf = object::File::parse(bytes.as_slice())
+            .with_context(|| format!("parsing ELF {}", elf_path.display()))?;
+        let has_debug_info = elf.section_by_name(".debug_info").is_some();
+        let dwarf = if has_debug_info {
+            match load_dwarf_context(&elf) {
+                Ok(ctx) => Some(DwarfIndex {
+                    ctx,
+                    offset_to_vaddr: SymbolIndex::offset_to_vaddr_map(&elf),
+                }),
+                Err(e) => {
+                    eprintln!(
+                        "warning: {} has .debug_info but it could not be read ({e}); \
+                         falling back to symbol-table lookups, so inlined functions \
+                         will report 0",
+                        elf_path.display()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Symbolizer { symtab, dwarf })
+    }
+
+    /// True when inline expansion is available.
+    fn has_inline_info(&self) -> bool {
+        self.dwarf.is_some()
+    }
+
+    /// Append every function name active at `file_offset` to `out`,
+    /// innermost inlined frame first. Falls back to the symbol table when
+    /// DWARF is absent or covers no frame at this address (the two disagree
+    /// at, for instance, PLT stubs).
+    fn names_at(&self, file_offset: u64, out: &mut Vec<String>) {
+        out.clear();
+        if let Some(d) = &self.dwarf {
+            if let Some(vaddr) = d.vaddr_for(file_offset) {
+                if let Ok(mut frames) = d.ctx.find_frames(vaddr).skip_all_loads() {
+                    while let Ok(Some(frame)) = frames.next() {
+                        if let Some(f) = frame.function {
+                            if let Ok(name) = f.demangle() {
+                                out.push(name.into_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            if let Some(name) = self.symtab.lookup(file_offset) {
+                out.push(name.to_string());
+            }
+        }
+    }
+}
+
+/// Build an addr2line context over owning readers, so it outlives the parsed
+/// `object::File` the section bytes came from.
+fn load_dwarf_context(
+    elf: &object::File,
+) -> Result<addr2line::Context<gimli::EndianArcSlice<gimli::RunTimeEndian>>> {
+    let endian = if elf.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+    let load = |id: gimli::SectionId| -> Result<gimli::EndianArcSlice<gimli::RunTimeEndian>> {
+        let data = match elf.section_by_name(id.name()) {
+            Some(section) => section.uncompressed_data()?.into_owned(),
+            None => Vec::new(),
+        };
+        Ok(gimli::EndianArcSlice::new(data.into(), endian))
+    };
+    let dwarf = gimli::Dwarf::load(load)?;
+    Ok(addr2line::Context::from_dwarf(dwarf)?)
+}
+
+impl DwarfIndex {
+    fn vaddr_for(&self, file_offset: u64) -> Option<u64> {
+        vaddr_for(&self.offset_to_vaddr, file_offset)
+    }
+}
+
+/// Translate a file offset into the vaddr DWARF is addressed by, using the
+/// `(start, end, vaddr - offset)` map built from the section headers.
+/// `None` for an offset in no mapped section — a debug section, or padding.
+fn vaddr_for(map: &[(u64, u64, i64)], file_offset: u64) -> Option<u64> {
+    let idx = map.partition_point(|s| s.0 <= file_offset);
+    if idx == 0 {
+        return None;
+    }
+    let (_, end, delta) = map[idx - 1];
+    if file_offset >= end {
+        return None;
+    }
+    Some((file_offset as i64 + delta) as u64)
+}
+
+/// Which configured patterns an address matches, cached per address.
+///
+/// Resolving a DWARF inline chain is orders of magnitude slower than a binary
+/// search over a symbol table, and a capture repeats the same hot addresses
+/// across hundreds of thousands of samples — so the cache is what makes the
+/// inline path affordable rather than an optimisation.
+#[derive(Default, Clone)]
+struct AddressMatch {
+    /// Indices into `engine.functions`, deduplicated, in frame order.
+    funcs: Vec<u16>,
+    /// Indices into `engine.groups`, deduplicated.
+    groups: Vec<u16>,
+}
+
+/// Bytes an [`AddressMatch`] entry costs in the map, near enough for
+/// budgeting: 8 for the key, two `Vec` headers, and slot overhead. Entries
+/// that actually match allocate on top, but those are a small minority.
+const CACHE_ENTRY_BYTES: usize = 96;
+
+/// Cap on the address cache. Generous, because overshooting costs the host
+/// RSS while a too-small cache costs analysis time on every iteration.
+const MAX_CACHE_BYTES: usize = 1 << 30;
+
+struct MatchCache {
+    map: rustc_hash::FxHashMap<u64, AddressMatch>,
+    max_entries: usize,
+    /// Set once the cap is hit, so the warning is printed at most once.
+    warned: bool,
+}
+
+impl MatchCache {
+    fn new() -> Self {
+        MatchCache {
+            map: rustc_hash::FxHashMap::default(),
+            max_entries: MAX_CACHE_BYTES / CACHE_ENTRY_BYTES,
+            warned: false,
+        }
+    }
+
+    /// Resolve `file_offset` against the engine's patterns, memoised.
+    ///
+    /// At the cap the map is emptied and refilled rather than evicted
+    /// entry-by-entry: an LRU would cost more per lookup than it saves, and
+    /// the working set of hot addresses re-warms in a few thousand samples.
+    /// Results are unaffected either way — only speed is.
+    fn get<'a>(
+        &'a mut self,
+        file_offset: u64,
+        symbolizer: &Symbolizer,
+        engine: &EngineConfig,
+        scratch_names: &mut Vec<String>,
+        scratch_match: &mut AddressMatch,
+    ) -> &'a AddressMatch {
+        if !self.map.contains_key(&file_offset) {
+            symbolizer.names_at(file_offset, scratch_names);
+            scratch_match.funcs.clear();
+            scratch_match.groups.clear();
+            for name in scratch_names.iter() {
+                // One frame credits at most one function pattern — the first
+                // that matches — mirroring the symbol-table path.
+                for (i, t) in engine.functions.iter().enumerate() {
+                    if name.contains(t.as_str()) {
+                        let i = i as u16;
+                        if !scratch_match.funcs.contains(&i) {
+                            scratch_match.funcs.push(i);
+                        }
+                        break;
+                    }
+                }
+                for (g, group) in engine.groups.iter().enumerate() {
+                    let g = g as u16;
+                    if scratch_match.groups.contains(&g) {
+                        continue;
+                    }
+                    if group.functions.iter().any(|f| name.contains(f.as_str())) {
+                        scratch_match.groups.push(g);
+                    }
+                }
+            }
+            if self.map.len() < self.max_entries {
+                self.map.insert(file_offset, scratch_match.clone());
+            } else {
+                if !self.warned {
+                    eprintln!(
+                        "warning: symbolization cache hit its {} MiB cap and was reset; \
+                         analysis will be slower",
+                        MAX_CACHE_BYTES / (1 << 20)
+                    );
+                    self.warned = true;
+                }
+                self.map.clear();
+                self.map.insert(file_offset, scratch_match.clone());
+            }
+        }
+        &self.map[&file_offset]
     }
 }

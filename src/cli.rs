@@ -83,8 +83,15 @@ pub struct OhosArgs {
     #[arg(long)]
     pub hdc_server: Option<String>,
     /// `hdc` binary to invoke (must match the device's hdc version).
+    /// On Windows this is `hdc.exe` from the command-line tools; put its
+    /// directory on `PATH` or pass the full path here.
     #[arg(long, default_value = "hdc")]
     pub hdc_bin: String,
+    /// Device serial, threaded through as `hdc -t <serial>`. Required when
+    /// more than one device is attached; with a single device it can be
+    /// omitted. `hdc list targets` prints the serials.
+    #[arg(long)]
+    pub hdc_target: Option<String>,
     /// Bundle name to launch.
     #[arg(long, default_value = "org.servo.servo")]
     pub ohos_bundle: String,
@@ -94,12 +101,22 @@ pub struct OhosArgs {
     /// Where on the device the captured hitrace text is written.
     #[arg(long, default_value = "/data/local/tmp/servoperf_hitrace.txt")]
     pub ohos_trace_path: String,
-    /// Hitrace ring buffer in KiB.
+    /// Hitrace ring buffer in KiB. The buffer is a *ring*: once it fills,
+    /// `--overwrite` discards the oldest records, which for a page-load
+    /// capture means losing the load burst — so a suspiciously low
+    /// `reflow.count` usually means the window was too long for the buffer,
+    /// not that the engine laid out less. Devices cap this: hitrace accepts
+    /// 256 KiB - 300 MB and DAYU200 enforces the upper end, rejecting this
+    /// default (`--trace_begin` then fails with hitrace's own message).
     #[arg(long, default_value_t = 524_288)]
     pub ohos_trace_buffer_kib: u64,
     /// Comma-separated hitrace tag list (passed as positional args to
-    /// `hitrace`). The default mirrors the servo CI bencher.
-    #[arg(long, default_value = "app,graphic,ohos,freq,idle,memory")]
+    /// `hitrace`). The default mirrors the servo CI bencher, plus `nweb`:
+    /// ArkWeb's Blink trace events (`LocalFrameView::performLayout`,
+    /// `UpdateLayoutTree`, …) are emitted under that tag and are the
+    /// source of `reflow.count` — measured on PLR-AL00, dropping `nweb`
+    /// yields zero Blink markers.
+    #[arg(long, default_value = "app,graphic,ohos,freq,idle,memory,nweb")]
     pub ohos_trace_tags: String,
     /// Seconds to sleep after `aa start` before stopping the trace.
     /// Should comfortably exceed the workload's expected first-paint
@@ -157,6 +174,14 @@ pub struct OhosArgs {
     /// can resolve symbols in `libarkweb_engine.so`.
     #[arg(long)]
     pub with_instructions: bool,
+    /// Force which `_instructions.toml` engine entry to use, by `id`,
+    /// instead of resolving it from `--ohos-bundle`. Needed when one bundle
+    /// can run more than one engine — the arkweb test app renders with the
+    /// system ArkWeb engine or with Servo depending on a device system
+    /// parameter, and the two need different symbol files and function
+    /// lists.
+    #[arg(long)]
+    pub engine: Option<String>,
     /// hiperf sampling period (events between samples) when
     /// `--with-instructions` is set. 100 000 retired instructions per
     /// sample matches what the manual investigation used and produces

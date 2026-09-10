@@ -60,6 +60,9 @@ rustc-demangle = "0.1"
 # completion time) from device log text with a per-metric pattern.
 regex = "1"
 cpp_demangle = "0.4"
+addr2line = "0.24"
+rustc-hash = "2"
+gimli = { version = "0.31", default-features = false, features = ["read", "std", "endian-reader"] }
 
 [build-dependencies]
 prost-build = { version = "0.13", optional = true }

@@ -1,0 +1,29 @@
+name = "mossel-user-scroll"
+# 我的 account: login card + entry grid
+# Scrolling variant: the page is loaded, then swiped repeatedly inside the
+# capture window. Scroll is where incremental layout dominates, so it is the
+# leg where `instructions.per_reflow` should be most stable.
+url = "https://m.huaweimossel.com/#/pages/user"
+iterations = 15
+servoshell_args = ["--ignore-certificate-errors"]
+
+[scenario]
+# Surface name for the app under test — `hidumper -s RenderService -a "fps"`
+# lists what a device has. Same app for both engines, so the same name works
+# for the ArkWeb and the Servo backend.
+surface = "RosenWeb"
+capture_seconds = 20
+
+[[scenario.post_processing]]
+kind = "exclude-idle-gaps"
+gap_ms = 250.0
+
+# First swipe at 6 s leaves the load settled; repeating every 1.5 s gives ~9
+# scrolls per iteration. Coordinates are chosen to be on-screen on the
+# smallest device in the fleet (DAYU200, 720x1280) so the same workload is
+# valid on a phone too. On the rk3568 board the page needs far longer than 6 s
+# to load — raise `capture_seconds` and `after_ms` there.
+[[steps]]
+after_ms = 6000
+every_ms = 1500
+run = "uitest uiInput swipe 360 1000 360 400 400"

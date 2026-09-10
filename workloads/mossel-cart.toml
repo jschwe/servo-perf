@@ -1,0 +1,8 @@
+name = "mossel-cart"
+# 购物车 cart: near-empty when logged out — the low-layout control
+url = "https://m.huaweimossel.com/#/pages/tabbarcart"
+iterations = 15
+# No viewport / dpr / user-agent: those are servoshell-only args, and this
+# workload is meant to run inside the arkweb wrapper app, where the viewport
+# comes from the app's window and is identical for both engines.
+servoshell_args = ["--ignore-certificate-errors"]

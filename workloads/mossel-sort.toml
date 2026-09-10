@@ -1,0 +1,8 @@
+name = "mossel-sort"
+# 分类 category: sidebar + product list
+url = "https://m.huaweimossel.com/#/pages/sort/sort"
+iterations = 15
+# No viewport / dpr / user-agent: those are servoshell-only args, and this
+# workload is meant to run inside the arkweb wrapper app, where the viewport
+# comes from the app's window and is identical for both engines.
+servoshell_args = ["--ignore-certificate-errors"]

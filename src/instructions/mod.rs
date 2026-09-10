@@ -54,6 +54,36 @@ pub struct EngineConfig {
     /// `workload_args_to_aa_params`.
     #[serde(default)]
     pub proxy_args: Vec<String>,
+    /// Trace-span name substrings that each denote one completed layout
+    /// run. Counted from the iteration's hitrace capture to give the
+    /// denominator of `instructions.per_reflow`. Case-sensitive substring
+    /// match, so it works against both Servo's bare span names and the
+    /// `H:`-prefixed markers OHOS system emitters use.
+    #[serde(default)]
+    pub reflow_spans: Vec<String>,
+    /// Which entry of `functions` — or which `group` name — is the reflow
+    /// numerator. When set (and `reflow_spans` produced a non-zero count) the
+    /// bench also reports `instructions.per_reflow`.
+    #[serde(default)]
+    pub reflow_instructions: Option<String>,
+    /// Named sums over several `functions` patterns, for reporting a phase
+    /// that no single symbol covers — Servo's paint prep is a stacking-context
+    /// tree plus a display list, for instance.
+    ///
+    /// A group is **not** the sum of its members' individual metrics: a sample
+    /// is credited to the group once if its callchain contains *any* member,
+    /// so nested members are not double-counted. Where a group sits below the
+    /// arithmetic sum of its parts, the difference is exactly that overlap.
+    #[serde(default, rename = "group")]
+    pub groups: Vec<MetricGroup>,
+}
+
+/// One named sum over `functions` patterns. Reported as
+/// `instructions.<name>` alongside the per-symbol counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricGroup {
+    pub name: String,
+    pub functions: Vec<String>,
 }
 
 impl InstructionsConfig {
@@ -70,6 +100,12 @@ impl InstructionsConfig {
     /// claims the bundle — caller falls back to skipping instruction
     /// collection (with a one-line stderr warning) so an unknown bundle
     /// doesn't fail the bench.
+    /// Engine selection by explicit `id` (`--engine`). Takes precedence over
+    /// bundle matching, for bundles whose engine is switchable at runtime.
+    pub fn engine_by_id(&self, id: &str) -> Option<&EngineConfig> {
+        self.engines.iter().find(|e| e.id == id)
+    }
+
     pub fn engine_for_bundle(&self, bundle: &str) -> Option<&EngineConfig> {
         self.engines
             .iter()
@@ -88,4 +124,113 @@ impl DevicePaths {
     pub const PERF_REPORT_TXT: &str = "/data/local/tmp/servoperf_iter.stack.txt";
     pub const SYMBOL_DIR: &str = "/data/local/tmp/symbols";
     pub const SYMBOL_FILE: &str = "/data/local/tmp/symbols/libarkweb_engine.so";
+}
+
+/// Count completed reflows in one iteration's trace.
+///
+/// Returns `reflow.count` (the total across every configured pattern)
+/// plus one `reflow.count.<pattern>` per pattern, so a mis-specified
+/// pattern is visible rather than silently folded into the total.
+///
+/// Counting *spans* rather than begin-markers means a layout that starts
+/// inside the capture window but ends after it is not counted; that
+/// undercounts by at most one per run.
+pub fn count_reflow_spans(
+    slices: &[crate::trace::Slice],
+    engine: &EngineConfig,
+) -> std::collections::BTreeMap<String, f64> {
+    let mut out = std::collections::BTreeMap::new();
+    if engine.reflow_spans.is_empty() {
+        return out;
+    }
+    let mut total = 0u64;
+    for pattern in &engine.reflow_spans {
+        let n = slices.iter().filter(|s| s.name.contains(pattern)).count() as u64;
+        total += n;
+        out.insert(format!("reflow.count.{pattern}"), n as f64);
+    }
+    out.insert("reflow.count".to_string(), total as f64);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::Slice;
+
+    fn slice(name: &str) -> Slice {
+        Slice {
+            name: name.to_string(),
+            thread: "t".into(),
+            ts_ns: 0,
+            dur_ns: 0,
+            debug_annotations: vec![],
+        }
+    }
+
+    #[test]
+    fn groups_are_seeded_and_named_alongside_functions() {
+        let cfg = InstructionsConfig::load(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/workloads"
+        )))
+        .expect("workloads/_instructions.toml parses");
+        for engine in &cfg.engines {
+            let names: Vec<&str> = engine.groups.iter().map(|g| g.name.as_str()).collect();
+            assert!(
+                names.contains(&"layout_proper")
+                    && names.contains(&"paint_prep")
+                    && names.contains(&"colleagues_reflow"),
+                "engine {:?} is missing a comparison group: {names:?}",
+                engine.id
+            );
+            for g in &engine.groups {
+                assert!(!g.functions.is_empty(), "group {:?} is empty", g.name);
+                // A group name that collides with a symbol pattern would have
+                // the two fight over the same metric key.
+                assert!(
+                    !engine.functions.contains(&g.name),
+                    "group {:?} collides with a functions entry",
+                    g.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counts_reflow_spans_by_substring() {
+        let engine = EngineConfig {
+            id: "arkweb".into(),
+            bundles: vec![],
+            symbol_file: String::new(),
+            functions: vec![],
+            proxy_args: vec![],
+            reflow_spans: vec!["LocalFrameView::performLayout".into()],
+            reflow_instructions: None,
+            groups: vec![],
+        };
+        let slices = vec![
+            slice("H:LocalFrameView::performLayout"),
+            slice("H:LocalFrameView::performLayout"),
+            slice("H:UpdateLayoutTree"),
+        ];
+        let m = count_reflow_spans(&slices, &engine);
+        assert_eq!(m["reflow.count"], 2.0);
+        assert_eq!(m["reflow.count.LocalFrameView::performLayout"], 2.0);
+    }
+
+    #[test]
+    fn no_patterns_yields_no_metrics() {
+        let engine = EngineConfig {
+            id: "x".into(),
+            bundles: vec![],
+            symbol_file: String::new(),
+            functions: vec![],
+            proxy_args: vec![],
+            reflow_spans: vec![],
+            reflow_instructions: None,
+            groups: vec![],
+        };
+        assert!(count_reflow_spans(&[slice("a")], &engine).is_empty());
+    }
 }

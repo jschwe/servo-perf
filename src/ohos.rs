@@ -22,7 +22,7 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::cli::OhosArgs;
 use crate::instructions::DevicePaths;
@@ -35,6 +35,7 @@ use crate::workload::Workload;
 pub struct OhosTarget {
     pub hdc_bin: String,
     pub hdc_server: Option<String>,
+    pub hdc_target: Option<String>,
     pub bundle: String,
     pub ability: String,
     pub trace_path_on_device: String,
@@ -68,6 +69,7 @@ impl OhosTarget {
         Self {
             hdc_bin: a.hdc_bin.clone(),
             hdc_server: a.hdc_server.clone(),
+            hdc_target: a.hdc_target.clone(),
             bundle: a.ohos_bundle.clone(),
             ability: a.ohos_ability.clone(),
             trace_path_on_device: a.ohos_trace_path.clone(),
@@ -155,6 +157,9 @@ impl OhosTarget {
         let mut cmd = Command::new(&self.hdc_bin);
         if let Some(s) = &self.hdc_server {
             cmd.args(["-s", s]);
+        }
+        if let Some(t) = &self.hdc_target {
+            cmd.args(["-t", t]);
         }
         cmd.args(args);
         let out = cmd
@@ -347,6 +352,7 @@ impl OhosTarget {
         Ok(RPortGuard {
             hdc_bin: self.hdc_bin.clone(),
             hdc_server: self.hdc_server.clone(),
+            hdc_target: self.hdc_target.clone(),
             ports: installed,
         })
     }
@@ -384,7 +390,15 @@ impl OhosTarget {
             begin_args.push(tag);
         }
         begin_args.push("--trace_begin");
-        self.hdc(&begin_args).context("hitrace --trace_begin")?;
+        let begin = self.hdc(&begin_args).context("hitrace --trace_begin")?;
+        // hitrace reports argument errors on stdout and still exits 0 — e.g.
+        // a buffer above the device's maximum. Left unchecked the iteration
+        // proceeds without a trace and fails much later, when the text file
+        // it never wrote cannot be read.
+        let begin_out = String::from_utf8_lossy(&begin.stdout);
+        if let Some(line) = begin_out.lines().find(|l| l.contains("error:")) {
+            anyhow::bail!("hitrace --trace_begin refused the capture: {}", line.trim());
+        }
 
         // Thermal snapshot immediately before launch — anchors the
         // per-iteration delta. If the read fails the iteration still
@@ -414,32 +428,46 @@ impl OhosTarget {
         let window = self.scenario_capture_seconds(workload);
         let mut fps_dumps = Vec::new();
         let mut thread_cpu = None;
-        if let Some(scenario) = workload.scenario.as_ref() {
-            // Take the opening thread-CPU sample only once the app has a pid,
-            // so the window measured is steady-state rendering rather than
-            // process start-up.
-            let cpu_before = scenario
-                .thread_cpu
-                .then(|| self.sample_thread_cpu())
-                .flatten();
-            std::thread::scope(|scope| -> Result<()> {
-                let sampler = scope.spawn(|| self.sample_frame_ring(scenario, window));
-                if let Some(period) = self.hiperf_period {
-                    self.run_hiperf_record(period)
-                        .context("hiperf record (--with-instructions)")?;
-                }
-                fps_dumps = sampler.join().unwrap_or_default();
-                Ok(())
-            })?;
-            if let Some(before) = cpu_before {
-                thread_cpu = self.sample_thread_cpu().map(|after| (before, after));
+        // Injected actions run on their own thread for the whole window, so
+        // they overlap whichever waiting strategy the branches below use.
+        std::thread::scope(|steps_scope| -> Result<()> {
+            if !workload.steps.is_empty() {
+                steps_scope.spawn(|| self.run_steps(&workload.steps, window));
             }
-        } else if let Some(period) = self.hiperf_period {
-            self.run_hiperf_record(period)
-                .context("hiperf record (--with-instructions)")?;
-        } else {
-            std::thread::sleep(Duration::from_secs(window));
-        }
+            if let Some(scenario) = workload.scenario.as_ref() {
+                // Take the opening thread-CPU sample only once the app has a pid,
+                // so the window measured is steady-state rendering rather than
+                // process start-up.
+                let cpu_before = scenario
+                    .thread_cpu
+                    .then(|| {
+                        if scenario.thread_cpu_from_start {
+                            self.sample_wall_clock()
+                        } else {
+                            self.sample_thread_cpu()
+                        }
+                    })
+                    .flatten();
+                std::thread::scope(|scope| -> Result<()> {
+                    let sampler = scope.spawn(|| self.sample_frame_ring(scenario, window));
+                    if let Some(period) = self.hiperf_period {
+                        self.run_hiperf_record(period, window)
+                            .context("hiperf record (--with-instructions)")?;
+                    }
+                    fps_dumps = sampler.join().unwrap_or_default();
+                    Ok(())
+                })?;
+                if let Some(before) = cpu_before {
+                    thread_cpu = self.sample_thread_cpu().map(|after| (before, after));
+                }
+            } else if let Some(period) = self.hiperf_period {
+                self.run_hiperf_record(period, window)
+                    .context("hiperf record (--with-instructions)")?;
+            } else {
+                std::thread::sleep(Duration::from_secs(window));
+            }
+            Ok(())
+        })?;
 
         // Pull the log before `force_stop`, while the app's lines are still
         // in the buffer.
@@ -544,6 +572,15 @@ impl OhosTarget {
     /// `None` when the app has no pid yet or the walk failed, which just
     /// leaves the per-thread breakdown out of this iteration rather than
     /// failing it.
+    /// A [`crate::threads::parse_sample`]-shaped sample carrying only the
+    /// device's wall clock, with no threads: one fork on the device instead of
+    /// two per thread. Marks the start of a window whose CPU is read from the
+    /// absolute counters at the end.
+    fn sample_wall_clock(&self) -> Option<String> {
+        let out = self.hdc(&["shell", "date +%s.%N"]).ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     fn sample_thread_cpu(&self) -> Option<String> {
         let out = self.hdc(&["shell", "pidof", &self.bundle]).ok()?;
         let pid = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -561,15 +598,23 @@ impl OhosTarget {
     /// activity out of the sample, and `--period` is set from
     /// `self.hiperf_period` (already validated to be `Some(_)` by the
     /// caller).
-    fn run_hiperf_record(&self, period: u64) -> Result<()> {
-        let duration = self.capture_seconds.to_string();
+    ///
+    /// `--delay-unwind` defers DWARF unwinding until after the capture
+    /// window. Unwinding inline cannot keep up once the load pushes the
+    /// sample rate past roughly 10k/s: a 10 s load capture on PLR-AL00
+    /// dropped 33 977 of 139 069 samples (24%), and the loss lands in the
+    /// busiest phase, so it biases rather than thins. Deferring cost ~0.7 s
+    /// per iteration and lost nothing in the same test.
+    fn run_hiperf_record(&self, period: u64, window_seconds: u64) -> Result<()> {
+        let duration = window_seconds.to_string();
         let period_str = period.to_string();
-        self.hdc(&[
+        let out = self.hdc(&[
             "shell",
             "hiperf",
             "record",
             "-a",
             "--exclude-hiperf",
+            "--delay-unwind",
             "-d",
             &duration,
             "-s",
@@ -581,18 +626,87 @@ impl OhosTarget {
             "-o",
             DevicePaths::PERF_DATA,
         ])?;
+        // hiperf reports sample loss on stdout and still exits 0. A lossy
+        // capture understates every instruction count, so surface it rather
+        // than letting it pass as a clean run — with the total, because the
+        // absolute number means nothing on its own (a PLR-class phone takes
+        // ~800k samples in a 20 s capture at period 100000).
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if let Some(lost) = parse_hiperf_count(&stdout, "Sample lost:") {
+            if lost > 0 {
+                let kept = parse_hiperf_count(&stdout, "Sample records:").unwrap_or(0);
+                let pct = if kept + lost > 0 {
+                    100.0 * lost as f64 / (kept + lost) as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "warning: hiperf dropped {lost} of {} samples ({pct:.1}%) this iteration. \
+                     Loss concentrates in the busiest phase, so it biases rather than thins: \
+                     raise --instructions-period until it reaches 0 (measured loss-free on \
+                     PLR-AL00 at 1000000). Under ~1% the effect is within sampling error.",
+                    kept + lost,
+                );
+            }
+        }
         Ok(())
     }
 
-    /// Push a freshly-merged `libarkweb_engine.so` to
-    /// `/data/local/tmp/symbols/`. Idempotent — safe to call before each
-    /// run as long as the host file is fresh.
-    pub fn push_arkweb_symbols(&self, host_path: &Path) -> Result<()> {
-        // `hdc shell mkdir -p` returns 0 even when the path already exists.
-        self.hdc(&["shell", "mkdir", "-p", DevicePaths::SYMBOL_DIR])?;
-        let host_str = host_path.to_string_lossy().to_string();
-        self.hdc(&["file", "send", &host_str, DevicePaths::SYMBOL_FILE])?;
-        Ok(())
+    /// Execute a workload's `[[steps]]` inside the capture window.
+    ///
+    /// Runs on its own thread started at `aa start`, so injected actions
+    /// overlap whichever waiting strategy the iteration uses (blocking
+    /// `hiperf record`, frame-ring sampling, or a plain sleep). A failing
+    /// step is reported and the schedule continues — losing one swipe is
+    /// better than losing the iteration.
+    fn run_steps(&self, steps: &[crate::workload::Step], window_seconds: u64) {
+        let window = Duration::from_secs(window_seconds);
+        let schedule = build_step_schedule(steps, window);
+        let start = Instant::now();
+        for (at, cmd) in schedule {
+            let elapsed = start.elapsed();
+            if at > elapsed {
+                std::thread::sleep(at - elapsed);
+            }
+            if let Err(e) = self.hdc(&["shell", cmd]) {
+                eprintln!("warning: step {cmd:?} failed: {e:#}");
+            }
+        }
+    }
+
+    /// Hold a SCREEN wakelock for the lifetime of the returned guard.
+    ///
+    /// Not optional for a measured run: when the screen turns off OHOS
+    /// backgrounds and then *freezes* the app, so the capture silently covers
+    /// a partly-suspended process. Measured 2026-07 on SGT-AL50: 2341 samples
+    /// frozen vs 6227 awake, and reflow 7.6% vs 11.3%.
+    ///
+    /// The lock stops *future* screen-offs but does not dismiss a lock screen
+    /// that is already up, so this also reports whether the screen is locked.
+    pub fn guard_screen_awake(&self) -> ScreenAwakeGuard {
+        let _ = self.hdc(&["shell", "power-shell", "wakeup"]);
+        match self.hdc(&["shell", "hidumper", "-s", "PowerManagerService", "-a", "-t"]) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("warning: could not take a screen wakelock: {e:#}");
+                return ScreenAwakeGuard { target: None };
+            }
+        }
+        if let Ok(out) = self.hdc(&["shell", "hidumper", "-s", "ScreenlockService", "-a", "-all"]) {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = text.lines().find(|l| l.contains("screenLocked")) {
+                if line.contains("true") {
+                    eprintln!(
+                        "warning: the lock screen is up; the app may not be visible for the \
+                         whole run. Dismiss it (`uitest uiInput swipe 540 2200 540 600 600`) \
+                         and re-run."
+                    );
+                }
+            }
+        }
+        ScreenAwakeGuard {
+            target: Some(self.clone()),
+        }
     }
 }
 
@@ -630,6 +744,7 @@ pub struct RunArtifact {
 pub struct RPortGuard {
     hdc_bin: String,
     hdc_server: Option<String>,
+    hdc_target: Option<String>,
     ports: Vec<u16>,
 }
 
@@ -640,6 +755,9 @@ impl Drop for RPortGuard {
             let mut cmd = Command::new(&self.hdc_bin);
             if let Some(s) = &self.hdc_server {
                 cmd.args(["-s", s]);
+            }
+            if let Some(t) = &self.hdc_target {
+                cmd.args(["-t", t]);
             }
             // `hdc fport rm` works for both fport and rport mappings
             // (the daemon distinguishes them internally). `hdc rport rm`
@@ -656,6 +774,50 @@ impl Drop for RPortGuard {
 /// on drop. `target` is `None` when no change was made (empty desired or
 /// already-matching threshold) — drop is then a no-op. Errors during
 /// restore are reported on stderr but never panic.
+/// Expand `[[steps]]` into a time-ordered `(offset, command)` schedule for
+/// one capture window. Repeats stop at the window edge; a step whose first
+/// firing is already past the edge is dropped with a warning, since a
+/// workload that silently never scrolls looks exactly like one that does.
+fn build_step_schedule(steps: &[crate::workload::Step], window: Duration) -> Vec<(Duration, &str)> {
+    let mut schedule: Vec<(Duration, &str)> = Vec::new();
+    for step in steps {
+        let first = Duration::from_millis(step.after_ms);
+        if first >= window {
+            eprintln!(
+                "warning: step at {}ms is past the {:?} capture window; skipped",
+                step.after_ms, window
+            );
+            continue;
+        }
+        schedule.push((first, step.run.as_str()));
+        if let Some(every) = step.every_ms.filter(|e| *e > 0) {
+            let mut at = first + Duration::from_millis(every);
+            while at < window {
+                schedule.push((at, step.run.as_str()));
+                at += Duration::from_millis(every);
+            }
+        }
+    }
+    schedule.sort_by_key(|(at, _)| *at);
+    schedule
+}
+
+/// Releases the SCREEN wakelock taken by
+/// [`OhosTarget::guard_screen_awake`] when dropped.
+pub struct ScreenAwakeGuard {
+    target: Option<OhosTarget>,
+}
+
+impl Drop for ScreenAwakeGuard {
+    fn drop(&mut self) {
+        if let Some(t) = &self.target {
+            if let Err(e) = t.hdc(&["shell", "hidumper", "-s", "PowerManagerService", "-a", "-f"]) {
+                eprintln!("warning: failed to release the screen wakelock: {e:#}");
+            }
+        }
+    }
+}
+
 pub struct TraceLevelGuard {
     target: Option<OhosTarget>,
     previous: String,
@@ -810,6 +972,18 @@ fn workload_args_to_aa_params(
     }
 
     out
+}
+
+/// Pull the first number following `label` in hiperf's summary lines
+/// (`[ Sample records: N, ... ]`, `[ Sample lost: N, ... ]`). `None` when the
+/// label is absent (older hiperf builds).
+fn parse_hiperf_count(stdout: &str, label: &str) -> Option<u64> {
+    let idx = stdout.find(label)?;
+    stdout[idx + label.len()..]
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|n| n.parse().ok())
 }
 
 // --- Hitrace text parsing ----------------------------------------------
@@ -1157,6 +1331,54 @@ fn parse_proxy_port(uri: &str) -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_hiperf_summary_counts() {
+        let out = "[ hiperf record: Captured 32.4 MB perf data. ]\n\
+                   [ Sample records: 164628, Non sample records: 427983 ]\n\
+                   [ Sample lost: 1274, Non sample lost: 0 ]\n";
+        assert_eq!(parse_hiperf_count(out, "Sample records:"), Some(164628));
+        assert_eq!(parse_hiperf_count(out, "Sample lost:"), Some(1274));
+        assert_eq!(parse_hiperf_count(out, "Nonexistent:"), None);
+    }
+
+    use crate::workload::Step;
+
+    fn step(after_ms: u64, every_ms: Option<u64>, run: &str) -> Step {
+        Step {
+            after_ms,
+            every_ms,
+            run: run.to_string(),
+        }
+    }
+
+    #[test]
+    fn step_schedule_repeats_until_the_window_edge() {
+        let steps = vec![step(2000, Some(1500), "swipe")];
+        let sched = build_step_schedule(&steps, Duration::from_secs(8));
+        let offsets: Vec<u64> = sched.iter().map(|(d, _)| d.as_millis() as u64).collect();
+        assert_eq!(offsets, vec![2000, 3500, 5000, 6500]);
+        assert!(sched.iter().all(|(_, cmd)| *cmd == "swipe"));
+    }
+
+    #[test]
+    fn step_schedule_orders_and_drops_out_of_window_steps() {
+        let steps = vec![
+            step(9000, None, "too-late"),
+            step(3000, None, "second"),
+            step(1000, None, "first"),
+        ];
+        let sched = build_step_schedule(&steps, Duration::from_secs(5));
+        let cmds: Vec<&str> = sched.iter().map(|(_, c)| *c).collect();
+        assert_eq!(cmds, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn step_schedule_ignores_zero_interval() {
+        let steps = vec![step(1000, Some(0), "once")];
+        let sched = build_step_schedule(&steps, Duration::from_secs(10));
+        assert_eq!(sched.len(), 1);
+    }
+
     use super::*;
 
     #[test]
@@ -1256,6 +1478,7 @@ mod tests {
             ],
             fixture: None,
             scenario: None,
+            steps: vec![],
         };
         let aa = workload_args_to_aa_params(&w, Some("http://127.0.0.1:9999"), &[]);
         // headless / exit dropped
