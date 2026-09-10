@@ -10,7 +10,12 @@ host; on Linux the only difference is path syntax.
 The two numbers this produces:
 
 - **`reflow.count`** — completed layouts, counted from the engine's own trace
-  spans in the same capture the instruction counts come from.
+  spans, narrowed to the interval the instruction samples came from. hitrace
+  starts before the app is launched and keeps recording while it flushes, so
+  the raw trace covers materially more than the PMU window (measured on one
+  20 s capture: 49.5 s of trace against 20.0 s of samples). Counting the whole
+  trace would put a denominator from one interval over a numerator from
+  another, biasing `per_reflow` low in a way that does not average out.
 - **`instructions.per_reflow`** — reflow instructions ÷ that count. This is the
   number to compare between engines: measured 18% run-to-run variation against
   36.7% for the raw instruction total and 25.8% for the count, because

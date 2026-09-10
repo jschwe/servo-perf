@@ -1,9 +1,9 @@
 //! Per-function instruction counting via `hiperf record -a -e hw-instructions`.
 //!
 //! Disabled by default; opt in with `--with-instructions`. When enabled, each
-//! iteration runs `hiperf record` in parallel with the existing hitrace
-//! capture (same time window, same device), then post-processes the perf.data
-//! into per-function inclusive instruction counts using
+//! iteration runs `hiperf record` alongside the hitrace capture, then
+//! post-processes the perf.data into per-function inclusive instruction counts
+//! using
 //! [`crate::instructions::perf_data`].
 //!
 //! Engine selection (which set of function-name substrings to aggregate) is
@@ -19,7 +19,7 @@
 mod perf_data;
 pub mod symbols;
 
-pub use perf_data::aggregate_inclusive_from_perf_data;
+pub use perf_data::{aggregate_inclusive_from_perf_data, Aggregation};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -135,17 +135,52 @@ impl DevicePaths {
 /// Counting *spans* rather than begin-markers means a layout that starts
 /// inside the capture window but ends after it is not counted; that
 /// undercounts by at most one per run.
-pub fn count_reflow_spans(
+pub fn reflow_span_starts(
     slices: &[crate::trace::Slice],
     engine: &EngineConfig,
+) -> std::collections::BTreeMap<String, Vec<u64>> {
+    let mut out = std::collections::BTreeMap::new();
+    for pattern in &engine.reflow_spans {
+        let starts: Vec<u64> = slices
+            .iter()
+            .filter(|s| s.name.contains(pattern))
+            .map(|s| s.ts_ns)
+            .collect();
+        out.insert(pattern.clone(), starts);
+    }
+    out
+}
+
+/// Count the reflows inside `window`, the interval the instruction counts
+/// actually came from.
+///
+/// Without this the two halves of `instructions.per_reflow` describe different
+/// intervals: hitrace is running before `aa start` and keeps recording while
+/// `--trace_finish` flushes, so the denominator spans measurably more than the
+/// PMU window (measured on one 20 s capture: a 49.5 s trace against a 20.0 s
+/// sample window). Both clocks are the device's monotonic one, so the
+/// timestamps are directly comparable.
+///
+/// `window` is `None` when instruction counting is off, or when the capture
+/// produced no timestamped sample; the whole trace is then counted, which is
+/// the right answer for a `reflow.count` that is not a denominator.
+pub fn count_reflow_spans_in(
+    starts: &std::collections::BTreeMap<String, Vec<u64>>,
+    window: Option<(u64, u64)>,
 ) -> std::collections::BTreeMap<String, f64> {
     let mut out = std::collections::BTreeMap::new();
-    if engine.reflow_spans.is_empty() {
+    if starts.is_empty() {
         return out;
     }
     let mut total = 0u64;
-    for pattern in &engine.reflow_spans {
-        let n = slices.iter().filter(|s| s.name.contains(pattern)).count() as u64;
+    for (pattern, ts) in starts {
+        let n = ts
+            .iter()
+            .filter(|t| match window {
+                Some((lo, hi)) => **t >= lo && **t <= hi,
+                None => true,
+            })
+            .count() as u64;
         total += n;
         out.insert(format!("reflow.count.{pattern}"), n as f64);
     }
@@ -157,6 +192,13 @@ pub fn count_reflow_spans(
 mod tests {
     use super::*;
     use crate::trace::Slice;
+
+    fn slice_at(name: &str, ts_ns: u64) -> Slice {
+        Slice {
+            ts_ns,
+            ..slice(name)
+        }
+    }
 
     fn slice(name: &str) -> Slice {
         Slice {
@@ -198,6 +240,35 @@ mod tests {
     }
 
     #[test]
+    fn counts_only_the_spans_inside_the_sampled_window() {
+        let engine = EngineConfig {
+            id: "arkweb".into(),
+            bundles: vec![],
+            symbol_file: String::new(),
+            functions: vec![],
+            proxy_args: vec![],
+            reflow_spans: vec!["performLayout".into()],
+            reflow_instructions: None,
+            groups: vec![],
+        };
+        let mut slices = vec![
+            slice_at("H:LocalFrameView::performLayout", 50), // before the window
+            slice_at("H:LocalFrameView::performLayout", 150),
+            slice_at("H:LocalFrameView::performLayout", 250),
+            slice_at("H:LocalFrameView::performLayout", 950), // after the window
+        ];
+        slices.push(slice_at("H:Something::else", 150));
+        let starts = reflow_span_starts(&slices, &engine);
+
+        // Narrowed to the interval the instruction samples came from.
+        let m = count_reflow_spans_in(&starts, Some((100, 300)));
+        assert_eq!(m["reflow.count"], 2.0);
+        // Without a window — no instruction counting — the whole trace counts.
+        let m = count_reflow_spans_in(&starts, None);
+        assert_eq!(m["reflow.count"], 4.0);
+    }
+
+    #[test]
     fn counts_reflow_spans_by_substring() {
         let engine = EngineConfig {
             id: "arkweb".into(),
@@ -214,7 +285,7 @@ mod tests {
             slice("H:LocalFrameView::performLayout"),
             slice("H:UpdateLayoutTree"),
         ];
-        let m = count_reflow_spans(&slices, &engine);
+        let m = count_reflow_spans_in(&reflow_span_starts(&slices, &engine), None);
         assert_eq!(m["reflow.count"], 2.0);
         assert_eq!(m["reflow.count.LocalFrameView::performLayout"], 2.0);
     }
@@ -231,6 +302,8 @@ mod tests {
             reflow_instructions: None,
             groups: vec![],
         };
-        assert!(count_reflow_spans(&[slice("a")], &engine).is_empty());
+        assert!(
+            count_reflow_spans_in(&reflow_span_starts(&[slice("a")], &engine), None).is_empty()
+        );
     }
 }
