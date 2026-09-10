@@ -56,6 +56,18 @@ use std::path::Path;
 
 use crate::instructions::EngineConfig;
 
+/// What one `perf.data` yielded.
+pub struct Aggregation {
+    /// Inclusive instruction counts, keyed by configured target or group.
+    pub totals: HashMap<String, u64>,
+    /// First and last sample timestamp, in the same monotonic clock the
+    /// hitrace slices carry — so the trace can be narrowed to exactly the
+    /// interval these instructions came from.
+    ///
+    /// `None` when the capture produced no timestamped sample.
+    pub window: Option<(u64, u64)>,
+}
+
 /// Aggregate per-target inclusive hw-instruction counts from one
 /// `perf.data` produced by `hiperf record -a -e hw-instructions`.
 ///
@@ -70,7 +82,8 @@ pub fn aggregate_inclusive_from_perf_data(
     perf_data_path: &Path,
     engine: &EngineConfig,
     workloads_dir: &Path,
-) -> Result<HashMap<String, u64>> {
+) -> Result<Aggregation> {
+    let mut window: Option<(u64, u64)> = None;
     let mut totals: HashMap<String, u64> = engine
         .functions
         .iter()
@@ -81,7 +94,10 @@ pub fn aggregate_inclusive_from_perf_data(
     if engine.symbol_file.is_empty() {
         // Caller's already warned about this; produce empty results so the
         // bench keeps running.
-        return Ok(totals);
+        return Ok(Aggregation {
+            totals,
+            window: None,
+        });
     }
 
     let sym_path = workloads_dir.join(&engine.symbol_file);
@@ -155,6 +171,12 @@ pub fn aggregate_inclusive_from_perf_data(
                         }
                     }
                     EventRecord::Sample(s) => {
+                        if let Some(t) = s.timestamp {
+                            window = Some(match window {
+                                Some((lo, hi)) => (lo.min(t), hi.max(t)),
+                                None => (t, t),
+                            });
+                        }
                         let Some(pid) = s.pid else { continue };
                         let Some(period) = s.period else { continue };
                         let Some(mappings) = mmaps_by_pid.get(&pid) else {
@@ -238,7 +260,7 @@ pub fn aggregate_inclusive_from_perf_data(
     }
 
     explain_zeros(&totals, &symbolizer, engine, &sym_path);
-    Ok(totals)
+    Ok(Aggregation { totals, window })
 }
 
 /// Say why a configured target came back at zero.

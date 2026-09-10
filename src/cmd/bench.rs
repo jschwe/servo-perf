@@ -114,10 +114,10 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // recording on the device, so wallclock for the whole bench is
     // bounded by max(recording_time, analyser_time) per iteration instead
     // of their sum. Joined in a single pass after the iteration loop.
-    let mut instr_jobs: Vec<(
-        u32,
-        JoinHandle<Result<std::collections::HashMap<String, u64>>>,
-    )> = Vec::new();
+    // Reflow-span timestamps per iteration, held until the matching
+    // perf.data yields the window to narrow them to.
+    let mut reflow_starts_by_iter: BTreeMap<u32, BTreeMap<String, Vec<u64>>> = BTreeMap::new();
+    let mut instr_jobs: Vec<(u32, JoinHandle<Result<instructions::Aggregation>>)> = Vec::new();
     for i in 0..w.iterations {
         if crate::cancel::requested() {
             eprintln!("bench: cancelled after {i} iteration(s); writing what was collected");
@@ -170,23 +170,14 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 // Reflow count from the same trace the timing metrics come
                 // from. Independent of `--with-instructions`: it needs no
                 // PMU, only the engine's span names.
-                if let Some(engine) = engine.as_ref() {
-                    let counts = instructions::count_reflow_spans(&slices, engine);
-                    // A configured-but-absent reflow span means the number is
-                    // wrong, not zero: the trace ring wrapped past the load
-                    // burst, the engine build has no tracing, or the tag list
-                    // is missing the one that carries the markers.
-                    if counts.get("reflow.count") == Some(&0.0) {
-                        eprintln!(
-                            "iter {i}: warning: no {:?} spans in the trace — reflow.count is 0. \
-                             Check the engine build emits them, that --ohos-trace-tags includes \
-                             their tag (`nweb` for ArkWeb), and that the capture window is short \
-                             enough that the ring buffer still holds the page load.",
-                            engine.reflow_spans,
-                        );
-                    }
-                    metrics.extend(counts);
-                }
+                // The reflow count is deliberately *not* computed here: it has
+                // to be narrowed to the window the instruction samples came
+                // from, which is only known once this iteration's perf.data
+                // has been parsed. Keep the span timestamps until then.
+                let reflow_starts = engine
+                    .as_ref()
+                    .map(|e| instructions::reflow_span_starts(&slices, e))
+                    .unwrap_or_default();
                 // Thermal snapshots (OHOS only). Absent on local targets.
                 if let Some(v) = art.thermal_before_milli_c {
                     metrics.insert("soc_thermal_milli_c.before".to_string(), v as f64);
@@ -227,6 +218,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
                     });
                     instr_jobs.push((i, handle));
                 }
+                reflow_starts_by_iter.insert(i, reflow_starts);
                 iterations.push(Iteration {
                     index: i,
                     status: IterationStatus::Ok {
@@ -272,18 +264,32 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 continue;
             }
         };
-        let totals = match result {
+        let aggregation = match result {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("iter {idx}: instruction aggregator failed: {e:#}");
                 continue;
             }
         };
+        let starts = reflow_starts_by_iter.remove(&idx).unwrap_or_default();
         if let Some(it) = iterations.iter_mut().find(|it| it.index == idx) {
             if let IterationStatus::Ok { metrics, .. } = &mut it.status {
-                for (func, events) in totals {
+                for (func, events) in aggregation.totals {
                     metrics.insert(format!("instructions.{func}"), events as f64);
                 }
+                // Now the window is known, so the denominator can describe the
+                // same interval as the numerator.
+                let counts = instructions::count_reflow_spans_in(&starts, aggregation.window);
+                if counts.get("reflow.count") == Some(&0.0) {
+                    eprintln!(
+                        "iter {idx}: warning: no reflow spans inside the sampled window — \
+                         reflow.count is 0. Check the engine build emits them, that \
+                         --ohos-trace-tags includes their tag (`nweb` for ArkWeb), and that \
+                         the capture window is short enough that the ring buffer still holds \
+                         the page load."
+                    );
+                }
+                metrics.extend(counts);
                 // instructions ÷ reflows, from the same iteration. Both
                 // inputs are per-iteration, so the ratio never mixes a
                 // numerator and denominator from different runs.
@@ -312,6 +318,17 @@ pub fn run(args: BenchArgs) -> Result<()> {
                         metrics.extend(derived);
                     }
                 }
+            }
+        }
+    }
+
+    // Iterations with no instruction job — `--with-instructions` off, or an
+    // aggregator that failed — still get a count, over the whole trace. It is
+    // not a denominator there, so there is no window to narrow it to.
+    for (idx, starts) in std::mem::take(&mut reflow_starts_by_iter) {
+        if let Some(it) = iterations.iter_mut().find(|it| it.index == idx) {
+            if let IterationStatus::Ok { metrics, .. } = &mut it.status {
+                metrics.extend(instructions::count_reflow_spans_in(&starts, None));
             }
         }
     }
