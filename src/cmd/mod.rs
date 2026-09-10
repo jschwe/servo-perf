@@ -5,3 +5,4 @@ pub mod bench;
 pub mod dump;
 pub mod prepare_symbols;
 pub mod regression;
+pub mod suite;

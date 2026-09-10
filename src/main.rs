@@ -13,6 +13,7 @@ mod proto;
 mod report;
 mod runner;
 mod stats;
+mod suite;
 mod threads;
 mod trace;
 mod workload;
@@ -29,6 +30,7 @@ fn main() -> Result<()> {
         cli::Command::Dump(a) => cmd::dump::run(a),
         cli::Command::CpuFreq(a) => cpufreq::run(&a),
         cli::Command::Regression(a) => cmd::regression::run(a),
+        cli::Command::Suite(a) => cmd::suite::run(a),
         cli::Command::PrepareArkwebSymbols(a) => cmd::prepare_symbols::run(a),
     }
 }

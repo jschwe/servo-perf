@@ -99,18 +99,34 @@ Check three things in `out/smoke-*/raw.json` before going further:
 
 ## 4. The full matrix
 
-The `mossel-*` workloads default to 15 iterations, so drop `--iterations`.
+One command runs every workload against every engine:
 
 ```sh
-for w in mossel-index mossel-sort mossel-articles mossel-cart mossel-user; do
-  servoperf bench $w $COMMON --engine arkweb --ohos-trace-level "" --out out/arkweb-$w
-done
-# switch the device to Servo, then repeat with --engine servo-arkweb
+servoperf suite mossel --ohos --ohos-bundle org.openharmonyrs.arkwebtest
 ```
 
-Budget ~7 minutes per workload, so ~35 minutes per engine. The `-scroll`
-variants are the same commands with `-scroll` names; they carry their own
-`capture_seconds` and swipe schedule and need `uitest` on the device.
+The matrix and its settings live in [`suites/mossel.toml`](../suites/mossel.toml)
+— repetitions, capture window, sampling period, trace tags, which workloads are
+in, and one `[[leg]]` per engine. Edit it rather than assembling flags: a
+campaign where one leg quietly ran with a different window than the other is
+not a comparison, and the file makes that visible in review.
+
+Each cell lands in `<out>/<leg>-<workload>/`, a normal `bench` output
+directory. A failing cell is reported and the run continues.
+
+Selecting the engine is the one thing servoperf will not guess. Give a leg a
+`setup` command — `setup = "param set <engine-param> <value>"`, run as
+`hdc shell` before the leg — or leave it out and the run pauses and asks you to
+switch by hand. `--assume-yes` skips the prompt when the device is already set.
+
+Useful for a first pass:
+
+```sh
+servoperf suite mossel --ohos --only mossel-index --legs arkweb --iterations 1
+```
+
+Budget ~7 minutes per workload per leg. The `-scroll` variants need `uitest` on
+the device.
 
 All ten workloads pass `--chrome=none`, which hides the wrapper app's toolbar
 so the Web component fills the window. That is not cosmetic: the toolbar costs
@@ -120,8 +136,11 @@ taken with and without it are not comparable; re-baseline if you switch.
 
 Two things about the workloads:
 
-- **`mossel-cart` is deliberately near-empty** when logged out. It is the
-  low-layout control — a small `reflow.count` there is correct.
+- **`mossel-cart` renders almost nothing** when logged out, so it was meant as
+  a low-layout control — but a first run on DAYU200 recorded 632 layouts
+  against 19 for `mossel-user`, i.e. the opposite of the intent. Something on
+  that page relayouts repeatedly. Check what it is before reading anything into
+  its numbers.
 - **Launch the app once by hand after installing it.** Without `--bin`,
   servoperf skips its install cooldown and warmup, and the first cold launch
   after an install runs ~3x slow, skewing iteration 0.

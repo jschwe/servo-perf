@@ -1,5 +1,8 @@
 name = "mossel-cart"
-# 购物车 cart: near-empty when logged out — the low-layout control
+# 购物车 cart: renders almost nothing when logged out, so it was intended as a
+# low-layout control — but one DAYU200 run recorded 632 layouts against 19 for
+# mossel-user, so something here relayouts repeatedly. Investigate before
+# treating its numbers as a baseline.
 url = "https://m.huaweimossel.com/#/pages/tabbarcart"
 iterations = 15
 # No viewport / dpr / user-agent: those are servoshell-only args, and this
