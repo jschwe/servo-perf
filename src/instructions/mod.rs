@@ -192,6 +192,12 @@ pub fn count_reflow_spans_in(
         total += n;
         out.insert(format!("reflow.count.{pattern}"), n as f64);
     }
+    if total == 0 {
+        // No reflow was seen at all. That is a measurement that did not
+        // happen, not a measurement of zero: recording it would drag the
+        // median of every other iteration in the run. The caller warns.
+        return std::collections::BTreeMap::new();
+    }
     out.insert("reflow.count".to_string(), total as f64);
     out
 }
@@ -272,6 +278,9 @@ mod tests {
         // Narrowed to the interval the instruction samples came from.
         let m = count_reflow_spans_in(&starts, Some((100, 300)));
         assert_eq!(m["reflow.count"], 2.0);
+        // A window containing none of them yields no metric at all, rather
+        // than a zero that would be averaged in as if it were data.
+        assert!(count_reflow_spans_in(&starts, Some((400, 500))).is_empty());
         // Without a window — no instruction counting — the whole trace counts.
         let m = count_reflow_spans_in(&starts, None);
         assert_eq!(m["reflow.count"], 4.0);

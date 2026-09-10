@@ -274,8 +274,14 @@ pub fn run(args: BenchArgs) -> Result<()> {
         let starts = reflow_starts_by_iter.remove(&idx).unwrap_or_default();
         if let Some(it) = iterations.iter_mut().find(|it| it.index == idx) {
             if let IterationStatus::Ok { metrics, .. } = &mut it.status {
+                // A target that never resolved is absent, not zero: a zero
+                // here is indistinguishable from "this phase costs nothing"
+                // and drags every median it lands in. `explain_zeros` has
+                // already said which of the two it was.
                 for (func, events) in aggregation.totals {
-                    metrics.insert(format!("instructions.{func}"), events as f64);
+                    if events > 0 {
+                        metrics.insert(format!("instructions.{func}"), events as f64);
+                    }
                 }
                 // Now the window is known, so the denominator can describe the
                 // same interval as the numerator.
