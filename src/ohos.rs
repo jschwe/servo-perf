@@ -36,6 +36,8 @@ pub struct OhosTarget {
     pub hdc_bin: String,
     pub hdc_server: Option<String>,
     pub hdc_target: Option<String>,
+    /// `thermal_zoneN` directory resolved from `--ohos-thermal-zone`.
+    pub thermal_zone: Option<String>,
     pub bundle: String,
     pub ability: String,
     pub trace_path_on_device: String,
@@ -70,6 +72,7 @@ impl OhosTarget {
             hdc_bin: a.hdc_bin.clone(),
             hdc_server: a.hdc_server.clone(),
             hdc_target: a.hdc_target.clone(),
+            thermal_zone: None,
             bundle: a.ohos_bundle.clone(),
             ability: a.ohos_ability.clone(),
             trace_path_on_device: a.ohos_trace_path.clone(),
@@ -232,13 +235,53 @@ impl OhosTarget {
     /// precision. Returns `None` if the read fails — caller treats absence
     /// as "no thermal info this iter" rather than failing the iteration.
     pub fn read_soc_thermal_milli_c(&self) -> Option<i64> {
-        let out = self
-            .hdc(&["shell", "cat", "/sys/class/thermal/thermal_zone0/temp"])
-            .ok()?;
+        let zone = self.thermal_zone.as_deref().unwrap_or("thermal_zone0");
+        let path = format!("/sys/class/thermal/{zone}/temp");
+        let out = self.hdc(&["shell", "cat", &path]).ok()?;
         String::from_utf8_lossy(&out.stdout)
             .trim()
             .parse::<i64>()
             .ok()
+    }
+
+    /// Resolve `--ohos-thermal-zone` (a zone `type`, e.g. `board_thermal`) to
+    /// a `thermal_zoneN` directory, and report whether the chosen zone looks
+    /// alive.
+    ///
+    /// Not every zone is: on PLR-AL00 `soc_thermal` reads a flat 30000 whatever
+    /// the device is doing, while `board_thermal` tracks. A constant zone makes
+    /// the thermal columns look plausible and mean nothing, so say so up front
+    /// rather than let a reader draw conclusions from a placeholder.
+    pub fn resolve_thermal_zone(&mut self, wanted_type: &str) {
+        let probe = r#"for z in /sys/class/thermal/thermal_zone*; do printf '%s %s %s\n' "${z##*/}" "$(cat $z/type 2>/dev/null)" "$(cat $z/temp 2>/dev/null)"; done"#;
+        let listing = match self.hdc(&["shell", probe]) {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+            Err(_) => return,
+        };
+        let mut found = None;
+        for line in listing.lines() {
+            let mut it = line.split_whitespace();
+            let (Some(dir), Some(ty), Some(temp)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            if ty == wanted_type {
+                found = Some((dir.to_string(), temp.parse::<i64>().unwrap_or(0)));
+                break;
+            }
+        }
+        match found {
+            Some((dir, temp)) => {
+                eprintln!("ohos: thermal zone {wanted_type} = {dir} (currently {temp} m°C)");
+                self.thermal_zone = Some(dir);
+            }
+            None => {
+                eprintln!(
+                    "warning: no thermal zone of type {wanted_type:?}; thermal columns will be                      blank. Zones on this device:\n{}",
+                    listing.trim()
+                );
+                self.thermal_zone = None;
+            }
+        }
     }
 
     /// Read the current `persist.hitrace.level.threshold` via

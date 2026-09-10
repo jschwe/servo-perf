@@ -112,7 +112,10 @@ campaign where one leg quietly ran with a different window than the other is
 not a comparison, and the file makes that visible in review.
 
 Each cell lands in `<out>/<leg>-<workload>/`, a normal `bench` output
-directory. A failing cell is reported and the run continues.
+directory, and the run writes `<out>/comparison.md` tabulating the legs side by
+side per workload — totals, `reflow.count`, and a `per_reflow` for each
+grouping, with a percentage column when there are exactly two legs. A failing
+cell is reported and the run continues.
 
 Selecting the engine is the one thing servoperf will not guess. Give a leg a
 `setup` command — `setup = "param set <engine-param> <value>"`, run as
@@ -167,6 +170,11 @@ Three groupings are reported per engine so the boundary is explicit:
 | `instructions.layout_proper` | `restyle_and_build_trees` | `LocalFrameView::UpdateStyleAndLayout(` |
 | `instructions.paint_prep` | `build_stacking_context_tree` + `build_display_list` | `RunPaintLifecyclePhase` + `PrePaintTreeWalk` |
 | `instructions.colleagues_reflow` | `Window>::reflow` | `Document::UpdateStyleAndLayout(` + `WebFrameWidgetImpl::UpdateLifecycle` |
+
+Each grouping also gets its own ratio — `instructions.per_reflow.layout_proper`
+and so on — alongside the bare `instructions.per_reflow`, which uses the
+engine's configured `reflow_instructions` symbol and is also published under
+that symbol's own name so it is never ambiguous which numerator produced it.
 
 A group credits a sample **once** if the chain contains any member, so nested
 members are not double-counted. That matters for `colleagues_reflow` on the

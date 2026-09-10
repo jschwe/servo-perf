@@ -168,6 +168,13 @@ pub struct OhosArgs {
     /// unused; that's bounded by `--ohos-capture-seconds`.
     #[arg(long, default_value_t = 45)]
     pub ohos_record_seconds: u64,
+    /// Thermal zone `type` to sample per iteration (see
+    /// `/sys/class/thermal/*/type`). Not every zone is live: on PLR-AL00
+    /// `soc_thermal` reads a flat 30000 under any load while `board_thermal`
+    /// tracks, so a run whose thermal columns never move is usually pointed at
+    /// a placeholder rather than a cool device.
+    #[arg(long, default_value = "soc_thermal")]
+    pub ohos_thermal_zone: String,
     /// Collect per-function inclusive instruction counts per iteration via
     /// `hiperf record -a -e hw-instructions`, running in parallel with the
     /// hitrace capture. The per-engine symbol list lives in

@@ -40,6 +40,10 @@ pub struct ConfigResults {
 
 #[derive(Debug, Serialize)]
 pub struct RunResults {
+    /// The command line this run was invoked with, so the report reproduces
+    /// what actually ran rather than a guess reassembled from the results.
+    #[serde(default)]
+    pub command: String,
     pub tool_version: String,
     pub timestamp_utc: String,
     pub workload: Workload,
@@ -55,6 +59,43 @@ pub fn write_json(out_dir: &Path, data: &RunResults) -> Result<()> {
     serde_json::to_writer_pretty(file, data)
         .with_context(|| format!("writing JSON to {}", path.display()))?;
     Ok(())
+}
+
+/// Render a Unix timestamp as `YYYY-MM-DD HH:MM:SS UTC`.
+///
+/// Civil-from-days per Howard Hinnant's algorithm, so the report carries a
+/// date a reader can compare against a lab notebook without pulling in a
+/// date-time crate for one line of output.
+pub fn format_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Shift the epoch to 0000-03-01 so leap days land at the end of the cycle.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sec:02} UTC")
+}
+
+/// The current process's command line, shell-quoted well enough to paste back.
+pub fn invocation() -> String {
+    std::env::args()
+        .map(|a| {
+            if a.is_empty() || a.contains([' ', '"', '\'', '$', '`']) {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            } else {
+                a
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn write_markdown(out_dir: &Path, data: &RunResults) -> Result<()> {
@@ -124,6 +165,9 @@ fn fcp_bar(ms: f64, max: f64, width: usize) -> String {
 /// stays aligned with the iteration list.
 fn render_per_iter_chart(s: &mut String, short: &str, metric: &str, cfg: &ConfigResults) {
     writeln!(s, "### Per-iteration {}\n", short).unwrap();
+    // Fenced: without it Markdown reflows the rows into one paragraph and the
+    // bars stop lining up.
+    writeln!(s, "```").unwrap();
     let bar_width = 30usize;
     let max_v = cfg
         .iterations
@@ -152,7 +196,7 @@ fn render_per_iter_chart(s: &mut String, short: &str, metric: &str, cfg: &Config
             }
         }
     }
-    writeln!(s).unwrap();
+    writeln!(s, "```\n").unwrap();
 }
 
 /// Presented-frame metrics for scenario workloads. Rendered only when the
@@ -321,6 +365,9 @@ fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
     fn mc_to_c(mc: f64) -> f64 {
         mc / 1000.0
     }
+    fn all_equal(v: &[f64]) -> bool {
+        v.len() > 1 && v.windows(2).all(|w| w[0] == w[1])
+    }
     let befores: Vec<f64> = cfg
         .iterations
         .iter()
@@ -352,7 +399,17 @@ fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
         })
         .collect();
 
-    writeln!(s, "### SoC thermal (zone0 `soc_thermal`, 70 °C trip)\n").unwrap();
+    writeln!(s, "### SoC thermal\n").unwrap();
+    if all_equal(&befores) && all_equal(&afters) {
+        writeln!(
+            s,
+            "> Every iteration reported the same before and after value. That is a static \
+             zone, not a thermally flat run — some devices pin a placeholder here (PLR-AL00 \
+             reports a flat 30000 m°C on `soc_thermal` under any load). Re-run with \
+             `--ohos-thermal-zone board_thermal`, or read these two columns as unavailable.\n"
+        )
+        .unwrap();
+    }
     let min_temp = befores
         .iter()
         .chain(afters.iter())
@@ -476,7 +533,9 @@ fn render_markdown(data: &RunResults) -> String {
         "bench"
     };
     writeln!(s, "## Reproduction\n").unwrap();
-    if subcommand == "ab" {
+    if !data.command.is_empty() {
+        writeln!(s, "```\n{}\n```\n", data.command).unwrap();
+    } else if subcommand == "ab" {
         let base_bin = data
             .configs
             .get("base")
@@ -757,6 +816,7 @@ mod tests {
         );
 
         let data = RunResults {
+            command: "servoperf bench demo --ohos".to_string(),
             tool_version: "0.1.0".into(),
             timestamp_utc: "2026-04-22T12:00:00Z".into(),
             workload: dummy_workload(),
