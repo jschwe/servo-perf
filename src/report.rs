@@ -40,6 +40,11 @@ pub struct ConfigResults {
 
 #[derive(Debug, Serialize)]
 pub struct RunResults {
+    /// True when the run was interrupted rather than completing its planned
+    /// iterations. Without it a stopped run is indistinguishable from a
+    /// finished one: it writes the same files and exits 0.
+    #[serde(default)]
+    pub cancelled: bool,
     /// The command line this run was invoked with, so the report reproduces
     /// what actually ran rather than a guess reassembled from the results.
     #[serde(default)]
@@ -567,6 +572,15 @@ fn render_markdown(data: &RunResults) -> String {
         "bench"
     };
     writeln!(s, "## Reproduction\n").unwrap();
+    if data.cancelled {
+        writeln!(
+            s,
+            "> **This run was interrupted.** It reports the iterations that completed \
+             before the stop, so its `n` is smaller than the workload asked for and any \
+             comparison against it is over fewer samples.\n"
+        )
+        .unwrap();
+    }
     if !data.command.is_empty() {
         writeln!(s, "```\n{}\n```\n", data.command).unwrap();
     } else if subcommand == "ab" {
@@ -877,6 +891,7 @@ mod tests {
         );
 
         let data = RunResults {
+            cancelled: false,
             command: "servoperf bench demo --ohos".to_string(),
             tool_version: "0.1.0".into(),
             timestamp_utc: "2026-04-22T12:00:00Z".into(),
