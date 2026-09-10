@@ -113,8 +113,7 @@ pub fn aggregate_inclusive_from_perf_data(
     }
 
     let sym_path = workloads_dir.join(&engine.symbol_file);
-    let symbolizer = Symbolizer::load(&sym_path)
-        .with_context(|| format!("loading symbols from {}", sym_path.display()))?;
+    let symbolizer = Symbolizer::load(&sym_path)?;
     // The DSO basename hiperf records under MMAP2's path field (e.g.
     // "libarkweb_engine.so" or "libservoshell.so"). Pre-compute the symbol
     // file's basename for the same comparison.
@@ -522,12 +521,7 @@ impl SymbolIndex {
     /// section table once and rewriting every symbol's bounds in
     /// file-offset space, so lookups at runtime are a single binary
     /// search.
-    fn load(elf_path: &Path) -> Result<Self> {
-        let bytes =
-            std::fs::read(elf_path).with_context(|| format!("reading {}", elf_path.display()))?;
-        let elf = object::File::parse(bytes.as_slice())
-            .with_context(|| format!("parsing ELF {}", elf_path.display()))?;
-
+    fn from_elf(elf: &object::File) -> Self {
         // Build a vaddr-range → file-offset-delta map, one entry per
         // allocated section that backs file content. NOBITS sections
         // (.bss etc) have no file backing so we skip them.
@@ -582,7 +576,7 @@ impl SymbolIndex {
             });
         }
         entries.sort_by_key(|e| e.start);
-        Ok(SymbolIndex { entries })
+        SymbolIndex { entries }
     }
 
     /// File-offset → vaddr map, the inverse of the rewrite [`Self::load`]
@@ -865,7 +859,7 @@ mod tests {
 /// as "this phase is free" rather than "this measurement is blind", which is
 /// the failure this type exists to remove.
 struct Symbolizer {
-    symtab: SymbolIndex,
+    symtab: std::sync::Arc<SymbolIndex>,
     dwarf: Option<DwarfIndex>,
 }
 
@@ -875,13 +869,57 @@ struct DwarfIndex {
     offset_to_vaddr: Vec<(u64, u64, i64)>,
 }
 
+/// The parts of a staged library that can be shared between aggregations.
+///
+/// Aggregations run on background threads, one per iteration, several alive at
+/// once. Each used to re-read a 150-300 MB ELF twice and re-demangle ~700k
+/// symbol names. The bytes and the symbol index are immutable, so one copy
+/// serves all of them; addr2line's `Context` is not `Sync` (it memoises
+/// lazily behind `UnsafeCell`), so that part is still built per aggregation —
+/// from the shared bytes rather than from disk.
+#[derive(Clone)]
+struct SharedElf {
+    bytes: std::sync::Arc<Vec<u8>>,
+    symtab: std::sync::Arc<SymbolIndex>,
+}
+
+static ELF_CACHE: std::sync::Mutex<Option<(std::path::PathBuf, SharedElf)>> =
+    std::sync::Mutex::new(None);
+
+fn shared_elf(elf_path: &Path) -> Result<SharedElf> {
+    let mut slot = ELF_CACHE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("symbol cache poisoned"))?;
+    if let Some((path, shared)) = slot.as_ref() {
+        if path == elf_path {
+            return Ok(shared.clone());
+        }
+    }
+    let bytes = std::sync::Arc::new(
+        std::fs::read(elf_path).with_context(|| format!("reading {}", elf_path.display()))?,
+    );
+    let elf = object::File::parse(bytes.as_slice())
+        .with_context(|| format!("parsing ELF {}", elf_path.display()))?;
+    let shared = SharedElf {
+        symtab: std::sync::Arc::new(SymbolIndex::from_elf(&elf)),
+        bytes: bytes.clone(),
+    };
+    // A campaign switches engines between legs, so keep the most recent rather
+    // than every library ever staged.
+    *slot = Some((elf_path.to_path_buf(), shared.clone()));
+    Ok(shared)
+}
+
 impl Symbolizer {
-    fn load(elf_path: &Path) -> Result<Self> {
-        let symtab = SymbolIndex::load(elf_path)?;
-        let bytes =
-            std::fs::read(elf_path).with_context(|| format!("reading {}", elf_path.display()))?;
-        let elf = object::File::parse(bytes.as_slice())
+    /// Read the ELF once and build both indexes from it.
+    ///
+    /// Worth the care: the staged libraries are 150-300 MB, and one of these
+    /// is built per aggregation — of which several run at once.
+    pub fn load(elf_path: &Path) -> Result<Self> {
+        let shared = shared_elf(elf_path)?;
+        let elf = object::File::parse(shared.bytes.as_slice())
             .with_context(|| format!("parsing ELF {}", elf_path.display()))?;
+        let symtab = shared.symtab;
         let has_debug_info = elf.section_by_name(".debug_info").is_some();
         let dwarf = if has_debug_info {
             match load_dwarf_context(&elf) {
