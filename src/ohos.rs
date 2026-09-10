@@ -280,13 +280,27 @@ impl OhosTarget {
         // Best-effort uninstall first; hdc isn't reliable about exit codes.
         let _ = self.hdc(&["uninstall", &self.bundle]);
         let hap_str = hap.to_string_lossy().to_string();
-        self.hdc(&["install", "-r", &hap_str])
+        let out = self
+            .hdc(&["install", "-r", &hap_str])
             .with_context(|| format!("installing {}", hap.display()))?;
+        // `hdc install` reports failure on stdout and still exits 0, which
+        // leaves the *previous* build installed while the run believes it is
+        // measuring the new one — an A/B that then reports a near-zero delta.
+        let text = String::from_utf8_lossy(&out.stdout);
+        anyhow::ensure!(
+            text.contains("successfully") || text.contains("success"),
+            "installing {} did not report success: {}",
+            hap.display(),
+            text.trim()
+        );
         Ok(())
     }
 
     /// Stop any running instance of the bundle. Tolerates "not running".
     pub fn force_stop(&self) {
+        // Best-effort by design — called on paths where there may be nothing
+        // to stop. A stop that silently fails is caught later by the pid
+        // comparison across the capture window, which sees the old process.
         let _ = self.hdc(&["shell", "aa", "force-stop", &self.bundle]);
     }
 
@@ -382,6 +396,16 @@ impl OhosTarget {
     pub fn set_trace_level(&self, level: &str) -> Result<()> {
         self.hdc(&["shell", "hitrace", "--trace_level", level])
             .with_context(|| format!("hitrace --trace_level {level}"))?;
+        // `hdc shell` does not propagate the device command's exit status, so
+        // the call above returns Ok whether or not the level changed. Read it
+        // back: silently failing to raise the level drops every Servo TRACE
+        // span, and the iteration then "succeeds" with a thinner trace and a
+        // reflow count of zero.
+        let now = self.get_trace_level()?;
+        anyhow::ensure!(
+            now.eq_ignore_ascii_case(level),
+            "hitrace --trace_level {level} did not take effect: the device still reports {now}"
+        );
         Ok(())
     }
 
@@ -839,8 +863,21 @@ impl OhosTarget {
             if at > elapsed {
                 std::thread::sleep(at - elapsed);
             }
-            if let Err(e) = self.hdc(&["shell", cmd]) {
-                eprintln!("warning: step {cmd:?} failed: {e:#}");
+            match self.hdc(&["shell", cmd]) {
+                Err(e) => eprintln!("warning: step {cmd:?} failed: {e:#}"),
+                Ok(out) => {
+                    // `hdc shell` swallows the device's exit status, so a step
+                    // that did nothing looks identical to one that worked —
+                    // and a scroll that never happened measures an idle page,
+                    // which reads as a faster engine.
+                    let text = String::from_utf8_lossy(&out.stdout);
+                    if let Some(line) = text.lines().find(|l| {
+                        let l = l.to_ascii_lowercase();
+                        l.contains("error") || l.contains("not found") || l.contains("failed")
+                    }) {
+                        eprintln!("warning: step {cmd:?} reported: {}", line.trim());
+                    }
+                }
             }
         }
     }
