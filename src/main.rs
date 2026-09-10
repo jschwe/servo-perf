@@ -8,6 +8,7 @@ mod cpufreq;
 mod fixtures;
 mod fps;
 mod instructions;
+mod log_once;
 mod ohos;
 #[cfg(feature = "pftrace")]
 mod proto;
