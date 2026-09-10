@@ -72,6 +72,14 @@ records name. If step 1 printed a differently-named library, rename the file
 and update `symbol_file` in that engine's entry in
 [`workloads/_instructions.toml`](../workloads/_instructions.toml).
 
+The staged file is checked against the device before the first iteration: both
+GNU build ids are read — the device's from a 16 KB prefix, so it costs
+milliseconds — and a mismatch **fails the run**. A stale staging is otherwise
+invisible: it resolves every sample against the old layout and reports
+plausible wrong numbers. The device path comes from `device_library` in
+`_instructions.toml`; clearing it skips the check, at the cost of trusting the
+staging.
+
 `workloads/*.so` is gitignored.
 
 ## 3. Smoke run — one iteration per engine

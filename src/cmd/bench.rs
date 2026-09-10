@@ -44,7 +44,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             match selected {
                 Some(e) => {
                     if args.ohos.with_instructions {
-                        check_engine_symbols(e, &workloads_dir);
+                        check_engine_symbols(ohos, e, &workloads_dir)?;
                     }
                     Some(e.clone())
                 }
@@ -411,9 +411,13 @@ fn workloads_dir() -> PathBuf {
 /// ELF is ~290 MB and pushing it per run cost more than the capture itself.
 /// Missing file isn't fatal: the bench still captures perf.data, and the
 /// counts can be re-derived once the file is in place.
-fn check_engine_symbols(engine: &EngineConfig, workloads_dir: &Path) {
+fn check_engine_symbols(
+    target: &OhosTarget,
+    engine: &EngineConfig,
+    workloads_dir: &Path,
+) -> Result<()> {
     if engine.symbol_file.is_empty() {
-        return;
+        return Ok(());
     }
     let host_path = workloads_dir.join(&engine.symbol_file);
     if !host_path.exists() {
@@ -425,6 +429,47 @@ fn check_engine_symbols(engine: &EngineConfig, workloads_dir: &Path) {
             host_path,
             host_path.display(),
         );
+        return Ok(());
+    }
+    let Some(device_path) = engine.device_library.as_deref() else {
+        eprintln!(
+            "warning: engine {:?} has no `device_library`, so the staged symbol file cannot be \
+             checked against what is installed. A stale file resolves every sample against the \
+             old layout and reports plausible wrong numbers.",
+            engine.id
+        );
+        return Ok(());
+    };
+
+    // Read both build ids and refuse to measure unless they agree. Failing
+    // here costs a minute; not failing costs a campaign, because a mismatch
+    // produces attributions that look entirely reasonable.
+    let staged = std::fs::read(&host_path).ok().and_then(|b| {
+        crate::instructions::symbols::build_id_from_elf_prefix(&b[..b.len().min(1 << 16)])
+    });
+    let installed = target.remote_build_id(device_path);
+    match (staged, installed) {
+        (Some(a), Some(b)) if a == b => {
+            eprintln!(
+                "ohos: {} matches the installed library (build id {a})",
+                engine.symbol_file
+            );
+            Ok(())
+        }
+        (Some(a), Some(b)) => anyhow::bail!(
+            "{} is not the installed library: staged build id {a}, {device_path} has {b}. \
+             Re-stage the symbol file for the build that is on the device.",
+            host_path.display()
+        ),
+        (None, _) => anyhow::bail!(
+            "{} carries no GNU build id, so it cannot be checked against the device. Link it \
+             with --build-id, or clear `device_library` to measure without the check.",
+            host_path.display()
+        ),
+        (_, None) => anyhow::bail!(
+            "could not read a build id from {device_path} on the device — wrong path, or the \
+             library has none. Fix `device_library`, or clear it to measure without the check."
+        ),
     }
 }
 

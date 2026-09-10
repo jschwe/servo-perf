@@ -66,6 +66,14 @@ pub struct EngineConfig {
     /// bench also reports `instructions.per_reflow`.
     #[serde(default)]
     pub reflow_instructions: Option<String>,
+    /// Where this engine's library lives on the device, so its build id can
+    /// be checked against the staged symbol file before a run.
+    ///
+    /// Unset skips the check, and the run then trusts that the staged file is
+    /// the build that is installed — which is exactly the assumption that
+    /// produces confident wrong attributions after a rebuild.
+    #[serde(default)]
+    pub device_library: Option<String>,
     /// Named sums over several `functions` patterns, for reporting a phase
     /// that no single symbol covers — Servo's paint prep is a stacking-context
     /// tree plus a display list, for instance.
@@ -250,6 +258,7 @@ mod tests {
             reflow_spans: vec!["performLayout".into()],
             reflow_instructions: None,
             groups: vec![],
+            device_library: None,
         };
         let mut slices = vec![
             slice_at("H:LocalFrameView::performLayout", 50), // before the window
@@ -279,6 +288,7 @@ mod tests {
             reflow_spans: vec!["LocalFrameView::performLayout".into()],
             reflow_instructions: None,
             groups: vec![],
+            device_library: None,
         };
         let slices = vec![
             slice("H:LocalFrameView::performLayout"),
@@ -301,6 +311,7 @@ mod tests {
             reflow_spans: vec![],
             reflow_instructions: None,
             groups: vec![],
+            device_library: None,
         };
         assert!(
             count_reflow_spans_in(&reflow_span_starts(&[slice("a")], &engine), None).is_empty()
