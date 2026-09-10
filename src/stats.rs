@@ -114,9 +114,27 @@ pub struct Spread {
     pub cv: f64,
     /// Standard error of the mean.
     pub sem: f64,
-    /// Half-width of a rough 95% interval on the mean, as a fraction of it:
-    /// a difference smaller than this cannot be told from noise at this `n`.
+    /// Half-width of a rough 95% interval on this leg's own mean, as a
+    /// fraction of it.
+    ///
+    /// Not the floor for a *comparison*: a difference of two independent means
+    /// carries both legs' error, so use [`resolvable_between`] for that. The
+    /// two differ by about √2, enough to mark a delta significant in one
+    /// breath and unresolvable in the next.
     pub resolvable: f64,
+}
+
+/// The smallest relative difference between two legs that is not noise, as a
+/// fraction of the first leg's mean.
+///
+/// Two standard errors of the *difference*, which is what the comparison table
+/// tests a delta against — so the table and the note beside it cannot
+/// disagree.
+pub fn resolvable_between(a: &Spread, b: &Spread) -> f64 {
+    if a.mean == 0.0 {
+        return 0.0;
+    }
+    2.0 * (a.sem.powi(2) + b.sem.powi(2)).sqrt() / a.mean.abs()
 }
 
 pub fn spread(samples: &[f64]) -> Option<Spread> {
@@ -131,11 +149,11 @@ pub fn spread(samples: &[f64]) -> Option<Spread> {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = xs.len();
     let mean = xs.iter().sum::<f64>() / n as f64;
-    let median = if n % 2 == 1 {
-        xs[n / 2]
-    } else {
-        (xs[n / 2 - 1] + xs[n / 2]) / 2.0
-    };
+    // Deliberately the same nearest-rank definition `summarise` uses, so the
+    // per-run report and the campaign comparison cannot print different p50s
+    // for the same data — they disagreed at every even `n`, which is any cell
+    // shortened by a failed or cancelled iteration.
+    let median = xs[(((n as f64 - 1.0) * 0.5).round() as usize).min(n - 1)];
     let sd = (xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0)).sqrt();
     let cv = if mean != 0.0 { sd / mean.abs() } else { 0.0 };
     let sem = sd / (n as f64).sqrt();
@@ -199,6 +217,33 @@ pub fn outliers(samples: &[f64]) -> Vec<usize> {
 #[cfg(test)]
 mod spread_tests {
     use super::*;
+
+    #[test]
+    fn the_two_medians_agree() {
+        // They disagreed at even n, so a cell shortened by one failed
+        // iteration printed different p50s in report.md and comparison.md.
+        for xs in [
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![1.0, 2.0, 3.0],
+            vec![10.0, 10.0, 20.0, 30.0, 40.0, 50.0],
+        ] {
+            assert_eq!(
+                spread(&xs).unwrap().median,
+                summarise(&xs).unwrap().p50,
+                "disagreement for {xs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_comparison_floor_carries_both_legs_error() {
+        let a = spread(&[100.0, 102.0, 98.0, 101.0]).unwrap();
+        let b = spread(&[100.0, 103.0, 97.0, 100.0]).unwrap();
+        // Two independent means carry more error than one, so the pairwise
+        // floor must exceed either leg's own.
+        assert!(resolvable_between(&a, &b) > a.resolvable);
+        assert!(resolvable_between(&a, &b) > b.resolvable);
+    }
 
     #[test]
     fn one_sample_reports_no_spread_rather_than_no_uncertainty() {
