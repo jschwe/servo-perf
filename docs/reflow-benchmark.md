@@ -247,7 +247,38 @@ Two levers that do **not** help sample loss: hiperf's `--cpu-limit` (at 100 it
 collected twice as many samples and lost 17.9% instead of 6.8%) and `-m`
 (already at its 1024-page maximum).
 
-## 7. Stopping a run
+## 7. Core placement and clock headroom
+
+Not checked automatically, and the suite's default tags do not even collect the
+inputs. `servoperf cpufreq <trace>` reports, per thread, the share of its
+running time on each cluster (`little` / `mid` / `big`, derived from the OPP
+sets) and its clock as a percentage of what those cores could have offered.
+That is the measurement; it needs a capture taken with the `sched` and `freq`
+tags:
+
+```sh
+servoperf bench mossel-index --ohos-trace-tags app,nweb,sched,freq --iterations 1
+servoperf cpufreq out/<run>/iter_0.hitrace.txt
+```
+
+Worth doing once per device or after any scheduler-affecting change, not on
+every run — those two tags multiply the trace volume.
+
+What it does and does not tell you: **retired instructions are essentially
+invariant to which cluster runs the code** — same ISA, same binary, same
+instruction stream — so a LITTLE core does not by itself inflate an instruction
+count. What it inflates is wall time and cycles. Two indirect routes can still
+move the instruction count, and both are worth ruling out before trusting an
+engine comparison:
+
+- **Spin-then-sleep.** Layout runs on rayon, whose workers spin before
+  parking. A thread starved of a big core makes its peers spin longer, which
+  retires real instructions for no work done.
+- **Time-boxed captures.** A slower placement completes less of the page inside
+  a fixed window, which changes what the capture contains rather than what the
+  work costs.
+
+## 8. Stopping a run
 
 Ctrl-C once: the run stops at the next iteration boundary, writes the results
 collected so far, and restores the device state it changed (hitrace level,
@@ -260,7 +291,7 @@ Before this existed, a Ctrl-C that killed the child `hdc` process was seen by
 servoperf as a failed *iteration* — logged, and the loop carried on to the
 next — so a long run appeared to ignore it.
 
-## 8. When a number looks wrong
+## 9. When a number looks wrong
 
 An iteration whose app crashed is reported as **failed**, not as a success
 with missing metrics, and the device's own crash report is pulled next to the
