@@ -123,6 +123,12 @@ side per workload — totals, `reflow.count`, and a `per_reflow` for each
 grouping, with a percentage column when there are exactly two legs. A failing
 cell is reported and the run continues.
 
+servoperf holds a screen wakelock for the whole run — across every cell and
+every engine-switch prompt, since those gaps are exactly when the screen would
+sleep, and a screen-off backgrounds and then *freezes* the app, silently
+covering a partly-suspended process. It cannot dismiss a lock screen that is
+*already* up, and warns when it sees one.
+
 Selecting the engine is the one thing servoperf will not guess. Give a leg a
 `setup` command — `setup = "param set <engine-param> <value>"`, run as
 `hdc shell` before the leg — or leave it out and the run pauses and asks you to
