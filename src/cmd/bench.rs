@@ -454,7 +454,7 @@ fn check_engine_symbols(
         );
         return Ok(());
     }
-    let Some(device_path) = engine.device_library.as_deref() else {
+    if engine.device_library.is_empty() {
         eprintln!(
             "warning: engine {:?} has no `device_library`, so the staged symbol file cannot be \
              checked against what is installed. A stale file resolves every sample against the \
@@ -462,7 +462,17 @@ fn check_engine_symbols(
             engine.id
         );
         return Ok(());
+    }
+    let Some(device_path) = target.first_existing(&engine.device_library) else {
+        anyhow::bail!(
+            "none of engine {:?}'s device_library paths exist on the device: {:?}. Add the \
+             right one, or clear the list to measure without the check.",
+            engine.id,
+            engine.device_library
+        );
     };
+    let device_path = device_path.as_str();
+    {}
 
     // Read both build ids and refuse to measure unless they agree. Failing
     // here costs a minute; not failing costs a campaign, because a mismatch
@@ -516,6 +526,7 @@ pub(crate) fn build_target(ohos: &OhosArgs, bin: Option<&Path>) -> Result<Target
     let workloads_dir = workloads_dir();
     if let Ok(cfg) = InstructionsConfig::load(&workloads_dir) {
         if let Some(engine) = cfg.engine_for_bundle(&target.bundle) {
+            target.engine_launch_args = engine.launch_args.clone();
             target.engine_proxy_args = engine.proxy_args.clone();
         }
     }
