@@ -3,6 +3,7 @@
 
 mod cli;
 mod cmd;
+mod cpufreq;
 mod fixtures;
 mod fps;
 mod instructions;
@@ -26,6 +27,7 @@ fn main() -> Result<()> {
         cli::Command::Ab(a) => cmd::ab::run(a),
         #[cfg(feature = "pftrace")]
         cli::Command::Dump(a) => cmd::dump::run(a),
+        cli::Command::CpuFreq(a) => cpufreq::run(&a),
         cli::Command::Regression(a) => cmd::regression::run(a),
         cli::Command::PrepareArkwebSymbols(a) => cmd::prepare_symbols::run(a),
     }

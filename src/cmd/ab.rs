@@ -294,6 +294,7 @@ fn run_and_record(
                         art.thread_cpu
                             .as_ref()
                             .map(|(b, a)| (b.as_str(), a.as_str())),
+                        Some(&pftrace),
                     );
                     Iteration {
                         index: iter,

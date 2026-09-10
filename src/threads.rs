@@ -95,7 +95,7 @@ pub struct ThreadCost {
 
 /// Fold servo's pool suffixes so `Canvas#1`/`Canvas#2` aggregate into `Canvas`.
 /// Threads whose names are genuinely distinct stay distinct.
-fn group_name(comm: &str) -> String {
+pub(crate) fn group_name(comm: &str) -> String {
     let base = comm.split('#').next().unwrap_or(comm);
     let base = base.trim_end_matches(|c: char| c.is_ascii_digit());
     let trimmed = base.trim_end_matches(['-', '_', ' ']);
@@ -141,6 +141,26 @@ pub fn costs(before: &ThreadCpuSample, after: &ThreadCpuSample, frames: f64) -> 
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     out
+}
+
+/// CPU per thread group counted from process start rather than from the
+/// opening sample, i.e. the absolute `utime + stime` in `after`.
+///
+/// Only meaningful when the process was launched cold for this window, which
+/// is how every iteration runs. Use it for page loads, where most of the work
+/// happens before the opening sample can be taken; use [`costs`] for
+/// steady-state rendering, where the startup cost is exactly what to exclude.
+/// `before` supplies only the window's start time, for `core_pct`.
+pub fn costs_since_process_start(
+    before: &ThreadCpuSample,
+    after: &ThreadCpuSample,
+    frames: f64,
+) -> Vec<ThreadCost> {
+    let origin = ThreadCpuSample {
+        wall_s: before.wall_s,
+        threads: BTreeMap::new(),
+    };
+    costs(&origin, after, frames)
 }
 
 /// Device-side shell that produces one sample. `{pid}` is substituted.

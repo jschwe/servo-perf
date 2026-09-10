@@ -121,6 +121,65 @@ archive, then re-run with `--ohos`.
     [SmartPerf Host](https://gitcode.com/openharmony/developtools_smartperf_host/releases)
     for a swimlane view, or `grep` for specific span names.
 
+## CPU frequency
+
+On a big.LITTLE phone, CPU-milliseconds cannot tell a thread that does more
+work from one that runs slower, and the difference is large: servo's canvas
+thread has been measured at 0.52 GHz on a cluster that reaches 2.15 GHz, i.e.
+24% of the clock available to it. A frame handed along a chain of threads is
+exactly the workload a utilisation-driven governor mis-serves, because each
+thread idles while the others work and no run queue ever looks busy.
+
+OHOS runs report this automatically from the hitrace capture:
+
+- `cluster_ghz.<cluster>`, `cluster_max_opp_pct.<cluster>` — per-cluster mean
+  clock and time spent at the top operating point.
+- `clock_headroom_pct` — how much clock the busiest thread (or, without
+  `sched`, the busiest cluster) was not given.
+- `thread_ghz.<thread>` — clock while that thread was on a CPU.
+- `thread_pct_of_max_ghz.<thread>` — that clock as a share of the top
+  frequency of the cores it ran on. **This is the number to read.**
+
+The cluster rows and `clock_headroom_pct` need only `cpu_frequency`, which the
+default tag list already captures, so every OHOS run gets them for free. Naming
+the *thread* additionally needs `sched_switch`, which is high volume (~200 MB
+for a 20 s capture, versus ~10 MB without) and so is opt-in:
+
+```bash
+servoperf bench <workload> --ohos --ohos-trace-tags=app,graphic,ohos,freq,idle,sched
+```
+
+Clusters are derived from the frequencies observed per CPU, so no core map is
+hardcoded and the numbers are right on any device.
+
+These land in `raw.json`; `report.md` stays a curated summary.
+
+**Read `clock_headroom_pct` before trusting an A/B.** A run whose busiest
+thread is near its ceiling is limited by the work it does, so an optimisation
+moves the result. A run far below it is limited by the governor, and an A/B
+there largely measures which side of the ramp each iteration landed on — a
+null result from such a run has not tested the change. servoperf prints a
+warning when this happens. The same device has been seen in both regimes on
+consecutive days.
+
+To inspect a capture directly:
+
+```bash
+./target/release/servoperf cpufreq out/<run>/iter_0.hitrace.txt
+```
+
+```text
+thread                      n    cpu_s   eff_GHz  %of_max  clusters
+Canvas                     49    21.69     0.522      24%  mid 100% big 0%
+Script                      1    17.25     1.867      76%  big 89% mid 11%
+org.servo.servo             9    11.46     0.754      46%  little 95% mid 4% big 1%
+
+cluster                  cpus   mean_GHz    max_GHz    max_OPP_%
+little                0,1,2,3      0.677      1.600         5.5%
+mid               4,5,6,7,8,9      0.584      2.151         1.2%
+big                     10,11      1.692      2.500         5.3%
+```
+
 ## Workloads
 
 TOML files in [`workloads/`](workloads/). Each names a URL and optional local fixture. To add one: copy an existing TOML, adjust, rerun.

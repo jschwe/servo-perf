@@ -172,6 +172,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
                     art.thread_cpu
                         .as_ref()
                         .map(|(b, a)| (b.as_str(), a.as_str())),
+                    Some(&pftrace),
                 );
                 // Per-function inclusive instruction counts run on a
                 // background thread so the next iteration's recording

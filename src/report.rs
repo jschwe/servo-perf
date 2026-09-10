@@ -721,6 +721,7 @@ mod tests {
             servoshell_args: vec![],
             fixture: None,
             scenario: None,
+            steps: vec![],
         }
     }
 

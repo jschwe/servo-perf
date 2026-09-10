@@ -37,6 +37,32 @@ pub enum Command {
     /// report doesn't surface enough detail.
     #[cfg(feature = "pftrace")]
     Dump(DumpArgs),
+    /// Report what clock each thread actually ran at, from a hitrace capture
+    /// taken with the `sched` and `freq` tags. Answers whether a thread is slow
+    /// because of the work it does or because the governor never ramped it.
+    #[command(name = "cpufreq")]
+    CpuFreq(CpuFreqArgs),
+}
+
+#[derive(clap::Args, Clone)]
+pub struct CpuFreqArgs {
+    /// Path to a hitrace text capture (`iter_<n>.hitrace.txt`).
+    pub trace: PathBuf,
+    /// Also write a scheduling + frequency timeline here as JSON, for
+    /// visualising which threads ran concurrently and at what clock.
+    #[arg(long)]
+    pub timeline: Option<PathBuf>,
+    /// Length of the timeline window in milliseconds, taken from the busiest
+    /// part of the capture.
+    #[arg(long, default_value_t = 200)]
+    pub timeline_ms: u64,
+    /// Comma-separated thread-name prefixes to include in the timeline.
+    /// Empty means every thread of the process.
+    #[arg(
+        long,
+        default_value = "Canvas,Script,org.servo,WR,Constellation,Compositor"
+    )]
+    pub timeline_threads: String,
 }
 
 /// Flags that select / configure a HarmonyOS device target reached over

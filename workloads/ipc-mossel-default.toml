@@ -1,0 +1,28 @@
+name = "ipc-mossel-default"
+url = "https://m.huaweimossel.com/#/"
+iterations = 1
+viewport = [824, 1830]
+device_pixel_ratio = 2.625
+user_agent = "Mozilla/5.0 (Linux; Android 11; SAMSUNG SM-G973U) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/14.2 Chrome/87.0.4280.141 Mobile Safari/537.36"
+# Default leg of the GenericChannel A/B: in-process crossbeam channels and
+# refcounted shared memory. The `-forceipc` sibling is the same page with
+# `--force-ipc` added and must stay otherwise byte-identical.
+servoshell_args = ["--ignore-certificate-errors"]
+
+[fixture]
+kind = "wpr-replay"
+archive = "cdn-huaweimossel.wprgo"
+
+# Not an animation: the scenario block is here only for its `thread_cpu`
+# sampling, which is what turns "the page loaded faster" into "which thread
+# spent the CPU". The frame ring is sampled too, but late enough not to
+# contend with the load it is measuring.
+[scenario]
+surface = "ServoDemoSurface"
+capture_seconds = 10
+sample_interval_seconds = 5
+refresh_hz = 60
+thread_cpu = true
+# Cold-start page load: read the CPU counters once at the end, so nothing
+# walks /proc while the page is loading.
+thread_cpu_from_start = true

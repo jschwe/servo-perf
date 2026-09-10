@@ -25,6 +25,17 @@ use crate::workload::PostProcessing;
 /// a servo process is dozens of near-idle threads that would swamp a report.
 const THREAD_CPU_ROWS: usize = 12;
 
+/// Minimum on-CPU seconds before a thread's effective clock is reported.
+/// Below this the mean is dominated by whichever operating point the thread
+/// happened to catch.
+const MIN_CLOCK_SAMPLE_S: f64 = 0.05;
+
+/// Below this share of the available clock, a run is reported as
+/// frequency-limited rather than work-limited. Measured runs cluster well away
+/// from this line: a starved canvas frame sits near 25%, a saturated one above
+/// 85%.
+const STARVED_CLOCK_PCT: f64 = 70.0;
+
 /// Presented-frame timestamps for one iteration, sorted and de-duplicated.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FrameTimeline {
@@ -202,6 +213,86 @@ fn percentile(values: &[f64], p: f64) -> f64 {
     sorted[idx]
 }
 
+/// Merge per-thread and per-cluster clock metrics read out of `trace`.
+///
+/// Split out so the file is only read when a capture might contain the events;
+/// a trace without them costs one read and yields nothing.
+fn merge_clock_metrics(metrics: &mut BTreeMap<String, f64>, trace: &std::path::Path) {
+    let Ok(text) = std::fs::read_to_string(trace) else {
+        return;
+    };
+    let parsed = crate::cpufreq::parse(&text);
+    if parsed.is_empty() {
+        return;
+    }
+    let report = crate::cpufreq::analyse(&parsed, crate::cpufreq::servo_pid(&parsed));
+    for thread in report.threads.iter().take(THREAD_CPU_ROWS) {
+        // A thread that barely ran has a frequency dominated by whichever OPP
+        // it happened to catch; reporting it would invite reading noise as
+        // signal.
+        if thread.cpu_s < MIN_CLOCK_SAMPLE_S {
+            continue;
+        }
+        metrics.insert(format!("thread_ghz.{}", thread.name), thread.effective_ghz);
+        metrics.insert(
+            format!("thread_pct_of_max_ghz.{}", thread.name),
+            thread.pct_of_max,
+        );
+    }
+    for cluster in &report.clusters {
+        metrics.insert(format!("cluster_ghz.{}", cluster.name), cluster.mean_ghz);
+        metrics.insert(
+            format!("cluster_max_opp_pct.{}", cluster.name),
+            cluster.max_opp_pct,
+        );
+    }
+
+    // Whether the run had any clock headroom left decides what its numbers can
+    // show. A busiest thread near its ceiling means the workload is limited by
+    // the work it does, so an optimisation moves the result; one far below it
+    // is limited by the governor, and an A/B there mostly measures which side
+    // of the ramp each iteration landed on. Saying so is the difference between
+    // a null result that rules a change out and one that never tested it.
+    //
+    // Prefer the busiest thread, which is the most direct statement. Without
+    // the `sched` tag fall back to the busiest cluster, which needs only
+    // `freq` and answers the same question about the run as a whole.
+    let (what, ran_at, pct) = match report
+        .threads
+        .iter()
+        .find(|t| t.cpu_s >= MIN_CLOCK_SAMPLE_S)
+    {
+        Some(busiest) => (
+            busiest.name.clone(),
+            busiest.effective_ghz,
+            busiest.pct_of_max,
+        ),
+        None => {
+            let Some(busiest) = report
+                .clusters
+                .iter()
+                .filter(|c| c.max_ghz > 0.0)
+                .max_by(|a, b| a.mean_ghz.total_cmp(&b.mean_ghz))
+            else {
+                return;
+            };
+            (
+                format!("the {} cluster", busiest.name),
+                busiest.mean_ghz,
+                100.0 * busiest.mean_ghz / busiest.max_ghz,
+            )
+        }
+    };
+    metrics.insert("clock_headroom_pct".to_string(), (100.0 - pct).max(0.0));
+    if pct < STARVED_CLOCK_PCT {
+        eprintln!(
+            "warning: {what} ran at {ran_at:.2} GHz, {pct:.0}% of what its cores offer — this \
+             run was limited by cpu frequency, not by the work it did. Treat comparisons \
+             against other runs with care."
+        );
+    }
+}
+
 /// Compute a scenario workload's metrics and merge them into `metrics`.
 ///
 /// A no-op for workloads without a `[scenario]` block, so both `bench` and
@@ -214,6 +305,7 @@ pub fn merge_scenario_metrics(
     fps_dumps: &[String],
     log: Option<&str>,
     thread_cpu: Option<(&str, &str)>,
+    trace: Option<&std::path::Path>,
 ) {
     let Some(scenario) = workload.scenario.as_ref() else {
         return;
@@ -305,6 +397,30 @@ pub fn merge_scenario_metrics(
         }
         let total: f64 = costs.iter().map(|c| c.cpu_ms_per_frame).sum();
         metrics.insert("thread_cpu_ms_per_frame.total".to_string(), total);
+
+        // Same threads, counted from process start. Page-load workloads spend
+        // most of their CPU before the opening sample can be taken, so the
+        // window delta above misses it; the absolute counters do not, because
+        // every iteration cold-starts the app.
+        let absolute = crate::threads::costs_since_process_start(
+            &crate::threads::parse_sample(before),
+            &crate::threads::parse_sample(after),
+            frames,
+        );
+        for cost in absolute.iter().take(THREAD_CPU_ROWS) {
+            metrics.insert(format!("thread_cpu_ms.{}", cost.name), cost.cpu_ms);
+        }
+        let total: f64 = absolute.iter().map(|c| c.cpu_ms).sum();
+        metrics.insert("thread_cpu_ms.total".to_string(), total);
+    }
+
+    // What clock those threads ran at. CPU-milliseconds alone cannot tell a
+    // thread doing more work from one running slower, and on this hardware the
+    // second is worth more than any optimisation measured so far. Needs the
+    // `sched` and `freq` hitrace tags, so it is silently absent for local
+    // (pftrace) targets and for captures taken without them.
+    if let Some(path) = trace {
+        merge_clock_metrics(metrics, path);
     }
 
     let Some(log) = log else { return };
