@@ -57,7 +57,7 @@ pub fn run(args: SuiteArgs) -> Result<()> {
     let root = args
         .out
         .clone()
-        .unwrap_or_else(|| PathBuf::from("out").join(format!("{}-{}", suite.name, now_stamp())));
+        .unwrap_or_else(|| crate::report::default_out_dir(&suite.name));
     std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
 
     // Held across the whole matrix, not per cell: the gaps between cells — and
@@ -230,14 +230,6 @@ fn leg_ohos_args(
 
 fn suites_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("suites")
-}
-
-fn now_stamp() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("{secs}")
 }
 
 #[cfg(test)]

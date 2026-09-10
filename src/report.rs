@@ -112,6 +112,26 @@ pub fn invocation() -> String {
         .join(" ")
 }
 
+/// The current time, formatted for a report header.
+pub fn now_utc() -> String {
+    format_utc(unix_now())
+}
+
+/// Default output directory for a run: `out/<name>-<YYYYMMDD-HHMMSS>`.
+///
+/// Shared by every command. Three copies of this is how `suite` kept writing
+/// epoch seconds after the other two were fixed.
+pub fn default_out_dir(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("out").join(format!("{}-{}", name, format_utc_compact(unix_now())))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64
+}
+
 pub fn write_markdown(out_dir: &Path, data: &RunResults) -> Result<()> {
     let path = out_dir.join("report.md");
     let md = render_markdown(data);
@@ -777,6 +797,22 @@ fn render_markdown(data: &RunResults) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Guards the shape of what every command derives its output directory
+    /// and report header from. The previous bug was not a broken formatter but
+    /// a call site that kept its own copy of the epoch-seconds version.
+    #[test]
+    fn shared_helpers_produce_dates_not_epochs() {
+        let dir = super::default_out_dir("mossel");
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("mossel-"), "{name}");
+        let stamp = name.trim_start_matches("mossel-");
+        assert_eq!(stamp.len(), 15, "expected YYYYMMDD-HHMMSS, got {stamp}");
+        assert_eq!(&stamp[8..9], "-");
+        assert!(stamp.chars().filter(|c| c.is_ascii_digit()).count() == 14);
+        let now = super::now_utc();
+        assert!(now.ends_with(" UTC") && now.starts_with("20"), "{now}");
+    }
+
     #[test]
     fn utc_formatting_matches_a_known_instant() {
         // 2026-09-10T20:30:45Z
