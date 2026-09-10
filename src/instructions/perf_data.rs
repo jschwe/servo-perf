@@ -235,7 +235,72 @@ pub fn aggregate_inclusive_from_perf_data(
         }
     }
 
+    explain_zeros(&totals, &symbolizer, engine, &sym_path);
     Ok(totals)
+}
+
+/// Say why a configured target came back at zero.
+///
+/// A zero reads as "this phase is free" rather than "this measurement did not
+/// find anything", and the two are indistinguishable in the output. The
+/// symbol table can tell them apart.
+fn explain_zeros(
+    totals: &HashMap<String, u64>,
+    symbolizer: &Symbolizer,
+    engine: &EngineConfig,
+    sym_path: &Path,
+) {
+    let mut unmatched: Vec<String> = Vec::new();
+    let mut cold: Vec<String> = Vec::new();
+
+    let mut classify = |label: &str, patterns: &[String]| {
+        if totals.get(label).copied().unwrap_or(0) != 0 {
+            return;
+        }
+        let missing: Vec<&str> = patterns
+            .iter()
+            .filter(|p| !symbolizer.symtab.matches_any(p))
+            .map(|p| p.as_str())
+            .collect();
+        if missing.len() == patterns.len() {
+            unmatched.push(format!("`{label}` ({})", missing.join("`, `")));
+        } else {
+            cold.push(label.to_string());
+        }
+    };
+
+    for f in &engine.functions {
+        classify(f, std::slice::from_ref(f));
+    }
+    for g in &engine.groups {
+        classify(&g.name, &g.functions);
+    }
+
+    if !unmatched.is_empty() {
+        eprintln!(
+            "warning: these targets matched no symbol in {}, so their zero means \
+             'not found', not 'not run': {}. rustc renders an inherent method as \
+             `<Type>::method`, so the `>` is part of the name \
+             (`LayoutThread>::handle_reflow`, not `LayoutThread::handle_reflow`). Check one \
+             with `nm -C {} | grep <pattern>`.{}",
+            sym_path.display(),
+            unmatched.join(", "),
+            sym_path.display(),
+            if symbolizer.has_inline_info() {
+                ""
+            } else {
+                " This library carries no DWARF, so an inlined function has no symbol \
+                 of its own and can only report zero; build it with `debug = 1`."
+            }
+        );
+    }
+    if !cold.is_empty() {
+        eprintln!(
+            "note: {} resolved to a symbol but no sample landed in it — either the phase \
+             did not run, or the capture missed it.",
+            cold.join(", ")
+        );
+    }
 }
 
 /// Pull the basename out of an mmap path. The path field is null-terminated
@@ -298,6 +363,16 @@ struct SymbolEntry {
 }
 
 impl SymbolIndex {
+    /// Does any symbol's demangled name contain `pattern`?
+    ///
+    /// Separates the two reasons a target reports zero: a pattern that matches
+    /// no symbol at all (usually a typo, or the `<Type>::method` form rustc
+    /// renders inherent methods in), and a symbol that exists but never had a
+    /// sample land in it.
+    fn matches_any(&self, pattern: &str) -> bool {
+        self.entries.iter().any(|e| e.name.contains(pattern))
+    }
+
     /// Build a file-offset → demangled-name lookup table.
     ///
     /// On most shared libraries the executable section's `vaddr` differs
@@ -438,6 +513,22 @@ fn demangle_name(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn symbol_presence_separates_a_typo_from_a_cold_symbol() {
+        let idx = super::SymbolIndex {
+            entries: vec![super::SymbolEntry {
+                start: 0,
+                end: 16,
+                name: "<layout::layout_impl::LayoutThread>::handle_reflow".into(),
+            }],
+        };
+        // The form rustc actually emits.
+        assert!(idx.matches_any("LayoutThread>::handle_reflow"));
+        // The form that looks right and matches nothing — the `>` is part of
+        // an inherent method's demangled name.
+        assert!(!idx.matches_any("LayoutThread::handle_reflow"));
+    }
+
     /// The test binary itself is built with debug info, so it doubles as a
     /// DWARF fixture: some address in it must expand to more than one frame,
     /// or inline attribution is silently not working.
