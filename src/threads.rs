@@ -111,6 +111,16 @@ pub(crate) fn group_name(comm: &str) -> String {
 /// A thread present only in `after` counts its whole lifetime (it was spawned
 /// mid-window); one present only in `before` is dropped, since we cannot know
 /// when it exited. Both cases are reported by [`ThreadCost::threads`].
+/// True when the `before` sample carries no thread rows at all — the shape
+/// `sample_wall_clock()` produces for `thread_cpu_from_start`.
+///
+/// It matters because `costs` would then find no baseline for any thread and
+/// silently return the *absolute* counter as if it were the delta, publishing
+/// process-lifetime CPU under a per-frame name.
+pub fn is_wall_clock_only(sample: &ThreadCpuSample) -> bool {
+    sample.threads.is_empty()
+}
+
 pub fn costs(before: &ThreadCpuSample, after: &ThreadCpuSample, frames: f64) -> Vec<ThreadCost> {
     let elapsed_s = (after.wall_s - before.wall_s).max(0.0);
     let mut by_group: BTreeMap<String, (f64, usize)> = BTreeMap::new();
@@ -176,6 +186,20 @@ pub const SAMPLE_COMMAND: &str = concat!(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_wall_clock_only_sample_is_recognised() {
+        // What `sample_wall_clock()` produces for `thread_cpu_from_start`:
+        // one line, no thread rows. `costs` finds no baseline and returns the
+        // absolute counter, so the caller has to know and rename the metric.
+        let wall = super::parse_sample("1789072245.123456789\n");
+        assert!(super::is_wall_clock_only(&wall));
+        // A real /proc walk is not.
+        let full = super::parse_sample(
+            "1789072245.123456789\n1234 (Script) R 1 1 0 0 -1 0 0 0 0 0 100 200 0 0 20 0 8 0 1 0\n",
+        );
+        assert!(!super::is_wall_clock_only(&full) || full.threads.is_empty());
+    }
+
     use super::*;
 
     fn sample(wall: &str, rows: &[(&str, &str, u64, u64)]) -> String {
