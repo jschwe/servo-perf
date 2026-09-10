@@ -284,13 +284,29 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 // instructions ÷ reflows, from the same iteration. Both
                 // inputs are per-iteration, so the ratio never mixes a
                 // numerator and denominator from different runs.
-                if let Some(num) = engine.as_ref().and_then(|e| e.reflow_instructions.as_ref()) {
-                    let instr = metrics.get(&format!("instructions.{num}")).copied();
-                    let count = metrics.get("reflow.count").copied();
-                    if let (Some(instr), Some(count)) = (instr, count) {
-                        if count > 0.0 {
-                            metrics.insert("instructions.per_reflow".to_string(), instr / count);
+                if let Some(engine) = engine.as_ref() {
+                    let count = metrics.get("reflow.count").copied().unwrap_or(0.0);
+                    if count > 0.0 {
+                        // One per group, so a reader never has to guess which
+                        // numerator a bare `per_reflow` came from.
+                        let mut derived: Vec<(String, f64)> = Vec::new();
+                        for group in &engine.groups {
+                            if let Some(v) = metrics.get(&format!("instructions.{}", group.name)) {
+                                derived.push((
+                                    format!("instructions.per_reflow.{}", group.name),
+                                    v / count,
+                                ));
+                            }
                         }
+                        // Plus the engine's configured numerator, kept under
+                        // its own symbol name for the same reason.
+                        if let Some(num) = engine.reflow_instructions.as_ref() {
+                            if let Some(v) = metrics.get(&format!("instructions.{num}")) {
+                                derived.push((format!("instructions.per_reflow.{num}"), v / count));
+                                derived.push(("instructions.per_reflow".to_string(), v / count));
+                            }
+                        }
+                        metrics.extend(derived);
                     }
                 }
             }
@@ -307,10 +323,19 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // One summary entry per configured instruction symbol, across every
     // iteration that resolved it.
     if let Some(engine) = engine.as_ref() {
-        let derived = [
+        let mut derived = vec![
             "reflow.count".to_string(),
             "instructions.per_reflow".to_string(),
         ];
+        derived.extend(
+            engine
+                .groups
+                .iter()
+                .map(|g| format!("instructions.per_reflow.{}", g.name)),
+        );
+        if let Some(num) = engine.reflow_instructions.as_ref() {
+            derived.push(format!("instructions.per_reflow.{num}"));
+        }
         let keys = engine
             .functions
             .iter()
@@ -342,6 +367,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     );
 
     let data = RunResults {
+        command: crate::report::invocation(),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp_utc: now_rfc3339(),
         workload: w,
@@ -393,6 +419,7 @@ pub(crate) fn build_target(ohos: &OhosArgs, bin: Option<&Path>) -> Result<Target
         });
     }
     let mut target = OhosTarget::from_args(ohos);
+    target.resolve_thermal_zone(&ohos.ohos_thermal_zone);
     // Hydrate engine-specific proxy-arg templates from the global
     // _instructions.toml. Done here (not in OhosTarget::from_args) so
     // workloads_dir is reachable. Bench callers don't pay for this unless
@@ -464,5 +491,5 @@ fn now_rfc3339() -> String {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0) as i64;
-    format!("@{}s", secs)
+    crate::report::format_utc(secs)
 }

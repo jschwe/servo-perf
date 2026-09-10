@@ -165,6 +165,7 @@ pub fn run(args: AbArgs) -> Result<()> {
     );
 
     let data = RunResults {
+        command: crate::report::invocation(),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
         timestamp_utc: format!(
             "@{}s",
