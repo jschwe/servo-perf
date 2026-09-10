@@ -256,6 +256,12 @@ next — so a long run appeared to ignore it.
 
 ## 8. When a number looks wrong
 
+An iteration whose app crashed is reported as **failed**, not as a success
+with missing metrics, and the device's own crash report is pulled next to the
+other artefacts as `iter_<n>.faultlog.txt`. The run continues; the report's
+`Iterations: N ok, M failed` line is where to look, and a run that is more than
+half failures aborts.
+
 | symptom | cause |
 | --- | --- |
 | every `instructions.*` is 0 | symbol file missing or misnamed (step 2) |
@@ -263,4 +269,7 @@ next — so a long run appeared to ignore it.
 | `reflow.count` is 1-6 on a real page | capture window too long for the buffer — shorten it |
 | counts look plausible but the engine is wrong | a stale process kept the previous engine; force-stop before switching |
 | sample-loss warning | raise `--instructions-period` |
+| `the app exited during the capture` | it crashed; read `iter_<n>.faultlog.txt` |
+| `the app restarted during the capture` | it crashed and was respawned — the same thing, just harder to see |
+| `OpenRecording failed, errorCode(1103)` | a previous run left a hitrace recording open. Should no longer happen; clear it with `hdc shell hitrace --trace_finish -o /dev/null` |
 | `reflow.count` 0 on Servo only | that build lacks the `tracing` feature or installs no subscriber. `handle_reflow` is instrumented upstream, but the attribute expands only when both are present. `instructions.*` works either way — it comes from the PMU, not from tracing. |
