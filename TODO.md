@@ -6,7 +6,7 @@ An independent review found defects whose common shape is *silent wrongness*: a
 number that is plausible and wrong rather than an error. Ordered by whether a
 number you would put in a report changes.
 
-### Before the next campaign
+### Before the next campaign — done 2026-09-10
 
 1. **Align the reflow count with the instruction window.** `instructions.*`
    covers `[hiperf start, +capture_seconds]`; `reflow.count` covers
@@ -62,7 +62,9 @@ number you would put in a report changes.
    thinner trace), `run_steps` (a swipe that never happened measures an idle
    page and reads as a faster engine), `install_hap`, `force_stop`.
 
-### Soon
+### Soon — done 2026-09-10
+
+All seven fixed; kept here for the reasoning, not as open work.
 
 7. Count what the aggregator discards. Five `continue` paths drop samples
    silently; if `sample_type` lacks `PERF_SAMPLE_PERIOD`/`TID`, or the device
