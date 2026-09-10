@@ -5,7 +5,10 @@ name = "mossel-sort-scroll"
 # leg where `instructions.per_reflow` should be most stable.
 url = "https://m.huaweimossel.com/#/pages/sort/sort"
 iterations = 15
-servoshell_args = ["--ignore-certificate-errors"]
+# `--chrome=none` hides the wrapper app's toolbar so the Web component fills
+# the window: the toolbar costs ArkUI layout every frame and shrinks the
+# viewport, which changes how much the page has to lay out.
+servoshell_args = ["--ignore-certificate-errors", "--chrome=none"]
 
 [scenario]
 # Surface name for the app under test — `hidumper -s RenderService -a "fps"`

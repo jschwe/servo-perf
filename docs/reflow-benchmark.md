@@ -112,6 +112,12 @@ Budget ~7 minutes per workload, so ~35 minutes per engine. The `-scroll`
 variants are the same commands with `-scroll` names; they carry their own
 `capture_seconds` and swipe schedule and need `uitest` on the device.
 
+All ten workloads pass `--chrome=none`, which hides the wrapper app's toolbar
+so the Web component fills the window. That is not cosmetic: the toolbar costs
+ArkUI layout every frame and shrinks the viewport, so it changes how much of
+the page has to be laid out — it lands in the number being measured. Numbers
+taken with and without it are not comparable; re-baseline if you switch.
+
 Two things about the workloads:
 
 - **`mossel-cart` is deliberately near-empty** when logged out. It is the
@@ -191,7 +197,7 @@ not cheaper work.
 
 | knob | what it is for |
 | --- | --- |
-| `--instructions-period` | Sampling period in retired instructions. Measured on PLR-AL00 over 20 s: 100000 → 808k samples, 6.8% lost; 500000 → 295k, 0.43%; **1000000 → 165k, 0%**. Use 1000000 on a phone, 250000 on a slower board. 165k samples still puts ~16k in the reflow bucket, far past the ~1000 needed for ±1%. |
+| `--instructions-period` | How many retired instructions pass between samples. hiperf programs the PMU counter to fire every N instructions, and each sample carries N as its weight, credited to every frame in its callchain — so the metric is a sum of periods, not a count of samples, and lowering N buys resolution rather than accuracy. It costs interrupt overhead and, past a point, dropped samples. Measured on PLR-AL00 over 20 s: 100000 → 808k samples, 6.8% lost; 500000 → 295k, 0.43%; **1000000 → 165k, 0%**. Use 1000000 on a phone, 250000 on a slower board. 165k samples still puts ~16k in the reflow bucket, far past the ~1000 needed for ±1%. |
 | `--ohos-trace-tags` | Must include `nweb` for ArkWeb — Blink's layout markers are emitted under that tag and there are none without it. The default set also produces ~160 MB of trace text per 12 s, hence `app,nweb`. |
 | `--ohos-capture-seconds` | Keep it near the page's load time. hitrace's `--overwrite` keeps the *newest* records, so a long window discards the load burst: on DAYU200 a 75 s window reported 1 layout where 20 s reported 330. |
 | `--ohos-trace-buffer-kib` | Ring buffer, default 512 MB. hitrace accepts 256 KiB - 300 MB and some devices enforce the upper end (DAYU200 rejects the default; `--trace_begin` then fails with hitrace's own message). |
