@@ -148,7 +148,27 @@ warning, Windows `.exe` / `USERPROFILE` handling.* Remaining below.
   allowed buffer. `--ohos-trace-tags app,nweb` keeps the Blink layout markers
   and drops the RenderService flood.
 
-## 8. Dependency audit (2026-09-10)
+## 8. Wire the core-placement check into a run
+
+`servoperf cpufreq` already reports per-thread cluster share and clock headroom
+from a hitrace capture, but nothing runs it and the suite's default tags
+(`app,nweb`) do not capture `sched`/`freq`, so a campaign's traces cannot be
+analysed after the fact. Today it is a deliberate, separate diagnostic run.
+
+Worth adding: when a trace does contain `sched_switch`, compute the busiest
+engine thread's little-core share and clock headroom and warn below a
+threshold. The cost to watch is parse time — these traces run to hundreds of
+MB, and `cpufreq` re-reads the raw text rather than sharing `parse_hitrace_text`'s
+pass.
+
+Note the premise this does *not* support: retired instructions are invariant to
+which cluster runs the code. The routes by which placement can still move an
+instruction count are indirect — rayon workers spinning longer when a peer is
+starved, and a fixed capture window covering less of the page — so the check is
+worth having as a validity gate on a comparison, not as an explanation for an
+instruction-count difference.
+
+## 9. Dependency audit (2026-09-10)
 
 OSV over the 247 locked packages reports four advisories, none of which
 warrants acting before a measurement campaign:
@@ -176,7 +196,7 @@ standard to hold a version bump to.
 Cosmetic and not worth churn: `thiserror` 1→2, `toml` 0.8→1, `rand` 0.8→0.10,
 `prost` 0.13→0.14, `cpp_demangle` 0.4→0.5.
 
-## 9. Plan: strengthen the mossel scenario
+## 10. Plan: strengthen the mossel scenario
 
 Goal: replace the single-URL `cdn-huaweimossel` workload with a suite covering
 all five site pages, each measured twice — once as a page load, once with
