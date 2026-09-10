@@ -60,6 +60,11 @@ use crate::instructions::EngineConfig;
 pub struct Aggregation {
     /// Inclusive instruction counts, keyed by configured target or group.
     pub totals: HashMap<String, u64>,
+    /// How many samples the file held, and how many had at least one frame
+    /// inside the engine library. Without these a total of zero cannot be
+    /// told from an analysis that resolved nothing.
+    pub samples_seen: u64,
+    pub samples_in_library: u64,
     /// First and last sample timestamp, in the same monotonic clock the
     /// hitrace slices carry — so the trace can be narrowed to exactly the
     /// interval these instructions came from.
@@ -84,6 +89,11 @@ pub fn aggregate_inclusive_from_perf_data(
     workloads_dir: &Path,
 ) -> Result<Aggregation> {
     let mut window: Option<(u64, u64)> = None;
+    let mut samples_seen = 0u64;
+    let mut samples_in_library = 0u64;
+    let mut dropped_no_period = 0u64;
+    let mut dropped_no_mappings = 0u64;
+    let mut other_dsos: rustc_hash::FxHashMap<String, u64> = Default::default();
     let mut totals: HashMap<String, u64> = engine
         .functions
         .iter()
@@ -97,6 +107,8 @@ pub fn aggregate_inclusive_from_perf_data(
         return Ok(Aggregation {
             totals,
             window: None,
+            samples_seen: 0,
+            samples_in_library: 0,
         });
     }
 
@@ -177,9 +189,14 @@ pub fn aggregate_inclusive_from_perf_data(
                                 None => (t, t),
                             });
                         }
+                        samples_seen += 1;
                         let Some(pid) = s.pid else { continue };
-                        let Some(period) = s.period else { continue };
+                        let Some(period) = s.period else {
+                            dropped_no_period += 1;
+                            continue;
+                        };
                         let Some(mappings) = mmaps_by_pid.get(&pid) else {
+                            dropped_no_mappings += 1;
                             continue;
                         };
 
@@ -215,13 +232,19 @@ pub fn aggregate_inclusive_from_perf_data(
                             }
                         }
 
+                        let mut in_library = false;
                         for &ip in frame_ips.iter() {
                             let Some(mapping) = find_mapping(mappings, ip) else {
                                 continue;
                             };
                             if mapping.basename != symbol_basename {
+                                // Remembered so a basename that never matches
+                                // can be named, rather than leaving every
+                                // total at zero with no explanation.
+                                *other_dsos.entry(mapping.basename.clone()).or_default() += 1;
                                 continue;
                             }
+                            in_library = true;
                             let file_offset = ip - mapping.start + mapping.page_offset;
                             let hit = cache.get(
                                 file_offset,
@@ -251,6 +274,9 @@ pub fn aggregate_inclusive_from_perf_data(
                                 matched_groups[g] = true;
                             }
                         }
+                        if in_library {
+                            samples_in_library += 1;
+                        }
                     }
                     _ => {}
                 }
@@ -259,8 +285,77 @@ pub fn aggregate_inclusive_from_perf_data(
         }
     }
 
+    for warning in coverage_warnings(
+        samples_seen,
+        samples_in_library,
+        dropped_no_period,
+        dropped_no_mappings,
+        &other_dsos,
+        &symbol_basename,
+    ) {
+        eprintln!("{warning}");
+    }
     explain_zeros(&totals, &symbolizer, engine, &sym_path);
-    Ok(Aggregation { totals, window })
+    Ok(Aggregation {
+        totals,
+        window,
+        samples_seen,
+        samples_in_library,
+    })
+}
+
+/// Report how much of the capture the analysis actually reached.
+///
+/// Every drop in the loop above is a `continue`, so a capture that yields
+/// nothing looks exactly like an engine that did no work — and the zero then
+/// gets diagnosed as "the phase did not run", which is the opposite of the
+/// truth. These counters are the difference between the two.
+fn coverage_warnings(
+    seen: u64,
+    in_library: u64,
+    no_period: u64,
+    no_mappings: u64,
+    other_dsos: &rustc_hash::FxHashMap<String, u64>,
+    symbol_basename: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if seen == 0 {
+        out.push("warning: the capture contains no samples at all".to_string());
+        return out;
+    }
+    if in_library == 0 {
+        let mut top: Vec<(&String, &u64)> = other_dsos.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        let names: Vec<String> = top
+            .iter()
+            .take(3)
+            .map(|(n, c)| format!("{n} ({c})"))
+            .collect();
+        out.push(format!(
+            "warning: {seen} samples, none with a frame in {symbol_basename:?} — every \
+             instruction total will be 0 because nothing was attributed, not because the \
+             engine was idle. Most-sampled libraries instead: {}. Check `symbol_file` names \
+             the library the device actually maps.",
+            if names.is_empty() {
+                "none resolved".to_string()
+            } else {
+                names.join(", ")
+            }
+        ));
+    }
+    if no_period > 0 {
+        out.push(format!(
+            "warning: {no_period} of {seen} samples carried no period and were dropped — the \
+             capture's sample_type is missing PERF_SAMPLE_PERIOD, so counts are understated"
+        ));
+    }
+    if no_mappings * 2 > seen {
+        out.push(format!(
+            "warning: {no_mappings} of {seen} samples belonged to a pid with no mmap records; \
+             the capture may have started after the process did"
+        ));
+    }
+    out
 }
 
 /// Say why a configured target came back at zero.
@@ -557,6 +652,33 @@ fn demangle_name(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coverage_separates_an_idle_engine_from_a_failed_analysis() {
+        let mut others: rustc_hash::FxHashMap<String, u64> = Default::default();
+        others.insert("libarkweb_engine.so".into(), 221_495);
+
+        // Samples exist, none in the library we were asked to attribute to.
+        // Without this the totals are 0 and read as "the engine did nothing".
+        let w = super::coverage_warnings(57_720, 0, 0, 0, &others, "libservo_arkweb.so");
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("none with a frame"));
+        assert!(
+            w[0].contains("libarkweb_engine.so"),
+            "names what was sampled"
+        );
+
+        // A healthy capture says nothing.
+        assert!(
+            super::coverage_warnings(57_720, 12_332, 0, 0, &others, "libarkweb_engine.so")
+                .is_empty()
+        );
+
+        // An empty capture, and a sample_type missing the period field.
+        assert_eq!(super::coverage_warnings(0, 0, 0, 0, &others, "x").len(), 1);
+        let w = super::coverage_warnings(100, 100, 100, 0, &others, "x");
+        assert!(w[0].contains("PERF_SAMPLE_PERIOD"));
+    }
+
     /// The same pattern has to work whichever mangling the build used: rustc
     /// renders an inherent method as `Type::method` (legacy) or
     /// `<Type>::method` (v0), and the two are mutually exclusive as
