@@ -185,10 +185,11 @@ bundles = []
 # Stage it under workloads/ with this name.
 symbol_file = "libservo_arkweb.symbols.so"
 functions = [
-  # Patterns are matched against rustc-demangled names, where an inherent
-  # method renders as `<Type>::method` — so the `>` is part of the name and
-  # `LayoutThread::handle_reflow` matches nothing. Verify a new pattern
-  # against the staged .so with `nm -C … | grep` before trusting a zero.
+  # Patterns are matched against rustc-demangled names. An inherent method
+  # renders as `Type::method` under legacy mangling and `<Type>::method` under
+  # v0, so either form here matches either build — servoperf collapses `>::`
+  # when comparing. A target that still reports zero says which of "no symbol
+  # matches" and "symbol found but never sampled" it is.
   "Layout>::reflow",
   "Window>::reflow",
   "LayoutThread>::handle_reflow",
