@@ -533,7 +533,15 @@ fn sibling_binary(name: &str) -> Result<PathBuf> {
     let exe_dir = exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("servoperf binary has no parent directory"))?;
-    let candidates = [exe_dir.join(name), exe_dir.join("..").join(name)];
+    // Cargo appends `.exe` on Windows; look for both so a Windows host finds
+    // the sibling helper binaries.
+    let exe_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let candidates = [
+        exe_dir.join(&exe_name),
+        exe_dir.join("..").join(&exe_name),
+        exe_dir.join(name),
+        exe_dir.join("..").join(name),
+    ];
     candidates
         .iter()
         .find(|p| p.is_file())
@@ -548,7 +556,10 @@ fn sibling_binary(name: &str) -> Result<PathBuf> {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    // `HOME` is not set on Windows; `USERPROFILE` is the equivalent.
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn which_on_path(name: &Path) -> Option<PathBuf> {
@@ -582,6 +593,7 @@ mod tests {
             servoshell_args: vec![],
             fixture: Some(fx),
             scenario: None,
+            steps: vec![],
         }
     }
 

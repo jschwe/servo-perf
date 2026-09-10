@@ -1,0 +1,8 @@
+name = "mossel-user"
+# 我的 account: login card + entry grid
+url = "https://m.huaweimossel.com/#/pages/user"
+iterations = 15
+# No viewport / dpr / user-agent: those are servoshell-only args, and this
+# workload is meant to run inside the arkweb wrapper app, where the viewport
+# comes from the app's window and is identical for both engines.
+servoshell_args = ["--ignore-certificate-errors"]

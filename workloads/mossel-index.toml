@@ -1,0 +1,8 @@
+name = "mossel-index"
+# 首页 home: banners, promo modal, product rails
+url = "https://m.huaweimossel.com/#/pages/index/index"
+iterations = 15
+# No viewport / dpr / user-agent: those are servoshell-only args, and this
+# workload is meant to run inside the arkweb wrapper app, where the viewport
+# comes from the app's window and is identical for both engines.
+servoshell_args = ["--ignore-certificate-errors"]

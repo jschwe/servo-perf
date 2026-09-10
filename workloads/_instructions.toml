@@ -46,7 +46,7 @@ functions = [
   # other reflow-related symbol (handle_reflow has no `>` in its name).
   "Layout>::reflow",
   "Window>::reflow",
-  "LayoutThread::handle_reflow",
+  "LayoutThread>::handle_reflow",
   # Vsync paths. `on_vsync_cb` fires per OHOS vsync callback (every frame
   # under the legacy per-frame-resubscribe path; only when an observer
   # asks under the on-demand path). `Paint::perform_updates` covers the
@@ -72,6 +72,43 @@ proxy_args = [
   "--pref=network_http_proxy_uri=$PROXY",
   "--ignore-certificate-errors",
 ]
+# One span per completed layout run. `handle_reflow` carries
+# `#[servo_tracing::instrument]`, so the span name is the bare function
+# name — but only in a hap built with the `tracing` feature; a plain
+# release build emits no Servo spans at all and `reflow.count` stays 0.
+reflow_spans = ["handle_reflow"]
+# `<LayoutThread as Layout>::reflow` is the outer entry point and survives
+# LTO; `handle_reflow` and `build_display_list` get inlined into it at
+# codegen-units=1 and resolve to 0 (measured on the DAYU200 shim build), so
+# they are kept in `functions` as diagnostics but must not be the numerator.
+reflow_instructions = "Layout>::reflow"
+
+
+# --- Comparison groupings -------------------------------------------------
+# Each is reported as `instructions.<name>`. A group counts a sample once if
+# the chain contains ANY member, so where a group is smaller than the sum of
+# its members' own metrics, the difference is the overlap between them.
+
+# Style recalc + box/fragment trees: what Blink accounts to
+# `LocalFrameView::UpdateStyleAndLayout`. NOTE `restyle_and_build_trees` is
+# inlined at codegen-units=1, so this currently sees only the parallel restyle
+# and fragment-tree jobs. Add `#[inline(never)]` to it for a true figure.
+[[engines.group]]
+name = "layout_proper"
+functions = ["restyle_and_build_trees"]
+
+# Stacking-context tree + display list. `handle_reflow` runs these, but Blink
+# does the equivalent in its paint lifecycle, so they must be compared against
+# `paint_prep` on the other engine rather than folded into layout.
+[[engines.group]]
+name = "paint_prep"
+functions = ["build_stacking_context_tree", "build_display_list"]
+
+# The grouping used elsewhere in the team: the script-side reflow entry point,
+# which covers style, layout, paint prep, the a11y tree and scroll nodes.
+[[engines.group]]
+name = "colleagues_reflow"
+functions = ["Window>::reflow"]
 
 [[engines]]
 id = "arkweb"
@@ -100,3 +137,106 @@ proxy_args = [
   "--proxy-uri=$PROXY",
   "--ignore-certificate-errors",
 ]
+# Blink emits these under the `nweb` hitrace tag. `performLayout` counts
+# layouts that actually ran (forced or lifecycle-driven), which is the
+# denominator that holds still: measured across 5 cold loads of
+# m.huaweimossel.com it varied 2.9% (251-270), while
+# `Blink.ForcedStyleAndLayout.UpdateTime` varied 21% (6 892-10 869)
+# because most of those calls find style already clean and do no layout.
+reflow_spans = ["LocalFrameView::performLayout"]
+reflow_instructions = "Document::UpdateStyleAndLayout("
+
+
+# --- Comparison groupings (see the servo entry for the semantics) ---------
+
+# Style recalc + layout, excluding paint. The like-for-like counterpart of
+# Servo's `layout_proper`.
+[[engines.group]]
+name = "layout_proper"
+functions = ["LocalFrameView::UpdateStyleAndLayout("]
+
+# Paint lifecycle: the counterpart of Servo's stacking-context tree and
+# display-list building.
+[[engines.group]]
+name = "paint_prep"
+functions = ["LocalFrameView::RunPaintLifecyclePhase", "PrePaintTreeWalk"]
+
+# The grouping used elsewhere in the team. Note these two overlap — lifecycle
+# style+layout runs under `UpdateLifecycle` — so this group deliberately comes
+# out *below* `instructions.Document::UpdateStyleAndLayout(` plus
+# `instructions.WebFrameWidgetImpl::UpdateLifecycle` added by hand. The gap is
+# the double-count in that arithmetic. `UpdateLifecycle` is also mostly not
+# layout: measured 2026-07, only 18% of its inclusive instructions contained a
+# layout frame, the rest being paint and compositing.
+[[engines.group]]
+name = "colleagues_reflow"
+functions = ["Document::UpdateStyleAndLayout(", "WebFrameWidgetImpl::UpdateLifecycle"]
+
+# Servo running as the ArkWeb backend, inside the same wrapper app as the
+# entry above. Bundle matching cannot tell the two apart — the engine is
+# chosen by a device system parameter, not by which app is launched — so this
+# entry is selected explicitly with `--engine servo-arkweb` and claims no
+# bundles of its own.
+[[engines]]
+id = "servo-arkweb"
+bundles = []
+# Unstripped `libservo_arkweb.so` from the build that produced the copy on the
+# device — check `/proc/<pid>/maps` for the library that is actually mapped.
+# Stage it under workloads/ with this name.
+symbol_file = "libservo_arkweb.symbols.so"
+functions = [
+  # Patterns are matched against rustc-demangled names, where an inherent
+  # method renders as `<Type>::method` — so the `>` is part of the name and
+  # `LayoutThread::handle_reflow` matches nothing. Verify a new pattern
+  # against the staged .so with `nm -C … | grep` before trusting a zero.
+  "Layout>::reflow",
+  "Window>::reflow",
+  "LayoutThread>::handle_reflow",
+  # Paint-prep, which `handle_reflow` runs but Blink accounts to the paint
+  # lifecycle rather than to reflow. Subtract these to get the number that
+  # compares like-for-like against `LocalFrameView::UpdateStyleAndLayout`.
+  # `build_stacking_context_tree` survives as a LayoutThread method;
+  # `build_display_list` is inlined and only matches the per-Fragment
+  # helpers, so it undercounts the serial part.
+  "build_display_list",
+  "build_stacking_context_tree",
+  # `restyle_and_build_trees` is inlined into handle_reflow at
+  # codegen-units=1, leaving only rayon job closures — it therefore measures
+  # the *parallel* portions of restyle and fragment-tree building, not the
+  # whole subtree. Add `#[inline(never)]` to it in a measurement build if you
+  # want the Blink-comparable subtree directly.
+  "restyle_and_build_trees",
+  "update_the_rendering",
+]
+reflow_spans = ["handle_reflow"]
+# `<LayoutThread as Layout>::reflow` is the outer entry point and survives
+# LTO; `handle_reflow` and `build_display_list` get inlined into it at
+# codegen-units=1 and resolve to 0 (measured on the DAYU200 shim build), so
+# they are kept in `functions` as diagnostics but must not be the numerator.
+reflow_instructions = "Layout>::reflow"
+
+# --- Comparison groupings -------------------------------------------------
+# Each is reported as `instructions.<name>`. A group counts a sample once if
+# the chain contains ANY member, so where a group is smaller than the sum of
+# its members' own metrics, the difference is the overlap between them.
+
+# Style recalc + box/fragment trees: what Blink accounts to
+# `LocalFrameView::UpdateStyleAndLayout`. NOTE `restyle_and_build_trees` is
+# inlined at codegen-units=1, so this currently sees only the parallel restyle
+# and fragment-tree jobs. Add `#[inline(never)]` to it for a true figure.
+[[engines.group]]
+name = "layout_proper"
+functions = ["restyle_and_build_trees"]
+
+# Stacking-context tree + display list. `handle_reflow` runs these, but Blink
+# does the equivalent in its paint lifecycle, so they must be compared against
+# `paint_prep` on the other engine rather than folded into layout.
+[[engines.group]]
+name = "paint_prep"
+functions = ["build_stacking_context_tree", "build_display_list"]
+
+# The grouping used elsewhere in the team: the script-side reflow entry point,
+# which covers style, layout, paint prep, the a11y tree and scroll nodes.
+[[engines.group]]
+name = "colleagues_reflow"
+functions = ["Window>::reflow"]

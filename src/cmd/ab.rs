@@ -31,6 +31,12 @@ pub fn run(args: AbArgs) -> Result<()> {
     // TRACE-level Servo spans land in the trace. Same semantics as in
     // `cmd/bench.rs`; one guard covers both phases since they share the
     // device.
+    // Held for the whole run: a screen-off mid-capture freezes the app and
+    // silently invalidates every iteration after it.
+    let _screen_guard = match &base_target {
+        Target::Ohos(ohos) => Some(ohos.guard_screen_awake()),
+        Target::Local { .. } => None,
+    };
     let _trace_level_guard = match &base_target {
         Target::Ohos(ohos) => Some(ohos.guard_trace_level(&ohos.trace_level.clone())?),
         Target::Local { .. } => None,

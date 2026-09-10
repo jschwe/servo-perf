@@ -29,32 +29,39 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     // Resolve which engine the bench is exercising, so we know which list of
     // function-name substrings to aggregate inclusive instruction counts
-    // for. Only consulted when `--with-instructions` is on (the target is
-    // OHOS). Engines whose `symbol_file` is non-empty get the merged ELF
-    // auto-pushed if a sibling file is present in `workloads/`.
-    let engine: Option<EngineConfig> = if args.ohos.with_instructions {
-        match &target {
-            Target::Ohos(ohos) => {
-                let cfg = InstructionsConfig::load(&workloads_dir)?;
-                match cfg.engine_for_bundle(&ohos.bundle) {
-                    Some(e) => {
-                        push_engine_symbols(ohos, e, &workloads_dir)?;
-                        Some(e.clone())
+    // for, and which trace spans count as one reflow. Resolved on every
+    // OHOS run — `reflow.count` needs no PMU — but symbol staging (the
+    // merged ELF from a sibling file in `workloads/`) only happens when
+    // `--with-instructions` is on.
+    let engine: Option<EngineConfig> = match &target {
+        Target::Ohos(ohos) => {
+            let cfg = InstructionsConfig::load(&workloads_dir)?;
+            let selected = match args.ohos.engine.as_deref() {
+                Some(id) => Some(cfg.engine_by_id(id).ok_or_else(|| {
+                    anyhow::anyhow!("--engine {id:?} not found in _instructions.toml")
+                })?),
+                None => cfg.engine_for_bundle(&ohos.bundle),
+            };
+            match selected {
+                Some(e) => {
+                    if args.ohos.with_instructions {
+                        check_engine_symbols(e, &workloads_dir);
                     }
-                    None => {
+                    Some(e.clone())
+                }
+                None => {
+                    if args.ohos.with_instructions {
                         eprintln!(
                             "warning: --with-instructions: no engine matches bundle {:?} in \
                              _instructions.toml; per-function counts will be skipped",
                             ohos.bundle
                         );
-                        None
                     }
+                    None
                 }
             }
-            _ => None,
         }
-    } else {
-        None
+        _ => None,
     };
 
     // Local fixtures (http1/h2 servers, wpr) live on the host's
@@ -66,6 +73,12 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // bump it for the duration of the run; the guard restores on
     // Drop. Held alongside `fx` / `_rport` so scope-exit ordering
     // is: tear down rport → stop fixture → restore trace level.
+    // Held for the whole run: a screen-off mid-capture freezes the app and
+    // silently invalidates every iteration after it.
+    let _screen_guard = match &target {
+        Target::Ohos(ohos) => Some(ohos.guard_screen_awake()),
+        Target::Local { .. } => None,
+    };
     let _trace_level_guard = match &target {
         Target::Ohos(ohos) => Some(ohos.guard_trace_level(&ohos.trace_level.clone())?),
         Target::Local { .. } => None,
@@ -150,6 +163,26 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 }
                 for row in &cp.named_spans {
                     metrics.insert(format!("{}.dur_ms", row.name), row.dur_ms);
+                }
+                // Reflow count from the same trace the timing metrics come
+                // from. Independent of `--with-instructions`: it needs no
+                // PMU, only the engine's span names.
+                if let Some(engine) = engine.as_ref() {
+                    let counts = instructions::count_reflow_spans(&slices, engine);
+                    // A configured-but-absent reflow span means the number is
+                    // wrong, not zero: the trace ring wrapped past the load
+                    // burst, the engine build has no tracing, or the tag list
+                    // is missing the one that carries the markers.
+                    if counts.get("reflow.count") == Some(&0.0) {
+                        eprintln!(
+                            "iter {i}: warning: no {:?} spans in the trace — reflow.count is 0. \
+                             Check the engine build emits them, that --ohos-trace-tags includes \
+                             their tag (`nweb` for ArkWeb), and that the capture window is short \
+                             enough that the ring buffer still holds the page load.",
+                            engine.reflow_spans,
+                        );
+                    }
+                    metrics.extend(counts);
                 }
                 // Thermal snapshots (OHOS only). Absent on local targets.
                 if let Some(v) = art.thermal_before_milli_c {
@@ -248,6 +281,18 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 for (func, events) in totals {
                     metrics.insert(format!("instructions.{func}"), events as f64);
                 }
+                // instructions ÷ reflows, from the same iteration. Both
+                // inputs are per-iteration, so the ratio never mixes a
+                // numerator and denominator from different runs.
+                if let Some(num) = engine.as_ref().and_then(|e| e.reflow_instructions.as_ref()) {
+                    let instr = metrics.get(&format!("instructions.{num}")).copied();
+                    let count = metrics.get("reflow.count").copied();
+                    if let (Some(instr), Some(count)) = (instr, count) {
+                        if count > 0.0 {
+                            metrics.insert("instructions.per_reflow".to_string(), instr / count);
+                        }
+                    }
+                }
             }
         }
     }
@@ -262,8 +307,17 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // One summary entry per configured instruction symbol, across every
     // iteration that resolved it.
     if let Some(engine) = engine.as_ref() {
-        for func in &engine.functions {
-            let key = format!("instructions.{func}");
+        let derived = [
+            "reflow.count".to_string(),
+            "instructions.per_reflow".to_string(),
+        ];
+        let keys = engine
+            .functions
+            .iter()
+            .chain(engine.groups.iter().map(|g| &g.name))
+            .map(|f| format!("instructions.{f}"))
+            .chain(derived);
+        for key in keys {
             let samples: Vec<f64> = iterations
                 .iter()
                 .filter_map(|i| match &i.status {
@@ -305,36 +359,27 @@ fn workloads_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workloads")
 }
 
-/// If the engine declares a `symbol_file`, look for the file under
-/// `workloads/` and (if found) push it to the device's symbol-dir so
-/// hiperf's per-iteration `report -s --symbol-dir …` resolves library
-/// symbols. Missing file emits a hint but isn't fatal — the bench still
-/// captures perf.data, and the user can re-run with the file present.
-fn push_engine_symbols(
-    target: &OhosTarget,
-    engine: &EngineConfig,
-    workloads_dir: &Path,
-) -> Result<()> {
+/// Warn if the engine declares a `symbol_file` that isn't staged under
+/// `workloads/`. Symbol resolution happens on the host (`perf_data.rs` reads
+/// this ELF directly), so nothing is pushed to the device — the merged ArkWeb
+/// ELF is ~290 MB and pushing it per run cost more than the capture itself.
+/// Missing file isn't fatal: the bench still captures perf.data, and the
+/// counts can be re-derived once the file is in place.
+fn check_engine_symbols(engine: &EngineConfig, workloads_dir: &Path) {
     if engine.symbol_file.is_empty() {
-        return Ok(());
+        return;
     }
     let host_path = workloads_dir.join(&engine.symbol_file);
     if !host_path.exists() {
         eprintln!(
-            "warning: engine {:?} symbol_file {:?} not found — symbols won't resolve. \
-             Run: servoperf prepare-arkweb-symbols --input <stripped-libarkweb_engine.so> \
-             --output {}",
+            "warning: engine {:?} symbol_file {:?} not found — instruction counts will all \
+             be 0. For ArkWeb run: servoperf prepare-arkweb-symbols --input \
+             <stripped-libarkweb_engine.so> --output {}",
             engine.id,
             host_path,
             host_path.display(),
         );
-        return Ok(());
     }
-    eprintln!(
-        "ohos: pushing engine symbols ({} → device)",
-        host_path.display()
-    );
-    target.push_arkweb_symbols(&host_path)
 }
 
 /// Build the [`Target`] for this run. For local mode, validates the bin
