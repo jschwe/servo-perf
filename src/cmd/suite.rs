@@ -373,6 +373,7 @@ fn write_comparison(
         .unwrap();
         for w in workloads {
             write!(s, "| {} |", w.name).unwrap();
+            let mut high_spread: Vec<(String, String, crate::stats::Spread)> = Vec::new();
             let mut stats: Vec<Option<crate::stats::Spread>> = Vec::new();
             for leg in legs {
                 let samples = rows.get(&(leg.id.clone(), w.name.clone()));
@@ -401,17 +402,9 @@ fn write_comparison(
                         )
                         .unwrap();
                         if sp.cv > 0.20 {
-                            notes.push(format!(
-                                "`{}` on {}/{}: spread is {:.0}%, so at n={} only differences \
-                                 above ~{:.0}% can be told from noise — raise `iterations` if \
-                                 the effect you are chasing is smaller than that.",
-                                metric,
-                                leg.id,
-                                w.name,
-                                100.0 * sp.cv,
-                                sp.n,
-                                100.0 * sp.resolvable
-                            ));
+                            // Noted below, where the other leg is known: the
+                            // floor for a comparison carries both legs' error.
+                            high_spread.push((leg.id.clone(), w.name.clone(), *sp));
                         }
                         for i in crate::stats::outliers(values) {
                             notes.push(format!(
@@ -433,14 +426,37 @@ fn write_comparison(
                     _ => write!(s, " — |").unwrap(),
                 }
             }
+            // One floor for the whole document: quoting a single leg's own
+            // understated it by about sqrt(2), enough to bold a delta in the
+            // table and call it unresolvable in the note beneath.
+            let pairwise = match (
+                stats.first().copied().flatten(),
+                stats.get(1).copied().flatten(),
+            ) {
+                (Some(a), Some(b)) => Some(100.0 * crate::stats::resolvable_between(&a, &b)),
+                _ => None,
+            };
+            for (leg_id, wl, sp) in high_spread.drain(..) {
+                match pairwise {
+                    Some(floor) => notes.push(format!(
+                        "`{metric}` on {leg_id}/{wl}: spread is {:.0}% at n={}, so a difference \
+                         below ~{floor:.0}% cannot be told from noise — raise `iterations` if \
+                         the effect you are chasing is smaller than that.",
+                        100.0 * sp.cv,
+                        sp.n
+                    )),
+                    None => notes.push(format!(
+                        "`{metric}` on {leg_id}/{wl}: spread is {:.0}% at n={}.",
+                        100.0 * sp.cv,
+                        sp.n
+                    )),
+                }
+            }
             if legs.len() == 2 {
                 match (stats[0], stats[1]) {
                     (Some(a), Some(b)) if a.mean != 0.0 => {
                         let delta = 100.0 * (b.mean - a.mean) / a.mean;
-                        // Two standard errors on each side, combined: below
-                        // this the two legs are not distinguishable at this n.
-                        let noise =
-                            100.0 * 2.0 * (a.sem.powi(2) + b.sem.powi(2)).sqrt() / a.mean.abs();
+                        let noise = pairwise.unwrap_or(0.0);
                         if delta.abs() < noise {
                             write!(s, " {delta:+.1}% (within noise, ±{noise:.1}%) |").unwrap();
                         } else {

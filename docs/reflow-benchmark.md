@@ -140,9 +140,10 @@ Each cell reads `median ±cv (n)`, because a median alone cannot say whether a
 difference between legs is a result. A delta in **bold** exceeds the combined
 standard error of the two legs; one marked *within noise* does not, and
 repeating the campaign will move it. Cells whose spread passes 20% are flagged
-`⚠` and get a note saying what size of difference is resolvable at that `n`, so
-"raise `iterations`" is a judgement about the effect you are chasing rather
-than a guess. Iterations far from their median — Tukey's far-out rule *and* at
+`⚠` and get a note saying what size of difference is resolvable at that `n` —
+computed from both legs' error, the same floor the table's bold/within-noise
+decision uses, so the two cannot disagree. That makes "raise `iterations`" a
+judgement about the effect you are chasing rather than a guess. Iterations far from their median — Tukey's far-out rule *and* at
 least 25% off, so tight metrics do not raise false alarms — are named
 individually rather than trimmed: an outlier is usually evidence about the run,
 a thermal step or a page served from cache.
