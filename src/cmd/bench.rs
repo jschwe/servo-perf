@@ -131,7 +131,23 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 );
                 successful_wall.push(wall);
                 let pftrace = art.pftrace;
-                let slices = parse_trace(&target, &pftrace)?;
+                // A trace that will not parse is one bad iteration, not a lost
+                // campaign: propagating here would discard every iteration
+                // already collected, since the results are written after the
+                // loop.
+                let slices = match parse_trace(&target, &pftrace) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        eprintln!("iter {i} failed: {err:#}");
+                        iterations.push(Iteration {
+                            index: i,
+                            status: IterationStatus::Failed {
+                                error: format!("{err:#}"),
+                            },
+                        });
+                        continue;
+                    }
+                };
                 let cp = trace::analyse(&slices, &registry, art.spawn_wall_ns);
                 let mut metrics = BTreeMap::new();
                 // The "FirstContentfulPaint" key in the metrics map is

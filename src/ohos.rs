@@ -675,8 +675,14 @@ impl OhosTarget {
             "-o",
             &self.trace_path_on_device,
         ];
-        recording.disarm();
-        self.hdc(&stop_args).context("hitrace --trace_finish")?;
+        // Disarm only once the recording is actually closed: a finish that
+        // fails would otherwise leave it open with nothing behind it, and
+        // every later --trace_begin fails with errorCode(1103).
+        let finish = self.hdc(&stop_args).context("hitrace --trace_finish");
+        if finish.is_ok() {
+            recording.disarm();
+        }
+        finish?;
         let exit_wall_ns = wall_now_ns();
 
         // Pull the trace text back to the host.
@@ -792,6 +798,15 @@ impl OhosTarget {
     fn run_hiperf_record(&self, period: u64, window_seconds: u64) -> Result<()> {
         let duration = window_seconds.to_string();
         let period_str = period.to_string();
+        // A device-side `hiperf record` outlives a killed hdc client, so an
+        // abandoned run leaves it profiling system-wide and holding the PMU —
+        // which is one of the ways the *next* run's capture fails to start.
+        let cleanup = {
+            let t = self.clone();
+            crate::cancel::register_cleanup(move || {
+                let _ = t.hdc(&["shell", "killall", "hiperf"]);
+            })
+        };
         let started = Instant::now();
         let out = self.hdc(&[
             "shell",
@@ -810,7 +825,11 @@ impl OhosTarget {
             "hw-instructions",
             "-o",
             DevicePaths::PERF_DATA,
-        ])?;
+        ]);
+        // Unregister on both paths, so an hdc failure does not leave a stale
+        // cleanup registered.
+        crate::cancel::unregister_cleanup(cleanup);
+        let out = out?;
         // hiperf reports argument and setup failures on stdout and still exits
         // 0. With --with-instructions this call *is* the capture window, so a
         // failure that returns immediately leaves the iteration recorded as a
