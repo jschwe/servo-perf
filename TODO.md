@@ -148,7 +148,35 @@ warning, Windows `.exe` / `USERPROFILE` handling.* Remaining below.
   allowed buffer. `--ohos-trace-tags app,nweb` keeps the Blink layout markers
   and drops the RenderService flood.
 
-## 8. Plan: strengthen the mossel scenario
+## 8. Dependency audit (2026-09-10)
+
+OSV over the 247 locked packages reports four advisories, none of which
+warrants acting before a measurement campaign:
+
+| advisory | crate | applies here? |
+| --- | --- | --- |
+| RUSTSEC-2026-0190 | anyhow 1.0.102 | **No.** Unsoundness in `Error::downcast_mut()`; nothing in `src/` downcasts. Fixed in 1.0.103. |
+| RUSTSEC-2026-0258 | h2 0.4.13 | **Barely.** Unbounded empty DATA frames (DoS) in the h2 the fixture server speaks — a localhost server the device reaches over `hdc rport`. Fixed in 0.4.16. |
+| RUSTSEC-2026-0185 | quinn-proto 0.11.14 | **No.** `cargo tree -i` finds no path; it is in the lockfile but never compiled. |
+| RUSTSEC-2025-0134 | rustls-pemfile 2.2.0 | Unmaintained, no fix published. rustls 0.23 can parse PEM itself; migrating is optional cleanup. |
+
+A plain `cargo update` (semver-compatible, ~145 crates) clears the first three.
+Safe, but run it **between** campaigns, never inside one — the lockfile is part
+of the instrument.
+
+Major bumps deliberately deferred: `object` 0.36→0.40, `addr2line` 0.24→0.27,
+`gimli` 0.31→0.34, `linux-perf-data` 0.11→0.13. These *are* the symbolization
+path, they are version-coupled (addr2line pins gimli and object), and changing
+them can change the numbers. `addr2line` was added at 0.24 rather than 0.27 for
+exactly that coupling. Do them as one change, after a review deadline, and
+verify by re-aggregating a stored `perf.data` against known per-symbol totals —
+that check caught nothing when the symbolizer was rewritten, which is the
+standard to hold a version bump to.
+
+Cosmetic and not worth churn: `thiserror` 1→2, `toml` 0.8→1, `rand` 0.8→0.10,
+`prost` 0.13→0.14, `cpp_demangle` 0.4→0.5.
+
+## 9. Plan: strengthen the mossel scenario
 
 Goal: replace the single-URL `cdn-huaweimossel` workload with a suite covering
 all five site pages, each measured twice — once as a page load, once with
