@@ -333,6 +333,7 @@ impl OhosTarget {
             return Ok(TraceLevelGuard {
                 target: None,
                 previous: String::new(),
+                cleanup: 0,
             });
         }
         let previous = self.get_trace_level()?;
@@ -340,6 +341,7 @@ impl OhosTarget {
             return Ok(TraceLevelGuard {
                 target: None,
                 previous,
+                cleanup: 0,
             });
         }
         self.set_trace_level(desired)?;
@@ -347,9 +349,16 @@ impl OhosTarget {
             "ohos: hitrace level {} → {} (will restore on exit)",
             previous, desired
         );
+        // Also restore if the run is abandoned: leaving a device at Debug
+        // costs every later capture volume it does not need.
+        let (t, p) = (self.clone(), previous.clone());
+        let cleanup = crate::cancel::register_cleanup(move || {
+            let _ = t.set_trace_level(&p);
+        });
         Ok(TraceLevelGuard {
             target: Some(self.clone()),
             previous,
+            cleanup,
         })
     }
 
@@ -740,7 +749,10 @@ impl OhosTarget {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("warning: could not take a screen wakelock: {e:#}");
-                return ScreenAwakeGuard { target: None };
+                return ScreenAwakeGuard {
+                    target: None,
+                    cleanup: 0,
+                };
             }
         }
         if let Ok(out) = self.hdc(&["shell", "hidumper", "-s", "ScreenlockService", "-a", "-all"]) {
@@ -755,8 +767,13 @@ impl OhosTarget {
                 }
             }
         }
+        let t = self.clone();
+        let cleanup = crate::cancel::register_cleanup(move || {
+            let _ = t.hdc(&["shell", "hidumper", "-s", "PowerManagerService", "-a", "-f"]);
+        });
         ScreenAwakeGuard {
             target: Some(self.clone()),
+            cleanup,
         }
     }
 }
@@ -857,10 +874,12 @@ fn build_step_schedule(steps: &[crate::workload::Step], window: Duration) -> Vec
 /// [`OhosTarget::guard_screen_awake`] when dropped.
 pub struct ScreenAwakeGuard {
     target: Option<OhosTarget>,
+    cleanup: u64,
 }
 
 impl Drop for ScreenAwakeGuard {
     fn drop(&mut self) {
+        crate::cancel::unregister_cleanup(self.cleanup);
         if let Some(t) = &self.target {
             if let Err(e) = t.hdc(&["shell", "hidumper", "-s", "PowerManagerService", "-a", "-f"]) {
                 eprintln!("warning: failed to release the screen wakelock: {e:#}");
@@ -872,10 +891,12 @@ impl Drop for ScreenAwakeGuard {
 pub struct TraceLevelGuard {
     target: Option<OhosTarget>,
     previous: String,
+    cleanup: u64,
 }
 
 impl Drop for TraceLevelGuard {
     fn drop(&mut self) {
+        crate::cancel::unregister_cleanup(self.cleanup);
         if let Some(t) = &self.target {
             if let Err(e) = t.set_trace_level(&self.previous) {
                 eprintln!(

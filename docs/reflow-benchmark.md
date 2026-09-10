@@ -235,7 +235,20 @@ Two levers that do **not** help sample loss: hiperf's `--cpu-limit` (at 100 it
 collected twice as many samples and lost 17.9% instead of 6.8%) and `-m`
 (already at its 1024-page maximum).
 
-## 7. When a number looks wrong
+## 7. Stopping a run
+
+Ctrl-C once: the run stops at the next iteration boundary, writes the results
+collected so far, and restores the device state it changed (hitrace level,
+screen wakelock). It waits for the current capture because abandoning one
+mid-`hiperf record` leaves the device holding both.
+
+Ctrl-C twice: stops immediately, still running those restores first.
+
+Before this existed, a Ctrl-C that killed the child `hdc` process was seen by
+servoperf as a failed *iteration* — logged, and the loop carried on to the
+next — so a long run appeared to ignore it.
+
+## 8. When a number looks wrong
 
 | symptom | cause |
 | --- | --- |

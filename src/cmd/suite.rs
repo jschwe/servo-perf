@@ -69,9 +69,16 @@ pub fn run(args: SuiteArgs) -> Result<()> {
     );
 
     let mut failures: Vec<String> = Vec::new();
-    for leg in &legs {
+    'legs: for leg in &legs {
+        if crate::cancel::requested() {
+            break;
+        }
         prepare_leg(leg, &args)?;
         for w in &workloads {
+            if crate::cancel::requested() {
+                eprintln!("suite: cancelled; skipping the rest of the matrix");
+                break 'legs;
+            }
             let out = root.join(format!("{}-{}", leg.id, w.name));
             eprintln!("\n=== {} / {} ===", leg.id, w.name);
             let bench = BenchArgs {
