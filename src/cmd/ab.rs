@@ -390,6 +390,10 @@ fn resolve_out(explicit: Option<&Path>, workload_name: &str) -> PathBuf {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    PathBuf::from("out").join(format!("{}-{}", workload_name, ts))
+        .unwrap_or(0) as i64;
+    PathBuf::from("out").join(format!(
+        "{}-{}",
+        workload_name,
+        crate::report::format_utc_compact(ts)
+    ))
 }

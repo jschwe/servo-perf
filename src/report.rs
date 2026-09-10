@@ -67,6 +67,20 @@ pub fn write_json(out_dir: &Path, data: &RunResults) -> Result<()> {
 /// date a reader can compare against a lab notebook without pulling in a
 /// date-time crate for one line of output.
 pub fn format_utc(secs: i64) -> String {
+    let (y, m, d, h, mi, sec) = civil_from_unix(secs);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sec:02} UTC")
+}
+
+/// The same instant as a directory-name component: `20260910-163045`.
+///
+/// No colons or spaces — a path with either is awkward on Windows, and these
+/// names end up in shell commands and report links.
+pub fn format_utc_compact(secs: i64) -> String {
+    let (y, m, d, h, mi, sec) = civil_from_unix(secs);
+    format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{sec:02}")
+}
+
+fn civil_from_unix(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
     let days = secs.div_euclid(86_400);
     let rem = secs.rem_euclid(86_400);
     let (h, mi, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
@@ -81,7 +95,7 @@ pub fn format_utc(secs: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sec:02} UTC")
+    (y, m, d, h, mi, sec)
 }
 
 /// The current process's command line, shell-quoted well enough to paste back.
@@ -763,6 +777,17 @@ fn render_markdown(data: &RunResults) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn utc_formatting_matches_a_known_instant() {
+        // 2026-09-10T20:30:45Z
+        let t = 1_789_072_245;
+        assert_eq!(super::format_utc(t), "2026-09-10 20:30:45 UTC");
+        assert_eq!(super::format_utc_compact(t), "20260910-203045");
+        // Epoch, and a leap day, to exercise the civil-date arithmetic.
+        assert_eq!(super::format_utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(super::format_utc_compact(1_709_164_800), "20240229-000000");
+    }
+
     use super::*;
     use crate::stats::summarise;
     use crate::trace::CriticalPathReport;
