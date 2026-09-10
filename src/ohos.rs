@@ -820,14 +820,28 @@ impl OhosTarget {
     /// The lock stops *future* screen-offs but does not dismiss a lock screen
     /// that is already up, so this also reports whether the screen is locked.
     pub fn guard_screen_awake(&self) -> ScreenAwakeGuard {
+        // The device's wakelock is a toggle, not a counter: measured on
+        // DAYU200, two takes followed by one release leave the screen
+        // unlocked. So a nested guard must not take or release anything, or
+        // the inner scope's exit would drop the lock the outer one is holding
+        // for the rest of the run.
+        if SCREEN_LOCK_HELD.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return ScreenAwakeGuard {
+                target: None,
+                cleanup: 0,
+                owns: false,
+            };
+        }
         let _ = self.hdc(&["shell", "power-shell", "wakeup"]);
         match self.hdc(&["shell", "hidumper", "-s", "PowerManagerService", "-a", "-t"]) {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("warning: could not take a screen wakelock: {e:#}");
+                SCREEN_LOCK_HELD.store(false, std::sync::atomic::Ordering::SeqCst);
                 return ScreenAwakeGuard {
                     target: None,
                     cleanup: 0,
+                    owns: false,
                 };
             }
         }
@@ -850,6 +864,7 @@ impl OhosTarget {
         ScreenAwakeGuard {
             target: Some(self.clone()),
             cleanup,
+            owns: true,
         }
     }
 }
@@ -1003,13 +1018,22 @@ impl Drop for TraceRecordingGuard {
 
 /// Releases the SCREEN wakelock taken by
 /// [`OhosTarget::guard_screen_awake`] when dropped.
+/// Whether this process is already holding the device's screen wakelock.
+static SCREEN_LOCK_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub struct ScreenAwakeGuard {
     target: Option<OhosTarget>,
     cleanup: u64,
+    /// False for a nested guard, which must leave the lock alone.
+    owns: bool,
 }
 
 impl Drop for ScreenAwakeGuard {
     fn drop(&mut self) {
+        if !self.owns {
+            return;
+        }
+        SCREEN_LOCK_HELD.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::cancel::unregister_cleanup(self.cleanup);
         if let Some(t) = &self.target {
             if let Err(e) = t.hdc(&["shell", "hidumper", "-s", "PowerManagerService", "-a", "-f"]) {
@@ -1534,6 +1558,28 @@ fn parse_proxy_port(uri: &str) -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
+    /// The device's wakelock is a toggle, not a counter, so a nested guard
+    /// must not release it — the outer scope is still relying on it.
+    #[test]
+    fn nested_screen_guards_do_not_release_the_lock() {
+        use std::sync::atomic::Ordering;
+        assert!(!super::SCREEN_LOCK_HELD.load(Ordering::SeqCst));
+        super::SCREEN_LOCK_HELD.store(true, Ordering::SeqCst);
+        {
+            // What `guard_screen_awake` returns when a lock is already held.
+            let _nested = super::ScreenAwakeGuard {
+                target: None,
+                cleanup: 0,
+                owns: false,
+            };
+        }
+        assert!(
+            super::SCREEN_LOCK_HELD.load(Ordering::SeqCst),
+            "a nested guard released the outer scope's wakelock"
+        );
+        super::SCREEN_LOCK_HELD.store(false, Ordering::SeqCst);
+    }
+
     #[test]
     fn liveness_classification() {
         assert_eq!(super::classify_liveness(Some(42), Some(42)), None);

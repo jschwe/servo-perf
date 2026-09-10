@@ -60,6 +60,13 @@ pub fn run(args: SuiteArgs) -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("out").join(format!("{}-{}", suite.name, now_stamp())));
     std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
 
+    // Held across the whole matrix, not per cell: the gaps between cells — and
+    // especially the wait at an engine-switch prompt — are exactly when the
+    // screen would sleep, and a screen-off freezes the app mid-campaign.
+    let _screen_guard =
+        crate::ohos::OhosTarget::from_args(&leg_ohos_args(&args, &suite, legs[0], None))
+            .guard_screen_awake();
+
     eprintln!(
         "suite {}: {} leg(s) x {} workload(s) -> {}",
         suite.name,
