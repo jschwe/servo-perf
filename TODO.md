@@ -168,7 +168,38 @@ starved, and a fixed capture window covering less of the page — so the check i
 worth having as a validity gate on a comparison, not as an explanation for an
 instruction-count difference.
 
-## 9. Dependency audit (2026-09-10)
+## 9. External fixtures, for WPR on the device-attached host
+
+Driving the device from a Linux VM while it hangs off a Windows PC works today
+(`--hdc-server <win>:8710`; file transfer follows the *client*, so artefacts
+land next to the agent). The fixture path is the one piece that does not, and
+the reason is only that servoperf spawns the fixture as a local child.
+
+WPR belongs on the device-attached host — a replay proxy one LAN hop further
+away adds exactly the network variance the archive exists to remove. And the
+plumbing already favours that: `hdc rport` is set up *by the hdc server*, so
+`rport tcp:4480 tcp:4480` forwards the device's port to the **server host's**
+localhost. With WPR on Windows alongside the server, that is the right machine.
+
+What is missing is a fixture mode that wires an already-running fixture in
+rather than starting one:
+
+- a `kind = "external"` (or a flag on the existing kinds) that keeps
+  `ports_to_forward()` and the proxy-argument injection but skips
+  `fixtures::spawn`, the `sibling_binary` lookup and `preflight_port` — that
+  last one checks the *local* port is free, which is the wrong question when
+  the listener is on another machine;
+- both `wpr` and the `wpr_tunnel` CONNECT shim run on the Windows side (they
+  talk to each other over localhost), so only the tunnel port is forwarded,
+  exactly as now;
+- the archive lives with WPR, so the automatic record-on-missing pass has to
+  become the operator's job in this mode, or be driven over SSH.
+
+Certificates need nothing: the app is launched with
+`--ignore-certificate-errors`, so WPR's per-host leaf certs are accepted
+wherever it runs. Roughly an hour of work, most of it in `fixtures.rs`.
+
+## 10. Dependency audit (2026-09-10)
 
 OSV over the 247 locked packages reports four advisories, none of which
 warrants acting before a measurement campaign:
@@ -196,7 +227,7 @@ standard to hold a version bump to.
 Cosmetic and not worth churn: `thiserror` 1→2, `toml` 0.8→1, `rand` 0.8→0.10,
 `prost` 0.13→0.14, `cpp_demangle` 0.4→0.5.
 
-## 10. Plan: strengthen the mossel scenario
+## 11. Plan: strengthen the mossel scenario
 
 Goal: replace the single-URL `cdn-huaweimossel` workload with a suite covering
 all five site pages, each measured twice — once as a page load, once with
