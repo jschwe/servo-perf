@@ -1,5 +1,117 @@
 # servoperf TODO
 
+## 0. Review findings (2026-09-10) — fix order
+
+An independent review found defects whose common shape is *silent wrongness*: a
+number that is plausible and wrong rather than an error. Ordered by whether a
+number you would put in a report changes.
+
+### Before the next campaign
+
+1. **Align the reflow count with the instruction window.** `instructions.*`
+   covers `[hiperf start, +capture_seconds]`; `reflow.count` covers
+   `[trace_begin, trace_finish]`, which is larger at both ends — `aa start` and
+   `wait_for_app_pid` before, then `app_pid`, `newest_faultlog`, `hilog -x` and
+   the thermal read after, each a blocking `hdc` round trip with the app still
+   reflowing. `per_reflow` is biased low by roughly the share of reflows in
+   those margins (order 2.5-7.5% at a 20 s window). It does not average out,
+   and it does not cancel in an A/B because the margin length depends on how
+   fast the engine reflows. `Slice` already carries `ts_ns`: record the hiperf
+   window and count only spans inside it. Two comments currently claim the
+   property the code does not provide (`docs/reflow-benchmark.md`,
+   `instructions/mod.rs`).
+
+2. **Verify the staged symbol ELF is the library that was sampled.** Nothing
+   checks it, so a rebuild-and-forget-to-restage resolves every sample against
+   the old layout: non-zero, plausible, wrong, with `explain_zeros` reassuring
+   you. Compare **GNU build ids**, not file hashes — the staged file is not
+   byte-identical to the device's (measured: the merged ArkWeb ELF differs by
+   md5 and matches by build id, because `prepare-arkweb-symbols` re-attaches
+   `.symtab`).
+
+   Early, as it should be: `dd if=<device .so> bs=4096 count=4`, `file recv`
+   the 16 KB, parse PT_NOTE (at offset 0x2a8 / 0x2c4 in the two real
+   libraries). Measured at 3 ms on device. Do it in `preflight` and fail rather
+   than warn — an unverifiable symbol file invalidates every instruction number
+   in the campaign. Belt and braces: perf.data MMAP2 records carry the build id
+   too (`perf_data.rs` already receives and ignores it), so iteration 0 can
+   confirm what preflight asserted.
+
+3. **`spread()` must not report certainty it does not have.** At `n <= 1` it
+   returns `sd = sem = cv = 0`, so every delta clears the noise floor and is
+   bolded as significant, and the cell escapes the `cv > 0.20` flag. A leg cut
+   short by failures or cancellation looks *maximally* clean. Return `None`
+   for `n < 2`.
+
+4. **Detect a `hiperf record` that did not run.** With `--with-instructions` it
+   *is* the capture window; if it exits immediately (PMU busy, unsupported
+   event, unwritable path) the iteration is recorded Ok with a ~0 s window and
+   no warning, since `parse_hiperf_count` returns `None` on an error message.
+   Scan its stdout for `error:` as `--trace_begin` already does, and assert the
+   call's wall time is close to `window_seconds`.
+
+5. **An absent metric must be absent, not zero.** `reflow.count = 0` and
+   `instructions.<fn> = 0` are warned about and then recorded, dragging the
+   median of an otherwise-good run. `LogAggregate::apply` already has the right
+   discipline — return `None`.
+
+6. **Check device-side exit codes where a silent failure changes the number.**
+   `hdc shell` does not propagate them, so every `shell` call returns `Ok`.
+   Worst first: `set_trace_level` (re-read with `get_trace_level` to confirm,
+   or Servo's TRACE spans are dropped and the iteration "succeeds" with a
+   thinner trace), `run_steps` (a swipe that never happened measures an idle
+   page and reads as a faster engine), `install_hap`, `force_stop`.
+
+### Soon
+
+7. Count what the aggregator discards. Five `continue` paths drop samples
+   silently; if `sample_type` lacks `PERF_SAMPLE_PERIOD`/`TID`, or the device
+   DSO basename does not match the staged filename, *every* sample is dropped
+   and `explain_zeros` reports "cold" — the wrong diagnosis. One
+   `samples seen / samples attributed` counter separates the two.
+8. A trace-parse error propagates out of `run()`, discarding every completed
+   iteration. Record it as `IterationStatus::Failed` like other per-iteration
+   errors.
+9. Build the `Symbolizer` once and share it behind an `Arc`. Up to
+   `iterations` aggregators run concurrently, each reading the ELF twice
+   (290 MB for ArkWeb) with its own 1 GiB cache budget.
+10. `recording.disarm()` runs before `--trace_finish`; swap them so a failed
+    finish still has the guard behind it. Give `hiperf record` the same guard —
+    an abandoned run leaves it profiling system-wide and holding the PMU, one
+    cause of (4).
+11. Mark a cancelled run in `RunResults`. Today it writes a normal report and
+    exits 0, and with the >50%-failure guard disabled during cancellation it is
+    indistinguishable from a complete one.
+12. `thread_cpu_ms_per_frame.*` publishes a table of zeros when the frame
+    timeline is empty (the block sits outside the `else` that skips the rest),
+    and under `thread_cpu_from_start` it publishes absolute process-lifetime
+    CPU under the per-frame name, because the `before` sample has no thread
+    rows. Both `ipc-mossel-*` workloads set that flag.
+13. One noise floor in the comparison: the table uses the combined standard
+    error, the note uses a single leg's, so a delta can be bolded while the
+    note beside it calls it unresolvable. Also `summarise()` and `spread()`
+    compute different medians at even `n`.
+
+### Later
+
+14. FCP's zero point is the earliest event in a system-wide trace, so
+    pre-launch `hdc` round trips land inside the measured interval and a
+    wrapped ring silently shrinks it.
+15. Exited threads vanish from thread-CPU accounting, contradicting the
+    docstring; a leg that reaps its workers looks cheaper.
+16. Per-run device paths for the trace and perf.data — two concurrent runs
+    against one device overwrite each other. Also the pre-iteration `rm -f` is
+    unchecked, so a failed capture can let iteration N pull N-1's file.
+17. The local runner deadlocks on an undrained pipe past ~64 KiB and reports it
+    as a timeout; the OHOS path has no timeout at all.
+18. `cancel::install()` swallows a failed handler registration and its comment
+    points at a `#[cfg(test)]` function; a poisoned cleanup mutex skips device
+    restore silently.
+19. `explain_zeros` consults only the symtab, so a pattern resolving solely
+    through an inline frame is reported as a typo.
+20. `count_reflow_spans` counts a slice once per matching pattern; latent while
+    each engine has one, but the config invites more.
+
 Open work, roughly in priority order. Measured facts that motivate an item are
 dated so a later reader can tell what still needs re-checking.
 
