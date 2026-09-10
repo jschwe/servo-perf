@@ -72,6 +72,16 @@ pub struct CpuFreqArgs {
 /// `hdc`. When `--ohos` is set, `--bin` (or its A/B equivalents) becomes
 /// optional: the .hap is expected to already be installed on the device,
 /// or installed once before the run if `--bin` points at a `.hap` file.
+/// CLI defaults, named so a suite file can fill in only the settings the
+/// command line did not set. Duplicating the literals in the `#[arg]`
+/// attributes would let the two drift apart silently.
+pub mod defaults {
+    pub const BUNDLE: &str = "org.servo.servo";
+    pub const ABILITY: &str = "EntryAbility";
+    pub const THERMAL_ZONE: &str = "soc_thermal";
+    pub const TRACE_BUFFER_KIB: u64 = 524_288;
+}
+
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct OhosArgs {
     /// Run against a HarmonyOS device via `hdc` instead of executing
@@ -96,10 +106,10 @@ pub struct OhosArgs {
     #[arg(long)]
     pub hdc_target: Option<String>,
     /// Bundle name to launch.
-    #[arg(long, default_value = "org.servo.servo")]
+    #[arg(long, default_value = defaults::BUNDLE)]
     pub ohos_bundle: String,
     /// UIAbility name to launch.
-    #[arg(long, default_value = "EntryAbility")]
+    #[arg(long, default_value = defaults::ABILITY)]
     pub ohos_ability: String,
     /// Where on the device the captured hitrace text is written.
     #[arg(long, default_value = "/data/local/tmp/servoperf_hitrace.txt")]
@@ -111,7 +121,7 @@ pub struct OhosArgs {
     /// not that the engine laid out less. Devices cap this: hitrace accepts
     /// 256 KiB - 300 MB and DAYU200 enforces the upper end, rejecting this
     /// default (`--trace_begin` then fails with hitrace's own message).
-    #[arg(long, default_value_t = 524_288)]
+    #[arg(long, default_value_t = defaults::TRACE_BUFFER_KIB)]
     pub ohos_trace_buffer_kib: u64,
     /// Comma-separated hitrace tag list (passed as positional args to
     /// `hitrace`). The default mirrors the servo CI bencher, plus `nweb`:
@@ -173,7 +183,7 @@ pub struct OhosArgs {
     /// `soc_thermal` reads a flat 30000 under any load while `board_thermal`
     /// tracks, so a run whose thermal columns never move is usually pointed at
     /// a placeholder rather than a cool device.
-    #[arg(long, default_value = "soc_thermal")]
+    #[arg(long, default_value = defaults::THERMAL_ZONE)]
     pub ohos_thermal_zone: String,
     /// Collect per-function inclusive instruction counts per iteration via
     /// `hiperf record -a -e hw-instructions`, running in parallel with the

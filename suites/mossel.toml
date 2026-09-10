@@ -8,6 +8,19 @@
 
 name = "mossel"
 
+# Device settings for this campaign, so they are not retyped every run. A flag
+# actually passed on the command line still wins; these fill in only where the
+# CLI is on its default.
+[device]
+bundle = "org.openharmonyrs.arkwebtest"
+# ability = "EntryAbility"
+# hdc_target = "<serial>"          # only with several devices attached
+# The CLI default (soc_thermal) is a flat placeholder on some devices — on
+# PLR-AL00 it reads 30000 m°C under any load, while board_thermal tracks.
+# thermal_zone = "board_thermal"
+# Some devices cap the hitrace ring below the 512 MB default (DAYU200: 300 MB).
+# trace_buffer_kib = 204800
+
 [defaults]
 # Repetitions per workload. 15 keeps the median stable against the page's own
 # load-to-load variance, which dominates the sampling error.

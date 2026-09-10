@@ -102,8 +102,14 @@ Check three things in `out/smoke-*/raw.json` before going further:
 One command runs every workload against every engine:
 
 ```sh
-servoperf suite mossel --ohos --ohos-bundle org.openharmonyrs.arkwebtest
+servoperf suite mossel
 ```
+
+No device flags: the suite's `[device]` section carries the bundle, and
+optionally the serial, thermal zone and trace-buffer size, so a campaign is
+reproduced by the file rather than by remembering a flag list. A flag actually
+passed still wins — these fill in only where the command line is on its
+default.
 
 The matrix and its settings live in [`suites/mossel.toml`](../suites/mossel.toml)
 — repetitions, capture window, sampling period, trace tags, which workloads are
@@ -125,7 +131,7 @@ switch by hand. `--assume-yes` skips the prompt when the device is already set.
 Useful for a first pass:
 
 ```sh
-servoperf suite mossel --ohos --only mossel-index --legs arkweb --iterations 1
+servoperf suite mossel --only mossel-index --legs arkweb --iterations 1
 ```
 
 Budget ~7 minutes per workload per leg. The `-scroll` variants need `uitest` on
