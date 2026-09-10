@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
-use std::time::SystemTime;
 
 use crate::cli::{BenchArgs, OhosArgs};
 use crate::fixtures::{self, FixtureHandle};
@@ -373,7 +372,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let data = RunResults {
         command: crate::report::invocation(),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        timestamp_utc: now_rfc3339(),
+        timestamp_utc: crate::report::now_utc(),
         workload: w,
         configs,
         deltas: BTreeMap::new(),
@@ -483,21 +482,5 @@ fn resolve_out(explicit: Option<&Path>, workload_name: &str) -> PathBuf {
     if let Some(p) = explicit {
         return p.to_path_buf();
     }
-    let ts = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
-    PathBuf::from("out").join(format!(
-        "{}-{}",
-        workload_name,
-        crate::report::format_utc_compact(ts)
-    ))
-}
-
-fn now_rfc3339() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
-    crate::report::format_utc(secs)
+    crate::report::default_out_dir(workload_name)
 }
