@@ -21,6 +21,11 @@ pub struct Suite {
     /// Applied to every leg/workload pair; individual entries override.
     #[serde(default)]
     pub defaults: SuiteDefaults,
+    /// Device settings for the campaign, so they do not have to be retyped on
+    /// every invocation. A command-line flag that was actually given still
+    /// wins; these fill in only where the CLI is still on its default.
+    #[serde(default)]
+    pub device: DeviceSettings,
     /// One entry per engine under test, run in file order.
     #[serde(rename = "leg")]
     pub legs: Vec<Leg>,
@@ -49,6 +54,26 @@ pub struct SuiteDefaults {
     /// Whether to collect per-function instruction counts.
     #[serde(default)]
     pub with_instructions: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DeviceSettings {
+    /// Bundle to launch — the CLI default is Servo's own, not the wrapper's.
+    #[serde(default)]
+    pub bundle: Option<String>,
+    /// UIAbility name, when it is not `EntryAbility`.
+    #[serde(default)]
+    pub ability: Option<String>,
+    /// Device serial, for a host with several attached.
+    #[serde(default)]
+    pub hdc_target: Option<String>,
+    /// Thermal zone `type` to sample. Worth setting per campaign: the CLI
+    /// default (`soc_thermal`) is a flat placeholder on some devices.
+    #[serde(default)]
+    pub thermal_zone: Option<String>,
+    /// hitrace ring buffer, KiB. Some devices cap below the CLI default.
+    #[serde(default)]
+    pub trace_buffer_kib: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -144,9 +169,21 @@ mod tests {
     }
 
     #[test]
+    fn the_mossel_suite_names_the_wrapper_bundle() {
+        // The CLI default bundle is Servo's own; a suite that forgets to say
+        // otherwise silently measures the wrong app.
+        let suite = Suite::load(&suites_dir(), "mossel").unwrap();
+        assert_eq!(
+            suite.device.bundle.as_deref(),
+            Some("org.openharmonyrs.arkwebtest")
+        );
+    }
+
+    #[test]
     fn workload_overrides_win_over_defaults() {
         let suite = Suite {
             name: "s".into(),
+            device: DeviceSettings::default(),
             defaults: SuiteDefaults {
                 iterations: Some(15),
                 capture_seconds: Some(20),

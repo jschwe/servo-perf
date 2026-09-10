@@ -459,6 +459,15 @@ impl OhosTarget {
         if let Some(line) = begin_out.lines().find(|l| l.contains("error:")) {
             anyhow::bail!("hitrace --trace_begin refused the capture: {}", line.trim());
         }
+        // An abandoned run must not leave the recording open: the next
+        // `--trace_begin` on this device then fails with `OpenRecording
+        // failed, errorCode(1103)` and nothing says why.
+        let trace_cleanup = {
+            let t = self.clone();
+            crate::cancel::register_cleanup(move || {
+                let _ = t.hdc(&["shell", "hitrace", "--trace_finish", "-o", "/dev/null"]);
+            })
+        };
 
         // Thermal snapshot immediately before launch — anchors the
         // per-iteration delta. If the read fails the iteration still
@@ -552,7 +561,9 @@ impl OhosTarget {
             "-o",
             &self.trace_path_on_device,
         ];
-        self.hdc(&stop_args).context("hitrace --trace_finish")?;
+        let finish = self.hdc(&stop_args).context("hitrace --trace_finish");
+        crate::cancel::unregister_cleanup(trace_cleanup);
+        finish?;
         let exit_wall_ns = wall_now_ns();
 
         // Pull the trace text back to the host.

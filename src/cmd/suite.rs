@@ -73,7 +73,7 @@ pub fn run(args: SuiteArgs) -> Result<()> {
         if crate::cancel::requested() {
             break;
         }
-        prepare_leg(leg, &args)?;
+        prepare_leg(leg, &args, &suite)?;
         for w in &workloads {
             if crate::cancel::requested() {
                 eprintln!("suite: cancelled; skipping the rest of the matrix");
@@ -86,7 +86,7 @@ pub fn run(args: SuiteArgs) -> Result<()> {
                 bin: args.bin.clone(),
                 iterations: args.iterations.or_else(|| suite.iterations_for(w)),
                 out: Some(out),
-                ohos: leg_ohos_args(&args, &suite, leg, w),
+                ohos: leg_ohos_args(&args, &suite, leg, Some(w)),
             };
             if let Err(e) = crate::cmd::bench::run(bench) {
                 eprintln!("suite: {} / {} FAILED: {e:#}", leg.id, w.name);
@@ -108,11 +108,11 @@ pub fn run(args: SuiteArgs) -> Result<()> {
 
 /// Select the engine for a leg: run its `setup` command, or ask for the switch
 /// to be made by hand when the suite does not say how.
-fn prepare_leg(leg: &Leg, args: &SuiteArgs) -> Result<()> {
+fn prepare_leg(leg: &Leg, args: &SuiteArgs, suite: &Suite) -> Result<()> {
     match &leg.setup {
         Some(cmd) => {
             eprintln!("suite: leg {} setup: hdc shell {cmd}", leg.id);
-            let target = crate::ohos::OhosTarget::from_args(&args.ohos);
+            let target = crate::ohos::OhosTarget::from_args(&leg_ohos_args(args, suite, leg, None));
             target
                 .shell(cmd)
                 .with_context(|| format!("leg {} setup command failed", leg.id))?;
@@ -145,18 +145,47 @@ fn leg_ohos_args(
     args: &SuiteArgs,
     suite: &Suite,
     leg: &Leg,
-    w: &crate::suite::SuiteWorkload,
+    w: Option<&crate::suite::SuiteWorkload>,
 ) -> crate::cli::OhosArgs {
     let mut ohos = args.ohos.clone();
+    // A suite is always a device campaign; `--ohos` would be noise.
     ohos.ohos = true;
     ohos.engine = Some(leg.engine.clone());
+    // Device settings from the file, applied only where the command line is
+    // still on its default — an explicitly passed flag keeps winning.
+    let d = &suite.device;
+    if let Some(v) = d.bundle.clone() {
+        if ohos.ohos_bundle == crate::cli::defaults::BUNDLE {
+            ohos.ohos_bundle = v;
+        }
+    }
+    if let Some(v) = d.ability.clone() {
+        if ohos.ohos_ability == crate::cli::defaults::ABILITY {
+            ohos.ohos_ability = v;
+        }
+    }
+    if let Some(v) = d.hdc_target.clone() {
+        if ohos.hdc_target.is_none() {
+            ohos.hdc_target = Some(v);
+        }
+    }
+    if let Some(v) = d.thermal_zone.clone() {
+        if ohos.ohos_thermal_zone == crate::cli::defaults::THERMAL_ZONE {
+            ohos.ohos_thermal_zone = v;
+        }
+    }
+    if let Some(v) = d.trace_buffer_kib {
+        if ohos.ohos_trace_buffer_kib == crate::cli::defaults::TRACE_BUFFER_KIB {
+            ohos.ohos_trace_buffer_kib = v;
+        }
+    }
     if let Some(v) = suite.defaults.with_instructions {
         ohos.with_instructions = v;
     }
     if let Some(v) = suite.defaults.instructions_period {
         ohos.instructions_period = v;
     }
-    if let Some(v) = suite.capture_seconds_for(w) {
+    if let Some(v) = w.and_then(|w| suite.capture_seconds_for(w)) {
         ohos.ohos_capture_seconds = v;
     }
     if let Some(v) = leg.trace_tags.clone().or(suite.defaults.trace_tags.clone()) {
