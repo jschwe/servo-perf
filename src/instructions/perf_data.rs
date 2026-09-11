@@ -65,6 +65,13 @@ pub struct Aggregation {
     /// told from an analysis that resolved nothing.
     pub samples_seen: u64,
     pub samples_in_library: u64,
+    /// Process names that contributed at least one in-library sample, with
+    /// their counts. `hiperf record -a` is system-wide and attribution here is
+    /// by library, so *any* process mapping the engine `.so` lands in
+    /// `totals` — a second browser tab's renderer, another app embedding the
+    /// same webview. Reporting who contributed is what makes that visible
+    /// instead of silently inflating the run.
+    pub library_samples_by_process: HashMap<String, u64>,
     /// First and last sample timestamp, in the same monotonic clock the
     /// hitrace slices carry — so the trace can be narrowed to exactly the
     /// interval these instructions came from.
@@ -109,6 +116,7 @@ pub fn aggregate_inclusive_from_perf_data(
             window: None,
             samples_seen: 0,
             samples_in_library: 0,
+            library_samples_by_process: HashMap::new(),
         });
     }
 
@@ -145,6 +153,10 @@ pub fn aggregate_inclusive_from_perf_data(
     // per pid is fine: perf records hundreds of mmaps for a typical
     // capture, and binary search on the Vec is ~O(log n) per lookup.
     let mut mmaps_by_pid: HashMap<i32, Vec<Mapping>> = HashMap::new();
+    // Process name per pid, from PERF_RECORD_COMM. Used only to report (and
+    // optionally restrict) which processes the totals came from.
+    let mut comm_by_pid: HashMap<i32, String> = HashMap::new();
+    let mut library_samples_by_process: HashMap<String, u64> = HashMap::new();
 
     while let Some(record) = record_iter
         .next_record(&mut perf_file)
@@ -180,6 +192,12 @@ pub fn aggregate_inclusive_from_perf_data(
                                 basename: basename.into_owned(),
                             });
                         }
+                    }
+                    EventRecord::Comm(c) => {
+                        comm_by_pid.insert(
+                            c.pid,
+                            String::from_utf8_lossy(&c.name.as_slice()).into_owned(),
+                        );
                     }
                     EventRecord::Sample(s) => {
                         if let Some(t) = s.timestamp {
@@ -275,6 +293,13 @@ pub fn aggregate_inclusive_from_perf_data(
                         }
                         if in_library {
                             samples_in_library += 1;
+                            let who = comm_by_pid
+                                .get(&pid)
+                                .map(String::as_str)
+                                .unwrap_or("<unknown>");
+                            *library_samples_by_process
+                                .entry(who.to_string())
+                                .or_insert(0) += 1;
                         }
                     }
                     _ => {}
@@ -300,6 +325,7 @@ pub fn aggregate_inclusive_from_perf_data(
         window,
         samples_seen,
         samples_in_library,
+        library_samples_by_process,
     })
 }
 

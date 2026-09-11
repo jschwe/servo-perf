@@ -40,7 +40,14 @@ pub struct Step {
     /// Repeat every `every_ms` until the window ends. Omit to run once.
     #[serde(default)]
     pub every_ms: Option<u64>,
-    /// Shell command, e.g. `uitest uiInput swipe 540 2200 540 600 600`.
+    /// Total number of runs, counting the first. Omit to keep repeating for
+    /// the whole window. A bounded count is what lets one workload hold two
+    /// phases — N swipes down, then N back up — instead of one gesture
+    /// repeated forever, and it makes the injected work identical across
+    /// engines even if their windows differ.
+    #[serde(default)]
+    pub times: Option<u32>,
+    /// Shell command, e.g. `uinput -T -m 630 1904 630 954`.
     pub run: String,
 }
 

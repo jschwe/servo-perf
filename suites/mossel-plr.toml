@@ -4,14 +4,19 @@
 # Run with:  servoperf suite mossel-plr --ohos
 #
 # Unlike `mossel`, the two legs are two different *apps*, not one wrapper whose
-# engine is picked by a system parameter: the ArkWeb wrapper app is not signed
-# for this device, so the ArkWeb side is the stock browser. Each leg therefore
-# names its own bundle and there is no engine switch between them.
+# engine is picked by a system parameter: this device cannot switch its engine,
+# so ArkWeb runs in the test wrapper and Servo in servoshell. Each leg names its
+# own bundle and there is no engine switch between them.
 #
-# Read the comparison with that in mind: startup path, chrome and window size
-# differ between the legs, so only within-leg trends and large between-leg gaps
-# are meaningful. `--chrome=none` levels the viewport on the servo leg but the
-# browser has no such flag, so its viewport stays the smaller of the two.
+# The ArkWeb side is deliberately NOT the stock browser. Measured on a PLR-AL00,
+# `com.huawei.hmos.browser` puts a modal "Allow Browser to send you
+# notifications?" over m.huaweimossel.com on every launch — it swallows every
+# injected swipe, so the scroll workloads measured an inert page — and each
+# `aa start -U` opens another tab, whose renderer keeps running and, because
+# attribution is by library rather than by process, lands in the totals.
+#
+# What still differs between the legs: startup path, and the app shell around
+# the engine. Both run `--chrome=none`, so the viewport matches.
 
 name = "mossel-plr"
 
@@ -29,8 +34,7 @@ with_instructions = true
 [[leg]]
 id = "arkweb"
 engine = "arkweb"
-bundle = "com.huawei.hmos.browser"
-ability = "MainAbility"
+bundle = "org.openharmonyrs.arkwebtest"
 # Blink emits its markers regardless of the threshold, so leave the device's
 # trace level alone on this leg.
 trace_level = ""
@@ -57,20 +61,20 @@ name = "mossel-user"
 
 [[workload]]
 name = "mossel-index-scroll"
-capture_seconds = 20
+capture_seconds = 48
 
 [[workload]]
 name = "mossel-sort-scroll"
-capture_seconds = 20
+capture_seconds = 48
 
 [[workload]]
 name = "mossel-articles-scroll"
-capture_seconds = 20
+capture_seconds = 48
 
 [[workload]]
 name = "mossel-cart-scroll"
-capture_seconds = 20
+capture_seconds = 48
 
 [[workload]]
 name = "mossel-user-scroll"
-capture_seconds = 20
+capture_seconds = 48
