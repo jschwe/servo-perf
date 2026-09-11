@@ -292,23 +292,30 @@ pub fn run(args: BenchArgs) -> Result<()> {
         // a second `:render` alive for a background tab and it was counted
         // into the ArkWeb leg. Name the contributors once per run so the next
         // one is noticed rather than quietly absorbed.
-        if aggregation.library_samples_by_process.len() > 1
-            && crate::log_once::first_time("instructions-multi-process")
-        {
-            let mut who: Vec<(&String, &u64)> =
-                aggregation.library_samples_by_process.iter().collect();
-            who.sort_by(|a, b| b.1.cmp(a.1));
-            let list = who
+        // The app's own helper processes are expected — an ArkWeb app is
+        // `<bundle>` plus `<bundle>:render` and `<bundle>:gpu`. Only names
+        // outside the bundle are a problem.
+        if let Target::Ohos(ohos) = &target {
+            let mut foreign: Vec<(&String, &u64)> = aggregation
+                .library_samples_by_process
                 .iter()
-                .map(|(name, n)| format!("{name} ({n})"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            eprintln!(
-                "warning: {} processes contributed samples inside the engine library: {list}. \
-                 Only the app under test should be here — force-stop anything else running \
-                 the same engine, or the extra work inflates every instruction total.",
-                who.len()
-            );
+                .filter(|(name, _)| name.split(':').next().unwrap_or(name) != ohos.bundle.as_str())
+                .collect();
+            if !foreign.is_empty() && crate::log_once::first_time("instructions-foreign-process") {
+                foreign.sort_by(|a, b| b.1.cmp(a.1));
+                let list = foreign
+                    .iter()
+                    .map(|(name, n)| format!("{name} ({n} samples)"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "warning: processes outside {:?} contributed samples inside the engine \
+                     library: {list}. Attribution is by library, not by process, so their work \
+                     is in every instruction total — force-stop whatever else is running this \
+                     engine and re-run.",
+                    ohos.bundle
+                );
+            }
         }
         let starts = reflow_starts_by_iter.remove(&idx).unwrap_or_default();
         if let Some(it) = iterations.iter_mut().find(|it| it.index == idx) {

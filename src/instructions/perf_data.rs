@@ -194,10 +194,18 @@ pub fn aggregate_inclusive_from_perf_data(
                         }
                     }
                     EventRecord::Comm(c) => {
-                        comm_by_pid.insert(
-                            c.pid,
-                            String::from_utf8_lossy(&c.name.as_slice()).into_owned(),
-                        );
+                        // COMM is per-*thread*. Only the main thread's name
+                        // identifies the process: taking any thread's would
+                        // report `ThreadPoolServi` or `OS_FFRT_4_3` and make
+                        // one ordinary multi-threaded app look like several
+                        // processes. The kernel truncates it to 15 bytes, so
+                        // this is a prefix of the bundle, not the bundle.
+                        if c.pid == c.tid {
+                            comm_by_pid.insert(
+                                c.pid,
+                                String::from_utf8_lossy(&c.name.as_slice()).into_owned(),
+                            );
+                        }
                     }
                     EventRecord::Sample(s) => {
                         if let Some(t) = s.timestamp {
