@@ -96,6 +96,41 @@ pub struct EngineConfig {
     /// arithmetic sum of its parts, the difference is exactly that overlap.
     #[serde(default, rename = "group")]
     pub groups: Vec<MetricGroup>,
+    /// Worker pools whose samples belong to a phase their own callchain does
+    /// not name. See [`ParallelPool`].
+    #[serde(default, rename = "parallel_pool")]
+    pub parallel_pools: Vec<ParallelPool>,
+}
+
+/// A thread pool that runs part of a phase off the thread that entered it.
+///
+/// Attribution here is per sample, against that sample's own callchain. That
+/// works for a single-threaded engine and breaks for a parallel one: Servo
+/// hands style and box/fragment-tree building to a rayon pool, and a worker's
+/// stack is rooted at the rayon loop, so no frame names
+/// `restyle_and_build_trees` or `<LayoutThread as Layout>::reflow`. Those
+/// samples were dropped while Blink's single-threaded equivalent was counted
+/// in full — a one-sided undercount. Measured on a PLR-AL00 by serialising the
+/// pool (`--pref layout_threads=1`), Servo's `layout_proper` rose 34.8% and
+/// `colleagues_reflow` 5.9%, so at least a quarter of its style and layout
+/// work was invisible.
+///
+/// Forcing the pool off would measure a configuration nobody ships, so instead
+/// the in-library samples taken *on* these threads are credited to the named
+/// targets, once each per sample like any other match.
+///
+/// This is only sound for a pool dedicated to the phase being credited. Servo's
+/// `StyleThread#N` pool is used solely for restyle and layout, so a sample on
+/// one is layout work by construction.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ParallelPool {
+    /// Thread-name prefixes, matched against `PERF_RECORD_COMM`. The kernel
+    /// truncates `comm` to 15 bytes, so keep these short.
+    pub threads: Vec<String>,
+    /// `functions` entries and `group` names to credit. A name that matches
+    /// neither is rejected at load time rather than silently crediting
+    /// nothing.
+    pub credit: Vec<String>,
 }
 
 /// One named sum over `functions` patterns. Reported as
@@ -113,6 +148,28 @@ impl InstructionsConfig {
             .with_context(|| format!("reading instructions config at {}", path.display()))?;
         let cfg: InstructionsConfig =
             toml::from_str(&text).with_context(|| format!("parsing TOML at {}", path.display()))?;
+        // A `credit` name that matches no target would silently credit
+        // nothing, which looks exactly like the undercount the pool exists to
+        // fix. Reject it here instead.
+        for engine in &cfg.engines {
+            for pool in &engine.parallel_pools {
+                for name in &pool.credit {
+                    let known = engine.functions.iter().any(|f| f == name)
+                        || engine.groups.iter().any(|g| &g.name == name);
+                    anyhow::ensure!(
+                        known,
+                        "engine {:?}: parallel_pool credits {name:?}, which is neither one of \
+                         its `functions` nor one of its `group` names",
+                        engine.id
+                    );
+                }
+                anyhow::ensure!(
+                    !pool.threads.is_empty(),
+                    "engine {:?}: parallel_pool has no `threads`",
+                    engine.id
+                );
+            }
+        }
         Ok(cfg)
     }
 
@@ -280,6 +337,7 @@ mod tests {
             reflow_spans: vec!["performLayout".into()],
             reflow_instructions: None,
             groups: vec![],
+            parallel_pools: vec![],
             launch_args: vec![],
             device_library: vec![],
         };
@@ -314,6 +372,7 @@ mod tests {
             reflow_spans: vec!["LocalFrameView::performLayout".into()],
             reflow_instructions: None,
             groups: vec![],
+            parallel_pools: vec![],
             launch_args: vec![],
             device_library: vec![],
         };
@@ -338,6 +397,7 @@ mod tests {
             reflow_spans: vec![],
             reflow_instructions: None,
             groups: vec![],
+            parallel_pools: vec![],
             launch_args: vec![],
             device_library: vec![],
         };

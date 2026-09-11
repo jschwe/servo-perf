@@ -164,6 +164,32 @@ pub fn aggregate_inclusive_from_perf_data(
     // optionally restrict) which processes the totals came from.
     let mut comm_by_pid: HashMap<i32, String> = HashMap::new();
     let mut library_samples_by_process: HashMap<String, u64> = HashMap::new();
+    // Per-*thread* names, for crediting worker pools whose callchains do not
+    // name the phase they are running. See `ParallelPool`.
+    let mut comm_by_tid: HashMap<i32, String> = HashMap::new();
+    // Resolved once: which target/group slots each pool credits.
+    let pool_targets: Vec<(&crate::instructions::ParallelPool, Vec<usize>, Vec<usize>)> = engine
+        .parallel_pools
+        .iter()
+        .map(|pool| {
+            let funcs = engine
+                .functions
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| pool.credit.iter().any(|c| c == *f))
+                .map(|(i, _)| i)
+                .collect();
+            let groups = engine
+                .groups
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| pool.credit.iter().any(|c| *c == g.name))
+                .map(|(i, _)| i)
+                .collect();
+            (pool, funcs, groups)
+        })
+        .collect();
+    let mut pool_credited_samples: u64 = 0;
 
     while let Some(record) = record_iter
         .next_record(&mut perf_file)
@@ -201,6 +227,10 @@ pub fn aggregate_inclusive_from_perf_data(
                         }
                     }
                     EventRecord::Comm(c) => {
+                        comm_by_tid.insert(
+                            c.tid,
+                            String::from_utf8_lossy(&c.name.as_slice()).into_owned(),
+                        );
                         // COMM is per-*thread*. Only the main thread's name
                         // identifies the process: taking any thread's would
                         // report `ThreadPoolServi` or `OS_FFRT_4_3` and make
@@ -306,6 +336,39 @@ pub fn aggregate_inclusive_from_perf_data(
                                 matched_groups[g] = true;
                             }
                         }
+                        // A worker-pool sample is layout work even though its
+                        // own stack does not say so. Credited after the chain
+                        // walk and through the same per-sample flags, so a
+                        // chain that *did* name the target is not counted twice.
+                        if in_library && !pool_targets.is_empty() {
+                            let thread = s.tid.and_then(|t| comm_by_tid.get(&t));
+                            if let Some(thread) = thread {
+                                for (pool, funcs, groups) in &pool_targets {
+                                    if !pool.threads.iter().any(|p| thread.starts_with(p)) {
+                                        continue;
+                                    }
+                                    pool_credited_samples += 1;
+                                    for &i in funcs {
+                                        if matched_for_this_sample[i] {
+                                            continue;
+                                        }
+                                        if let Some(slot) = totals.get_mut(&engine.functions[i]) {
+                                            *slot += period;
+                                        }
+                                        matched_for_this_sample[i] = true;
+                                    }
+                                    for &g in groups {
+                                        if matched_groups[g] {
+                                            continue;
+                                        }
+                                        if let Some(slot) = totals.get_mut(&engine.groups[g].name) {
+                                            *slot += period;
+                                        }
+                                        matched_groups[g] = true;
+                                    }
+                                }
+                            }
+                        }
                         if in_library {
                             samples_in_library += 1;
                             let who = comm_by_pid
@@ -333,6 +396,20 @@ pub fn aggregate_inclusive_from_perf_data(
         &symbol_basename,
     ) {
         eprintln!("{warning}");
+    }
+    if pool_credited_samples > 0 && crate::log_once::first_time("instructions-parallel-pool") {
+        eprintln!(
+            "instructions: {pool_credited_samples} sample(s) credited from worker pools \
+             ({}) — without that they would be dropped, because a worker's callchain does not \
+             name the phase it is running.",
+            engine
+                .parallel_pools
+                .iter()
+                .flat_map(|p| p.threads.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     explain_zeros(&totals, &symbolizer, engine, &sym_path);
     let mut resolved_targets = std::collections::HashSet::new();
