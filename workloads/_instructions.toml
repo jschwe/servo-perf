@@ -82,14 +82,27 @@ proxy_args = [
   "--pref=network_http_proxy_uri=$PROXY",
   "--ignore-certificate-errors",
 ]
-# One span per completed layout run. `handle_reflow` carries
-# `#[servo_tracing::instrument]`, so the span name is the bare function
-# name — but only in a hap built with `--features tracing-hitrace`; a plain
-# release build emits no Servo spans at all and `reflow.count` stays 0.
-# The spans also need a filter at launch: servoperf synthesizes
-# `--tracing-filter=<workload.tracing_filter>`, and without it servoshell
-# leaves the subscriber at LevelFilter::OFF.
-reflow_spans = ["handle_reflow"]
+# One span per layout that actually ran, to match Blink's
+# `LocalFrameView::performLayout` on the other side. It must NOT be
+# `handle_reflow`: that fires once per reflow *request*, and most requests find
+# style and the trees already clean and return without laying anything out.
+# Measured on a PLR-AL00, mossel-user-scroll, one 20 s capture: 11 947
+# `handle_reflow` against 410 `restyle_and_build_trees` and 34 display lists,
+# i.e. 97% of the calls did no layout work. Counting requests made
+# `instructions.per_reflow` a ratio of Servo requests to Blink layouts — a
+# denominator ~1000x too large on the scroll workloads, which is where the
+# nonsense "-99%" per-reflow deltas came from.
+#
+# `restyle_and_build_trees` carries `#[servo_tracing::instrument]`, so the span
+# name is the bare function name — but only in a hap built with
+# `--features tracing-hitrace`; a plain release build emits no Servo spans at
+# all and `reflow.count` stays 0. The spans also need a filter at launch:
+# servoperf synthesizes `--tracing-filter=<workload.tracing_filter>`, and
+# without it servoshell leaves the subscriber at LevelFilter::OFF.
+#
+# Only one pattern may be listed: `reflow.count` is the sum across patterns, so
+# adding `handle_reflow` back as a diagnostic would double the total.
+reflow_spans = ["restyle_and_build_trees"]
 # `<LayoutThread as Layout>::reflow` is the outer entry point and survives
 # LTO. `handle_reflow` and `build_display_list` are inlined into it at
 # codegen-units=1: they resolve to 0 unless the staged symbol file carries
@@ -246,7 +259,9 @@ functions = [
   "restyle_and_build_trees",
   "update_the_rendering",
 ]
-reflow_spans = ["handle_reflow"]
+# Same counterpart choice as the standalone servo engine above: layouts that
+# ran, not reflow requests.
+reflow_spans = ["restyle_and_build_trees"]
 # `<LayoutThread as Layout>::reflow` is the outer entry point and survives
 # LTO. `handle_reflow` and `build_display_list` are inlined into it at
 # codegen-units=1: they resolve to 0 unless the staged symbol file carries
