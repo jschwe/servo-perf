@@ -12,18 +12,38 @@ servoshell_args = ["--ignore-certificate-errors"]
 # lists what a device has. Same app for both engines, so the same name works
 # for the ArkWeb and the Servo backend.
 surface = "RosenWeb"
-capture_seconds = 20
+capture_seconds = 48
 
 [[scenario.post_processing]]
 kind = "exclude-idle-gaps"
 gap_ms = 250.0
 
-# First swipe at 6 s leaves the load settled; repeating every 1.5 s gives ~9
-# scrolls per iteration. Coordinates are chosen to be on-screen on the
-# smallest device in the fleet (DAYU200, 720x1280) so the same workload is
-# valid on a phone too. On the rk3568 board the page needs far longer than 6 s
-# to load — raise `capture_seconds` and `after_ms` there.
+# Twelve swipes: six down, then six back up, 2 s apart — the cadence the team's
+# existing ArkWeb runs use, so numbers taken here line up with theirs.
+#
+# `uinput -T -m` injects at the multimodal input layer; `uitest uiInput swipe`,
+# which this used to call, went through UITest and never moved the page in the
+# app under test. Verified on a PLR-AL00 by screenshotting before and after.
+#
+# Coordinates are that team's: x=630 is the horizontal centre, and the 950 px
+# travel stays inside the content on every mossel route. The previous
+# `360 1000 -> 360 400` was sized for a 720x1280 board and on a phone landed in
+# `mossel-sort`'s category sidebar, scrolling the nav rail instead of the list.
+# They are still absolute pixels, so they are wrong again on the next device.
+#
+# `uinput -T -m`'s trailing argument is *smooth time* (default 1000 ms), unlike
+# `uitest uiInput swipe`'s trailing *velocity*. `every_ms = 3000` is therefore a
+# 1 s gesture plus the 2 s gap.
 [[steps]]
-after_ms = 6000
-every_ms = 1500
-run = "uitest uiInput swipe 360 1000 360 400 400"
+after_ms = 10000
+every_ms = 3000
+times = 6
+run = "uinput -T -m 630 1904 630 954"
+
+# Back up. The page must be scrolled down first or this is a no-op (or a
+# pull-to-refresh), which is why the order matters.
+[[steps]]
+after_ms = 28000
+every_ms = 3000
+times = 6
+run = "uinput -T -m 630 816 630 1766"

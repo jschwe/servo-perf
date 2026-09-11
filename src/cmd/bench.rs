@@ -287,6 +287,29 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 continue;
             }
         };
+        // Attribution is by library, so any process mapping the engine `.so`
+        // is in these totals. Measured on a PLR-AL00: the stock browser keeps
+        // a second `:render` alive for a background tab and it was counted
+        // into the ArkWeb leg. Name the contributors once per run so the next
+        // one is noticed rather than quietly absorbed.
+        if aggregation.library_samples_by_process.len() > 1
+            && crate::log_once::first_time("instructions-multi-process")
+        {
+            let mut who: Vec<(&String, &u64)> =
+                aggregation.library_samples_by_process.iter().collect();
+            who.sort_by(|a, b| b.1.cmp(a.1));
+            let list = who
+                .iter()
+                .map(|(name, n)| format!("{name} ({n})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "warning: {} processes contributed samples inside the engine library: {list}. \
+                 Only the app under test should be here — force-stop anything else running \
+                 the same engine, or the extra work inflates every instruction total.",
+                who.len()
+            );
+        }
         let starts = reflow_starts_by_iter.remove(&idx).unwrap_or_default();
         if let Some(it) = iterations.iter_mut().find(|it| it.index == idx) {
             if let IterationStatus::Ok { metrics, .. } = &mut it.status {

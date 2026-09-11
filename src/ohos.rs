@@ -831,12 +831,16 @@ impl OhosTarget {
             })
         };
         let started = Instant::now();
-        let out = self.hdc(&[
-            "shell",
-            "hiperf",
-            "record",
-            "-a",
-            "--exclude-hiperf",
+        // System-wide, deliberately. Attribution downstream is by library, so
+        // another process running the same engine pollutes the totals — but
+        // `hiperf record --app <bundle>` is not the fix: measured on a
+        // PLR-AL00 it records only the app's main process, and every Blink
+        // sample lives in the `nwebspawn`-forked `:render` child, so the run
+        // came back with no instruction metrics at all. The contamination is
+        // caught after the fact instead, from the per-process sample counts in
+        // `Aggregation::library_samples_by_process`.
+        let mut argv: Vec<&str> = vec!["shell", "hiperf", "record", "-a", "--exclude-hiperf"];
+        argv.extend_from_slice(&[
             "--delay-unwind",
             "-d",
             &duration,
@@ -849,6 +853,7 @@ impl OhosTarget {
             "-o",
             DevicePaths::PERF_DATA,
         ]);
+        let out = self.hdc(&argv);
         // Unregister on both paths, so an hdc failure does not leave a stale
         // cleanup registered.
         crate::cancel::unregister_cleanup(cleanup);
@@ -1062,13 +1067,32 @@ fn build_step_schedule(steps: &[crate::workload::Step], window: Duration) -> Vec
             );
             continue;
         }
+        let wanted = step.times.unwrap_or(u32::MAX);
+        if wanted == 0 {
+            continue;
+        }
         schedule.push((first, step.run.as_str()));
+        let mut runs = 1u32;
         if let Some(every) = step.every_ms.filter(|e| *e > 0) {
             let mut at = first + Duration::from_millis(every);
-            while at < window {
+            while at < window && runs < wanted {
                 schedule.push((at, step.run.as_str()));
+                runs += 1;
                 at += Duration::from_millis(every);
             }
+        }
+        if step.times.is_some_and(|t| runs < t) {
+            // Silently injecting fewer gestures than the workload asks for is
+            // the same class of error as not injecting them at all: the page
+            // is measured less scrolled than intended, and it reads as a
+            // cheaper engine.
+            eprintln!(
+                "warning: step {:?} ran {runs} of {} times before the {:?} capture window ended; \
+                 raise capture_seconds",
+                step.run,
+                step.times.unwrap_or_default(),
+                window
+            );
         }
     }
     schedule.sort_by_key(|(at, _)| *at);
@@ -1815,8 +1839,58 @@ mod tests {
         Step {
             after_ms,
             every_ms,
+            times: None,
             run: run.to_string(),
         }
+    }
+
+    /// A phased workload — N swipes down, then N back up — needs each phase to
+    /// stop after its own count instead of running to the window edge.
+    #[test]
+    fn step_schedule_stops_after_times_runs() {
+        let steps = vec![Step {
+            after_ms: 1000,
+            every_ms: Some(1000),
+            times: Some(3),
+            run: "down".to_string(),
+        }];
+        let sched = build_step_schedule(&steps, Duration::from_secs(60));
+        let offsets: Vec<u64> = sched.iter().map(|(d, _)| d.as_millis() as u64).collect();
+        assert_eq!(offsets, vec![1000, 2000, 3000]);
+    }
+
+    /// Two phases interleave by time, not by declaration order.
+    #[test]
+    fn step_schedule_orders_two_phases() {
+        let steps = vec![
+            Step {
+                after_ms: 5000,
+                every_ms: Some(1000),
+                times: Some(2),
+                run: "up".to_string(),
+            },
+            Step {
+                after_ms: 1000,
+                every_ms: Some(1000),
+                times: Some(2),
+                run: "down".to_string(),
+            },
+        ];
+        let sched = build_step_schedule(&steps, Duration::from_secs(60));
+        let names: Vec<&str> = sched.iter().map(|(_, c)| *c).collect();
+        assert_eq!(names, vec!["down", "down", "up", "up"]);
+    }
+
+    /// `times: 0` means "do not run this phase", not "run it once".
+    #[test]
+    fn step_schedule_honours_zero_times() {
+        let steps = vec![Step {
+            after_ms: 1000,
+            every_ms: Some(1000),
+            times: Some(0),
+            run: "down".to_string(),
+        }];
+        assert!(build_step_schedule(&steps, Duration::from_secs(60)).is_empty());
     }
 
     #[test]
