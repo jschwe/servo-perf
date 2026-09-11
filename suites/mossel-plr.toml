@@ -1,0 +1,76 @@
+# The mossel campaign on a HarmonyOS phone, servoshell against the platform
+# browser.
+#
+# Run with:  servoperf suite mossel-plr --ohos
+#
+# Unlike `mossel`, the two legs are two different *apps*, not one wrapper whose
+# engine is picked by a system parameter: the ArkWeb wrapper app is not signed
+# for this device, so the ArkWeb side is the stock browser. Each leg therefore
+# names its own bundle and there is no engine switch between them.
+#
+# Read the comparison with that in mind: startup path, chrome and window size
+# differ between the legs, so only within-leg trends and large between-leg gaps
+# are meaningful. `--chrome=none` levels the viewport on the servo leg but the
+# browser has no such flag, so its viewport stays the smaller of the two.
+
+name = "mossel-plr"
+
+[device]
+# PLR-AL00's soc_thermal reads a flat 30000 m°C under any load.
+thermal_zone = "board_thermal"
+
+[defaults]
+iterations = 15
+capture_seconds = 20
+instructions_period = 1000000
+trace_tags = "app,nweb"
+with_instructions = true
+
+[[leg]]
+id = "arkweb"
+engine = "arkweb"
+bundle = "com.huawei.hmos.browser"
+ability = "MainAbility"
+# Blink emits its markers regardless of the threshold, so leave the device's
+# trace level alone on this leg.
+trace_level = ""
+
+[[leg]]
+id = "servo"
+engine = "servo"
+bundle = "org.servo.servo"
+
+[[workload]]
+name = "mossel-index"
+
+[[workload]]
+name = "mossel-sort"
+
+[[workload]]
+name = "mossel-articles"
+
+[[workload]]
+name = "mossel-cart"
+
+[[workload]]
+name = "mossel-user"
+
+[[workload]]
+name = "mossel-index-scroll"
+capture_seconds = 20
+
+[[workload]]
+name = "mossel-sort-scroll"
+capture_seconds = 20
+
+[[workload]]
+name = "mossel-articles-scroll"
+capture_seconds = 20
+
+[[workload]]
+name = "mossel-cart-scroll"
+capture_seconds = 20
+
+[[workload]]
+name = "mossel-user-scroll"
+capture_seconds = 20

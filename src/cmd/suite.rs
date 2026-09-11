@@ -117,6 +117,16 @@ pub fn run(args: SuiteArgs) -> Result<()> {
 /// Select the engine for a leg: run its `setup` command, or ask for the switch
 /// to be made by hand when the suite does not say how.
 fn prepare_leg(leg: &Leg, args: &SuiteArgs, suite: &Suite) -> Result<()> {
+    // A leg that names its own bundle *is* the engine selection: the two legs
+    // are different apps, so there is nothing to switch and nothing to ask.
+    if leg.bundle.is_some() && leg.setup.is_none() {
+        eprintln!(
+            "suite: leg {} runs its own bundle ({}); no engine switch needed",
+            leg.id,
+            leg.bundle.as_deref().unwrap_or_default()
+        );
+        return Ok(());
+    }
     match &leg.setup {
         Some(cmd) => {
             eprintln!("suite: leg {} setup: hdc shell {cmd}", leg.id);
@@ -186,12 +196,19 @@ fn leg_ohos_args(
     // Device settings from the file, applied only where the command line is
     // still on its default — an explicitly passed flag keeps winning.
     let d = &suite.device;
-    if let Some(v) = d.bundle.clone() {
+    // The leg wins over the campaign default: a leg bundle is the whole point
+    // of a two-app comparison, so it must not be filled in only when the CLI
+    // is still on its default.
+    if let Some(v) = leg.bundle.clone() {
+        ohos.ohos_bundle = v;
+    } else if let Some(v) = d.bundle.clone() {
         if ohos.ohos_bundle == crate::cli::defaults::BUNDLE {
             ohos.ohos_bundle = v;
         }
     }
-    if let Some(v) = d.ability.clone() {
+    if let Some(v) = leg.ability.clone() {
+        ohos.ohos_ability = v;
+    } else if let Some(v) = d.ability.clone() {
         if ohos.ohos_ability == crate::cli::defaults::ABILITY {
             ohos.ohos_ability = v;
         }

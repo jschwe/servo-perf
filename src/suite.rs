@@ -82,6 +82,17 @@ pub struct Leg {
     pub id: String,
     /// `_instructions.toml` engine entry to attribute against.
     pub engine: String,
+    /// Bundle for this leg, overriding `device.bundle`. Set it when the legs
+    /// are two different apps rather than one app whose engine is switched by
+    /// a system parameter — comparing servoshell against the platform browser,
+    /// say. A leg that names its own bundle needs no engine switch, so the
+    /// run neither prompts nor warns about one.
+    #[serde(default)]
+    pub bundle: Option<String>,
+    /// UIAbility for this leg, overriding `device.ability`. Only meaningful
+    /// alongside `bundle`; a different app rarely uses the same entry name.
+    #[serde(default)]
+    pub ability: Option<String>,
     /// Optional `hdc shell` command run once before the leg — typically the
     /// device's engine-selection parameter. Left unset, the run pauses and
     /// asks for the switch to be made by hand, because servoperf has no
