@@ -144,6 +144,30 @@ functions = ["build_stacking_context_tree", "build_display_list"]
 name = "colleagues_reflow"
 functions = ["Window>::reflow"]
 
+# Servo hands restyle and box/fragment-tree building to stylo's rayon pool
+# (`layout_threads`, default 3). A worker's stack is rooted at the rayon loop,
+# so nothing in it names `restyle_and_build_trees` or `Layout>::reflow` and the
+# sample would be dropped -- while Blink's single-threaded equivalent is
+# counted in full. Measured on a PLR-AL00 by serialising the pool
+# (`--pref layout_threads=1`): `layout_proper` rose 34.8% and
+# `colleagues_reflow` 5.9%, i.e. at least a quarter of Servo's style and layout
+# work was invisible, always in the direction that flattered Servo.
+#
+# The pool is used for nothing but restyle and layout, so a sample on one of
+# its threads is layout work by construction. Credit it to the phases that
+# contain it. `paint_prep` is deliberately absent: the stacking-context tree
+# and the display list are built on the script thread.
+[[engines.parallel_pool]]
+threads = ["StyleThread#"]
+credit = [
+  "layout_proper",
+  "colleagues_reflow",
+  "Layout>::reflow",
+  "Window>::reflow",
+  "LayoutThread>::handle_reflow",
+  "update_the_rendering",
+]
+
 [[engines]]
 id = "arkweb"
 bundles = [
@@ -330,3 +354,27 @@ functions = ["build_stacking_context_tree", "build_display_list"]
 [[engines.group]]
 name = "colleagues_reflow"
 functions = ["Window>::reflow"]
+
+# Servo hands restyle and box/fragment-tree building to stylo's rayon pool
+# (`layout_threads`, default 3). A worker's stack is rooted at the rayon loop,
+# so nothing in it names `restyle_and_build_trees` or `Layout>::reflow` and the
+# sample would be dropped -- while Blink's single-threaded equivalent is
+# counted in full. Measured on a PLR-AL00 by serialising the pool
+# (`--pref layout_threads=1`): `layout_proper` rose 34.8% and
+# `colleagues_reflow` 5.9%, i.e. at least a quarter of Servo's style and layout
+# work was invisible, always in the direction that flattered Servo.
+#
+# The pool is used for nothing but restyle and layout, so a sample on one of
+# its threads is layout work by construction. Credit it to the phases that
+# contain it. `paint_prep` is deliberately absent: the stacking-context tree
+# and the display list are built on the script thread.
+[[engines.parallel_pool]]
+threads = ["StyleThread#"]
+credit = [
+  "layout_proper",
+  "colleagues_reflow",
+  "Layout>::reflow",
+  "Window>::reflow",
+  "LayoutThread>::handle_reflow",
+  "update_the_rendering",
+]
