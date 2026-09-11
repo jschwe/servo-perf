@@ -178,8 +178,12 @@ pub fn reflow_span_starts(
 /// intervals: hitrace is running before `aa start` and keeps recording while
 /// `--trace_finish` flushes, so the denominator spans measurably more than the
 /// PMU window (measured on one 20 s capture: a 49.5 s trace against a 20.0 s
-/// sample window). Both clocks are the device's monotonic one, so the
-/// timestamps are directly comparable.
+/// sample window).
+///
+/// Both clocks are pinned to CLOCK_BOOTTIME — hitrace's default, and
+/// hiperf's only because `run_hiperf_record` passes `--clockid boottime`;
+/// hiperf's own default leaves samples on the perf clock, which stops across
+/// suspend.
 ///
 /// `window` is `None` when instruction counting is off, or when the capture
 /// produced no timestamped sample; the whole trace is then counted, which is

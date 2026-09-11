@@ -72,6 +72,12 @@ pub struct Aggregation {
     /// same webview. Reporting who contributed is what makes that visible
     /// instead of silently inflating the run.
     pub library_samples_by_process: HashMap<String, u64>,
+    /// Targets whose patterns matched at least one symbol in the staged
+    /// library. A zero for one of these is a real zero — the phase ran no
+    /// instructions this iteration — while a zero for a target *not* here
+    /// means the pattern found nothing and the number is meaningless. Callers
+    /// need the distinction to decide which zeros belong in a median.
+    pub resolved_targets: std::collections::HashSet<String>,
     /// First and last sample timestamp, in the same monotonic clock the
     /// hitrace slices carry — so the trace can be narrowed to exactly the
     /// interval these instructions came from.
@@ -117,6 +123,7 @@ pub fn aggregate_inclusive_from_perf_data(
             samples_seen: 0,
             samples_in_library: 0,
             library_samples_by_process: HashMap::new(),
+            resolved_targets: std::collections::HashSet::new(),
         });
     }
 
@@ -328,12 +335,24 @@ pub fn aggregate_inclusive_from_perf_data(
         eprintln!("{warning}");
     }
     explain_zeros(&totals, &symbolizer, engine, &sym_path);
+    let mut resolved_targets = std::collections::HashSet::new();
+    for f in &engine.functions {
+        if symbolizer.symtab.matches_any(f) {
+            resolved_targets.insert(f.clone());
+        }
+    }
+    for g in &engine.groups {
+        if g.functions.iter().any(|f| symbolizer.symtab.matches_any(f)) {
+            resolved_targets.insert(g.name.clone());
+        }
+    }
     Ok(Aggregation {
         totals,
         window,
         samples_seen,
         samples_in_library,
         library_samples_by_process,
+        resolved_targets,
     })
 }
 

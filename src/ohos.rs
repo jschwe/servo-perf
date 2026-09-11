@@ -841,6 +841,16 @@ impl OhosTarget {
         // `Aggregation::library_samples_by_process`.
         let mut argv: Vec<&str> = vec!["shell", "hiperf", "record", "-a", "--exclude-hiperf"];
         argv.extend_from_slice(&[
+            // Sample timestamps must be on the same clock as the hitrace
+            // slices, or `per_reflow` divides a numerator and a denominator
+            // taken over different intervals. hitrace's default `trace_clock`
+            // is `boot` (CLOCK_BOOTTIME, verified on a PLR-AL00 by matching
+            // trace timestamps against /proc/uptime); hiperf's default clockid
+            // is unset, which leaves samples on the kernel's perf clock — that
+            // one stops across suspend, so the two drift apart by however long
+            // the device has slept. Pin it rather than hope.
+            "--clockid",
+            "boottime",
             "--delay-unwind",
             "-d",
             &duration,

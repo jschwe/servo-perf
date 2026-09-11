@@ -77,28 +77,63 @@ pub fn run(args: SuiteArgs) -> Result<()> {
     );
 
     let mut failures: Vec<String> = Vec::new();
-    'legs: for leg in &legs {
-        if crate::cancel::requested() {
-            break;
+    let mut run_cell = |leg: &Leg, w: &crate::suite::SuiteWorkload, failures: &mut Vec<String>| {
+        let out = root.join(format!("{}-{}", leg.id, w.name));
+        eprintln!("\n=== {} / {} ===", leg.id, w.name);
+        let bench = BenchArgs {
+            workload: w.name.clone(),
+            bin: args.bin.clone(),
+            iterations: args.iterations.or_else(|| suite.iterations_for(w)),
+            out: Some(out),
+            ohos: leg_ohos_args(&args, &suite, leg, Some(w)),
+        };
+        if let Err(e) = crate::cmd::bench::run(bench) {
+            eprintln!("suite: {} / {} FAILED: {e:#}", leg.id, w.name);
+            failures.push(format!("{}/{}", leg.id, w.name));
         }
-        prepare_leg(leg, &args, &suite)?;
-        for w in &workloads {
-            if crate::cancel::requested() {
-                eprintln!("suite: cancelled; skipping the rest of the matrix");
-                break 'legs;
+    };
+
+    // Leg-major ordering confounds the engine with everything that drifts over
+    // the hours a campaign takes: SoC temperature, the CDN's idea of the page,
+    // whatever else the device decides to do. Interleaving per workload, with
+    // the order alternating, spreads that across both legs instead of giving
+    // all of it to the second one.
+    //
+    // Only possible when no leg needs preparing between cells. A leg that
+    // switches engines with a `setup` command would pay for it on every
+    // workload, and one that asks an operator to switch by hand would ask ten
+    // times.
+    let interleave = legs.iter().all(|l| l.bundle.is_some() && l.setup.is_none());
+    if interleave {
+        for leg in &legs {
+            prepare_leg(leg, &args, &suite)?;
+        }
+        eprintln!("suite: legs interleaved per workload, order alternating");
+        'workloads: for (i, w) in workloads.iter().enumerate() {
+            let mut order: Vec<&&Leg> = legs.iter().collect();
+            if i % 2 == 1 {
+                order.reverse();
             }
-            let out = root.join(format!("{}-{}", leg.id, w.name));
-            eprintln!("\n=== {} / {} ===", leg.id, w.name);
-            let bench = BenchArgs {
-                workload: w.name.clone(),
-                bin: args.bin.clone(),
-                iterations: args.iterations.or_else(|| suite.iterations_for(w)),
-                out: Some(out),
-                ohos: leg_ohos_args(&args, &suite, leg, Some(w)),
-            };
-            if let Err(e) = crate::cmd::bench::run(bench) {
-                eprintln!("suite: {} / {} FAILED: {e:#}", leg.id, w.name);
-                failures.push(format!("{}/{}", leg.id, w.name));
+            for leg in order {
+                if crate::cancel::requested() {
+                    eprintln!("suite: cancelled; skipping the rest of the matrix");
+                    break 'workloads;
+                }
+                run_cell(leg, w, &mut failures);
+            }
+        }
+    } else {
+        'legs: for leg in &legs {
+            if crate::cancel::requested() {
+                break;
+            }
+            prepare_leg(leg, &args, &suite)?;
+            for w in &workloads {
+                if crate::cancel::requested() {
+                    eprintln!("suite: cancelled; skipping the rest of the matrix");
+                    break 'legs;
+                }
+                run_cell(leg, w, &mut failures);
             }
         }
     }
@@ -311,6 +346,10 @@ fn write_comparison(
     use std::fmt::Write as _;
 
     // metric -> (leg, workload) -> the iteration values behind it.
+    // Iteration numbers parallel to `cells`, so a note can name the file a
+    // reader has to open.
+    let mut iter_indices: std::collections::BTreeMap<String, HashMap<(String, String), Vec<u64>>> =
+        Default::default();
     let mut cells: std::collections::BTreeMap<String, HashMap<(String, String), Vec<f64>>> =
         Default::default();
     for leg in legs {
@@ -333,6 +372,11 @@ fn write_comparison(
                     continue;
                 };
                 for it in iters {
+                    // The iteration's own number, not its position among the
+                    // successful ones: an outlier note that says "iteration 3"
+                    // must point at `iter_3.perf.data`, and every failed
+                    // iteration before it shifts the two apart.
+                    let index = it.get("index").and_then(|i| i.as_u64()).unwrap_or(u64::MAX);
                     let Some(metrics) = it
                         .get("ok")
                         .and_then(|o| o.get("metrics"))
@@ -345,12 +389,19 @@ fn write_comparison(
                             continue;
                         }
                         let Some(v) = value.as_f64() else { continue };
+                        let key = (leg.id.clone(), w.name.clone());
                         cells
                             .entry(metric.clone())
                             .or_default()
-                            .entry((leg.id.clone(), w.name.clone()))
+                            .entry(key.clone())
                             .or_default()
                             .push(v);
+                        iter_indices
+                            .entry(metric.clone())
+                            .or_default()
+                            .entry(key)
+                            .or_default()
+                            .push(index);
                     }
                 }
             }
@@ -392,10 +443,14 @@ fn write_comparison(
             write!(s, "| {} |", w.name).unwrap();
             let mut high_spread: Vec<(String, String, crate::stats::Spread)> = Vec::new();
             let mut stats: Vec<Option<crate::stats::Spread>> = Vec::new();
+            // Kept alongside the summaries: the delta is a bootstrap over the
+            // raw values, not a function of the summaries.
+            let mut samples_by_leg: Vec<Option<&Vec<f64>>> = Vec::new();
             for leg in legs {
                 let samples = rows.get(&(leg.id.clone(), w.name.clone()));
                 let sp = samples.and_then(|v| crate::stats::spread(v));
                 stats.push(sp);
+                samples_by_leg.push(samples);
                 match (&sp, samples) {
                     // One iteration: the value is real, the uncertainty is
                     // unknown. Say so rather than implying either.
@@ -423,6 +478,9 @@ fn write_comparison(
                             // floor for a comparison carries both legs' error.
                             high_spread.push((leg.id.clone(), w.name.clone(), *sp));
                         }
+                        let idx = iter_indices
+                            .get(metric)
+                            .and_then(|m| m.get(&(leg.id.clone(), w.name.clone())));
                         for i in crate::stats::outliers(values) {
                             notes.push(format!(
                                 "`{}` on {}/{}: iteration {} is {:.1}x the median — check its \
@@ -431,7 +489,9 @@ fn write_comparison(
                                 metric,
                                 leg.id,
                                 w.name,
-                                i,
+                                idx.and_then(|v| v.get(i))
+                                    .map(|n| n.to_string())
+                                    .unwrap_or_else(|| format!("#{i}")),
                                 if sp.median != 0.0 {
                                     values[i] / sp.median
                                 } else {
@@ -507,14 +567,7 @@ fn write_comparison(
 
     writeln!(
         s,
-        "A delta in **bold** is larger than the combined standard error of the two \
-         legs; one marked *within noise* is not, and repeating the campaign will \
-         move it. Read `instructions.per_reflow.*` in preference to the totals: \
-         numerator and denominator co-vary, so the ratio cancels most of the \
-         load-to-load variance that makes the totals swing. Compare \
-         `layout_proper` against `layout_proper` — the groupings are defined per \
-         engine in `workloads/_instructions.toml` so that they mean the same \
-         phase on both sides."
+        "A delta compares the two **medians** printed beside it; the interval after it is a 95% percentile bootstrap on that difference (2000 resamples, seeded from the data so the report is reproducible). Bold means the interval excludes zero. A cell with fewer than 5 iterations gets no verdict at all. Read `instructions.per_reflow.*` in preference to the totals: numerator and denominator co-vary, so the ratio cancels most of the load-to-load variance that makes the totals swing. Compare `layout_proper` against `layout_proper` — the groupings are defined per engine in `workloads/_instructions.toml` so that they mean the same phase on both sides."
     )
     .unwrap();
 

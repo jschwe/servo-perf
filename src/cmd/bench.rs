@@ -118,6 +118,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // perf.data yields the window to narrow them to.
     let mut reflow_starts_by_iter: BTreeMap<u32, BTreeMap<String, Vec<u64>>> = BTreeMap::new();
     let mut instr_jobs: Vec<(u32, JoinHandle<Result<instructions::Aggregation>>)> = Vec::new();
+    let mut attempted_instr_jobs: std::collections::HashSet<u32> = Default::default();
     for i in 0..w.iterations {
         if crate::cancel::requested() {
             eprintln!("bench: cancelled after {i} iteration(s); writing what was collected");
@@ -233,6 +234,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
                         )
                     });
                     instr_jobs.push((i, handle));
+                    attempted_instr_jobs.insert(i);
                 }
                 reflow_starts_by_iter.insert(i, reflow_starts);
                 iterations.push(Iteration {
@@ -299,9 +301,13 @@ pub fn run(args: BenchArgs) -> Result<()> {
             let mut foreign: Vec<(&String, &u64)> = aggregation
                 .library_samples_by_process
                 .iter()
-                .filter(|(name, _)| name.split(':').next().unwrap_or(name) != ohos.bundle.as_str())
+                .filter(|(name, _)| !names_this_bundle(name, &ohos.bundle))
                 .collect();
-            if !foreign.is_empty() && crate::log_once::first_time("instructions-foreign-process") {
+            // Keyed per cell, not per process: a suite is twenty cells in one
+            // process, so a single global key would report contamination in
+            // the first cell and stay silent for the other nineteen.
+            let key = format!("instructions-foreign-process:{}", out_dir.display());
+            if !foreign.is_empty() && crate::log_once::first_time(&key) {
                 foreign.sort_by(|a, b| b.1.cmp(a.1));
                 let list = foreign
                     .iter()
@@ -324,9 +330,15 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 // here is indistinguishable from "this phase costs nothing"
                 // and drags every median it lands in. `explain_zeros` has
                 // already said which of the two it was.
-                for (func, events) in aggregation.totals {
-                    if events > 0 {
-                        metrics.insert(format!("instructions.{func}"), events as f64);
+                for (func, events) in &aggregation.totals {
+                    // A target whose pattern matched no symbol has no number to
+                    // report, and a zero there would be read as "this phase is
+                    // free". A target that *did* resolve and scored zero really
+                    // did no work this iteration, and dropping it biases its
+                    // median upward — every iteration that skipped the phase
+                    // would be excluded from the summary of that phase.
+                    if *events > 0 || aggregation.resolved_targets.contains(func) {
+                        metrics.insert(format!("instructions.{func}"), *events as f64);
                     }
                 }
                 // Now the window is known, so the denominator can describe the
@@ -374,10 +386,18 @@ pub fn run(args: BenchArgs) -> Result<()> {
         }
     }
 
-    // Iterations with no instruction job — `--with-instructions` off, or an
-    // aggregator that failed — still get a count, over the whole trace. It is
-    // not a denominator there, so there is no window to narrow it to.
+    // Iterations that never had an instruction job — `--with-instructions` off
+    // — still get a count, over the whole trace. It is not a denominator
+    // there, so there is no window to narrow it to.
+    //
+    // An iteration whose aggregator *failed* is deliberately not given one: the
+    // trace runs from before `aa start` until the `--trace_finish` flush ends,
+    // so a whole-trace count is roughly twice a windowed one, and mixing the
+    // two into a single median is worse than a missing point.
     for (idx, starts) in std::mem::take(&mut reflow_starts_by_iter) {
+        if attempted_instr_jobs.contains(&idx) {
+            continue;
+        }
         if let Some(it) = iterations.iter_mut().find(|it| it.index == idx) {
             if let IterationStatus::Ok { metrics, .. } = &mut it.status {
                 metrics.extend(instructions::count_reflow_spans_in(&starts, None));
@@ -609,4 +629,62 @@ fn resolve_out(explicit: Option<&Path>, workload_name: &str) -> PathBuf {
         return p.to_path_buf();
     }
     crate::report::default_out_dir(workload_name)
+}
+
+/// Does this process name belong to the bundle under test?
+///
+/// An OHOS app is `<bundle>` plus helpers like `<bundle>:render` and
+/// `<bundle>:gpu`, all expected. The catch is that a process renamed after it
+/// starts carries the kernel's `comm`, truncated to 15 bytes — and
+/// `org.servo.servo` is exactly 15 characters, so an exact comparison would
+/// silently never fire on the Servo leg while firing spuriously on a longer
+/// bundle. Treat a 15-byte name as a prefix.
+fn names_this_bundle(name: &str, bundle: &str) -> bool {
+    let base = name.split(':').next().unwrap_or(name);
+    base == bundle || (base.len() == 15 && bundle.starts_with(base))
+}
+
+#[cfg(test)]
+mod contamination_tests {
+    use super::names_this_bundle;
+
+    #[test]
+    fn helper_processes_are_not_foreign() {
+        for name in [
+            "org.openharmonyrs.arkwebtest",
+            "org.openharmonyrs.arkwebtest:render",
+            "org.openharmonyrs.arkwebtest:gpu",
+        ] {
+            assert!(
+                names_this_bundle(name, "org.openharmonyrs.arkwebtest"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_comm_still_matches_its_bundle() {
+        // What the kernel gives for a renamed `org.openharmonyrs.arkwebtest`.
+        assert!(names_this_bundle(
+            "org.openharmony",
+            "org.openharmonyrs.arkwebtest"
+        ));
+        assert!(names_this_bundle(
+            "org.openharmony:render",
+            "org.openharmonyrs.arkwebtest"
+        ));
+    }
+
+    #[test]
+    fn another_app_is_foreign() {
+        assert!(!names_this_bundle(
+            "com.huawei.hmos.browser:render",
+            "org.openharmonyrs.arkwebtest"
+        ));
+        // A 15-byte name that is not a prefix must not be excused.
+        assert!(!names_this_bundle(
+            "com.huawei.hmo",
+            "org.openharmonyrs.arkwebtest"
+        ));
+    }
 }
