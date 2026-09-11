@@ -66,6 +66,12 @@ functions = [
   "update_the_rendering",
   "update_active_frames",
 ]
+# Hides the app's own toolbar and tab bar so the XComponent fills the window,
+# matching what `--chrome=none` does for the arkweb wrapper. The servoshell
+# ArkTS app consumes the flag in EntryAbility.ets and does not forward it to
+# servoshell, whose parser exits on an unknown option — so this only works on a
+# hap built from servo commit 1d0c5b0 or later.
+launch_args = ["--chrome=none"]
 # Servoperf injects these flags (one per line) when the workload uses a
 # fixture-side proxy (e.g. wpr-replay). `$PROXY` is replaced with the
 # host-side proxy URI (already reachable from device via `hdc rport`).
