@@ -84,13 +84,18 @@ proxy_args = [
 ]
 # One span per completed layout run. `handle_reflow` carries
 # `#[servo_tracing::instrument]`, so the span name is the bare function
-# name — but only in a hap built with the `tracing` feature; a plain
+# name — but only in a hap built with `--features tracing-hitrace`; a plain
 # release build emits no Servo spans at all and `reflow.count` stays 0.
+# The spans also need a filter at launch: servoperf synthesizes
+# `--tracing-filter=<workload.tracing_filter>`, and without it servoshell
+# leaves the subscriber at LevelFilter::OFF.
 reflow_spans = ["handle_reflow"]
 # `<LayoutThread as Layout>::reflow` is the outer entry point and survives
-# LTO; `handle_reflow` and `build_display_list` get inlined into it at
-# codegen-units=1 and resolve to 0 (measured on the DAYU200 shim build), so
-# they are kept in `functions` as diagnostics but must not be the numerator.
+# LTO. `handle_reflow` and `build_display_list` are inlined into it at
+# codegen-units=1: they resolve to 0 unless the staged symbol file carries
+# DWARF, in which case servoperf attributes the inline chain and they report
+# real numbers. Build with `CARGO_PROFILE_PRODUCTION_DEBUG=1` to get that;
+# without it only this outer symbol is trustworthy.
 reflow_instructions = "Layout>::reflow"
 
 
@@ -100,9 +105,10 @@ reflow_instructions = "Layout>::reflow"
 # its members' own metrics, the difference is the overlap between them.
 
 # Style recalc + box/fragment trees: what Blink accounts to
-# `LocalFrameView::UpdateStyleAndLayout`. NOTE `restyle_and_build_trees` is
-# inlined at codegen-units=1, so this currently sees only the parallel restyle
-# and fragment-tree jobs. Add `#[inline(never)]` to it for a true figure.
+# `LocalFrameView::UpdateStyleAndLayout`. `restyle_and_build_trees` is inlined
+# at codegen-units=1, so this is a true figure only when the staged symbol file
+# carries DWARF (`CARGO_PROFILE_PRODUCTION_DEBUG=1`); without it the group sees
+# only the parallel restyle and fragment-tree jobs and reads about 3x low.
 [[engines.group]]
 name = "layout_proper"
 functions = ["restyle_and_build_trees"]
@@ -242,9 +248,11 @@ functions = [
 ]
 reflow_spans = ["handle_reflow"]
 # `<LayoutThread as Layout>::reflow` is the outer entry point and survives
-# LTO; `handle_reflow` and `build_display_list` get inlined into it at
-# codegen-units=1 and resolve to 0 (measured on the DAYU200 shim build), so
-# they are kept in `functions` as diagnostics but must not be the numerator.
+# LTO. `handle_reflow` and `build_display_list` are inlined into it at
+# codegen-units=1: they resolve to 0 unless the staged symbol file carries
+# DWARF, in which case servoperf attributes the inline chain and they report
+# real numbers. Build with `CARGO_PROFILE_PRODUCTION_DEBUG=1` to get that;
+# without it only this outer symbol is trustworthy.
 reflow_instructions = "Layout>::reflow"
 
 # --- Comparison groupings -------------------------------------------------
@@ -253,9 +261,10 @@ reflow_instructions = "Layout>::reflow"
 # its members' own metrics, the difference is the overlap between them.
 
 # Style recalc + box/fragment trees: what Blink accounts to
-# `LocalFrameView::UpdateStyleAndLayout`. NOTE `restyle_and_build_trees` is
-# inlined at codegen-units=1, so this currently sees only the parallel restyle
-# and fragment-tree jobs. Add `#[inline(never)]` to it for a true figure.
+# `LocalFrameView::UpdateStyleAndLayout`. `restyle_and_build_trees` is inlined
+# at codegen-units=1, so this is a true figure only when the staged symbol file
+# carries DWARF (`CARGO_PROFILE_PRODUCTION_DEBUG=1`); without it the group sees
+# only the parallel restyle and fragment-tree jobs and reads about 3x low.
 [[engines.group]]
 name = "layout_proper"
 functions = ["restyle_and_build_trees"]
