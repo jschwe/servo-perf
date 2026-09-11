@@ -124,6 +124,79 @@ pub struct Spread {
     pub resolvable: f64,
 }
 
+/// Smallest n at which a significance verdict is printed at all.
+///
+/// Below this the interval is wider than anything it could exclude, and a
+/// "significant" label is an artefact of having too few points rather than a
+/// finding. Two samples in particular produce a standard error that looks like
+/// a noise floor and is not one.
+pub const MIN_N_FOR_VERDICT: usize = 5;
+
+/// Relative difference between two legs' *medians*, with a percentile
+/// bootstrap interval on it.
+///
+/// The comparison table prints medians, so the delta beside them has to be a
+/// delta of medians: computing it from the means let the table show a number
+/// that its own two columns could not produce, and let one outlying iteration
+/// bold a delta that the medians contradicted.
+///
+/// Returns `(delta, lo, hi)` as fractions of the first leg's median. The
+/// resampling is seeded from the data, so the same inputs always give the same
+/// interval — a report that moved when you re-rendered it would be worse than
+/// no report.
+pub fn bootstrap_median_delta(a: &[f64], b: &[f64]) -> Option<(f64, f64, f64)> {
+    const RESAMPLES: usize = 2000;
+    if a.len() < MIN_N_FOR_VERDICT || b.len() < MIN_N_FOR_VERDICT {
+        return None;
+    }
+    let med = |xs: &mut Vec<f64>| -> f64 {
+        xs.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+        let n = xs.len();
+        xs[(((n as f64 - 1.0) * 0.5).round() as usize).min(n - 1)]
+    };
+    let ma = med(&mut a.to_vec());
+    let mb = med(&mut b.to_vec());
+    if ma == 0.0 {
+        return None;
+    }
+    // Seeded from the inputs: deterministic, but not the same stream for every
+    // metric in the report.
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    for v in a.iter().chain(b.iter()) {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(v.to_bits() | 1);
+    }
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut deltas = Vec::with_capacity(RESAMPLES);
+    let mut buf_a = vec![0.0; a.len()];
+    let mut buf_b = vec![0.0; b.len()];
+    for _ in 0..RESAMPLES {
+        for slot in buf_a.iter_mut() {
+            *slot = a[(next() % a.len() as u64) as usize];
+        }
+        for slot in buf_b.iter_mut() {
+            *slot = b[(next() % b.len() as u64) as usize];
+        }
+        let ra = med(&mut buf_a.clone());
+        let rb = med(&mut buf_b.clone());
+        if ra != 0.0 {
+            deltas.push((rb - ra) / ra);
+        }
+    }
+    if deltas.len() < RESAMPLES / 2 {
+        return None;
+    }
+    deltas.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let at = |q: f64| deltas[((deltas.len() as f64 - 1.0) * q).round() as usize];
+    Some(((mb - ma) / ma, at(0.025), at(0.975)))
+}
+
 /// The smallest relative difference between two legs that is not noise, as a
 /// fraction of the first leg's mean.
 ///

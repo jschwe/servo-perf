@@ -82,27 +82,32 @@ proxy_args = [
   "--pref=network_http_proxy_uri=$PROXY",
   "--ignore-certificate-errors",
 ]
-# One span per layout that actually ran, to match Blink's
-# `LocalFrameView::performLayout` on the other side. It must NOT be
-# `handle_reflow`: that fires once per reflow *request*, and most requests find
-# style and the trees already clean and return without laying anything out.
-# Measured on a PLR-AL00, mossel-user-scroll, one 20 s capture: 11 947
-# `handle_reflow` against 410 `restyle_and_build_trees` and 34 display lists,
-# i.e. 97% of the calls did no layout work. Counting requests made
-# `instructions.per_reflow` a ratio of Servo requests to Blink layouts — a
-# denominator ~1000x too large on the scroll workloads, which is where the
-# nonsense "-99%" per-reflow deltas came from.
+# One marker per layout that actually ran, to match Blink's
+# `LocalFrameView::performLayout`.
 #
-# `restyle_and_build_trees` carries `#[servo_tracing::instrument]`, so the span
-# name is the bare function name — but only in a hap built with
+# Two earlier choices were both wrong, in the same direction:
+#   * `handle_reflow` fires once per reflow *request*, and most requests find
+#     style and the trees clean and return without laying anything out.
+#     Measured on a PLR-AL00, mossel-user-scroll, one 20 s capture: 11947
+#     `handle_reflow` against 410 `restyle_and_build_trees` and 34 display
+#     lists -- 97% of the calls did no layout work.
+#   * `restyle_and_build_trees` is better but still not "a layout ran": it
+#     emits its span and then returns early in three places (layout_impl.rs:
+#     no restyle, `!token.should_traverse()`, or damage that is
+#     Repaint/RecalculateOverflow with no layout root). That last one is what
+#     a CSS transition or a hover toggle produces -- Blink records zero
+#     `performLayout`, Servo recorded one "reflow".
+#
+# `RanLayout` is an explicit marker emitted from `handle_reflow` only when
+# `ReflowPhasesRun::RanLayout` came back set. It needs a hap built with
 # `--features tracing-hitrace`; a plain release build emits no Servo spans at
-# all and `reflow.count` stays 0. The spans also need a filter at launch:
+# all and `reflow.count` stays 0. The markers also need a filter at launch:
 # servoperf synthesizes `--tracing-filter=<workload.tracing_filter>`, and
 # without it servoshell leaves the subscriber at LevelFilter::OFF.
 #
 # Only one pattern may be listed: `reflow.count` is the sum across patterns, so
-# adding `handle_reflow` back as a diagnostic would double the total.
-reflow_spans = ["restyle_and_build_trees"]
+# adding a diagnostic pattern back would double the total.
+reflow_spans = ["RanLayout"]
 # `<LayoutThread as Layout>::reflow` is the outer entry point and survives
 # LTO. `handle_reflow` and `build_display_list` are inlined into it at
 # codegen-units=1: they resolve to 0 unless the staged symbol file carries
@@ -192,7 +197,13 @@ proxy_args = [
 # `Blink.ForcedStyleAndLayout.UpdateTime` varied 21% (6 892-10 869)
 # because most of those calls find style already clean and do no layout.
 reflow_spans = ["LocalFrameView::performLayout"]
-reflow_instructions = "Document::UpdateStyleAndLayout("
+# `LocalFrameView::UpdateStyleAndLayout(`, not the `Document::` one: in Blink
+# the Document entry is the *forced* path (script touching offsetWidth and
+# friends, document.cc), while the lifecycle path reaches
+# LocalFrameView::UpdateStyleAndLayout directly and never passes through it.
+# Servo's counterpart covers every reflow, so using the Document entry divided
+# forced-only Blink instructions by all layouts.
+reflow_instructions = "LocalFrameView::UpdateStyleAndLayout("
 
 
 # --- Comparison groupings (see the servo entry for the semantics) ---------
@@ -259,9 +270,32 @@ functions = [
   "restyle_and_build_trees",
   "update_the_rendering",
 ]
-# Same counterpart choice as the standalone servo engine above: layouts that
-# ran, not reflow requests.
-reflow_spans = ["restyle_and_build_trees"]
+# One marker per layout that actually ran, to match Blink's
+# `LocalFrameView::performLayout`.
+#
+# Two earlier choices were both wrong, in the same direction:
+#   * `handle_reflow` fires once per reflow *request*, and most requests find
+#     style and the trees clean and return without laying anything out.
+#     Measured on a PLR-AL00, mossel-user-scroll, one 20 s capture: 11947
+#     `handle_reflow` against 410 `restyle_and_build_trees` and 34 display
+#     lists -- 97% of the calls did no layout work.
+#   * `restyle_and_build_trees` is better but still not "a layout ran": it
+#     emits its span and then returns early in three places (layout_impl.rs:
+#     no restyle, `!token.should_traverse()`, or damage that is
+#     Repaint/RecalculateOverflow with no layout root). That last one is what
+#     a CSS transition or a hover toggle produces -- Blink records zero
+#     `performLayout`, Servo recorded one "reflow".
+#
+# `RanLayout` is an explicit marker emitted from `handle_reflow` only when
+# `ReflowPhasesRun::RanLayout` came back set. It needs a hap built with
+# `--features tracing-hitrace`; a plain release build emits no Servo spans at
+# all and `reflow.count` stays 0. The markers also need a filter at launch:
+# servoperf synthesizes `--tracing-filter=<workload.tracing_filter>`, and
+# without it servoshell leaves the subscriber at LevelFilter::OFF.
+#
+# Only one pattern may be listed: `reflow.count` is the sum across patterns, so
+# adding a diagnostic pattern back would double the total.
+reflow_spans = ["RanLayout"]
 # `<LayoutThread as Layout>::reflow` is the outer entry point and survives
 # LTO. `handle_reflow` and `build_display_list` are inlined into it at
 # codegen-units=1: they resolve to 0 unless the staged symbol file carries
