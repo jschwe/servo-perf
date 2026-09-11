@@ -159,6 +159,14 @@ Selecting the engine is the one thing servoperf will not guess. Give a leg a
 `hdc shell` before the leg — or leave it out and the run pauses and asks you to
 switch by hand. `--assume-yes` skips the prompt when the device is already set.
 
+A leg can also name its own `bundle` (and `ability`), for the case where the
+two legs are two different *apps* rather than one wrapper whose engine a system
+parameter picks — servoshell against the platform browser, say, which is what
+[`suites/mossel-plr.toml`](../suites/mossel-plr.toml) does. Such a leg needs no
+engine switch, so the run neither prompts nor waits. The price is that the legs
+no longer differ only in the engine: startup path, chrome and window size differ
+too, so read only within-leg trends and large between-leg gaps from it.
+
 Useful for a first pass:
 
 ```sh
@@ -168,10 +176,10 @@ servoperf suite mossel --only mossel-index --legs arkweb --iterations 1
 Budget ~7 minutes per workload per leg. The `-scroll` variants need `uitest` on
 the device.
 
-All ten workloads pass `--chrome=none`, which hides the wrapper app's toolbar
-so the Web component fills the window. That is not cosmetic: the toolbar costs
-ArkUI layout every frame and shrinks the viewport, so it changes how much of
-the page has to be laid out — it lands in the number being measured. Numbers
+Both engines are launched with `--chrome=none`, which hides the app's own
+toolbar so the web content fills the window. That is not cosmetic: the toolbar
+costs ArkUI layout every frame and shrinks the viewport, so it changes how much
+of the page has to be laid out — it lands in the number being measured. Numbers
 taken with and without it are not comparable; re-baseline if you switch.
 
 Two things about the workloads:
