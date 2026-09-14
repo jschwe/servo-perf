@@ -295,6 +295,11 @@ pub struct SuiteArgs {
     /// command — assume the device is already on the right engine.
     #[arg(long)]
     pub assume_yes: bool,
+    /// Measure nothing: rewrite `<out>/comparison.md` from the cells already
+    /// there. For re-pairing legs measured at different times — re-running
+    /// one leg under changed settings without re-running the other.
+    #[arg(long, requires = "out")]
+    pub report_only: bool,
     #[command(flatten)]
     pub ohos: OhosArgs,
 }

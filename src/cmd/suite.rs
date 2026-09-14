@@ -60,6 +60,9 @@ pub fn run(args: SuiteArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| crate::report::default_out_dir(&suite.name));
     std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+    if args.report_only {
+        return write_comparison(&root, &suite, &legs, &workloads);
+    }
 
     // Held across the whole matrix, not per cell: the gaps between cells — and
     // especially the wait at an engine-switch prompt — are exactly when the

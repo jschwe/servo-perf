@@ -30,6 +30,12 @@ capture_seconds = 20
 instructions_period = 1000000
 trace_tags = "app,nweb"
 with_instructions = true
+# Keep only the markers servoperf reads (FirstContentfulPaint, RanLayout). The
+# instrumentation sits inside the counted frames: under the old
+# `info,[{servo_profiling=true}]=trace` filter, Servo's per-function spans added
+# ~25% to layout_proper on mossel-index, and upstream #47669's spans on
+# ScrollTree::cumulative_node_transform ~46% to display-list building.
+tracing_filter = "info,layout::layout_impl=debug"
 
 [[leg]]
 id = "arkweb"
