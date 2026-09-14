@@ -90,6 +90,7 @@ pub fn run(args: SuiteArgs) -> Result<()> {
             out: Some(out),
             tracing_filter: suite.defaults.tracing_filter.clone(),
             live: args.live,
+            no_lcp: false,
             ohos: leg_ohos_args(&args, &suite, leg, Some(w)),
         };
         if let Err(e) = crate::cmd::bench::run(bench) {

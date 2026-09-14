@@ -159,8 +159,10 @@ pub fn run_once(
     // servoperf cares about LCP on every workload, so enable it
     // unconditionally here. Mirrored in
     // `crate::ohos::workload_args_to_aa_params` for the OHOS path.
-    cmd.arg("--pref")
-        .arg("largest_contentful_paint_enabled=true");
+    if workload.lcp {
+        cmd.arg("--pref")
+            .arg("largest_contentful_paint_enabled=true");
+    }
     if let Some((w, h)) = workload.viewport {
         cmd.arg("--window-size").arg(format!("{}x{}", w, h));
     }

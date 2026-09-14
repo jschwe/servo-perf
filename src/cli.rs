@@ -357,6 +357,11 @@ pub struct BenchArgs {
     /// 7.4 s live against 0.9 s replayed).
     #[arg(long)]
     pub live: bool,
+    /// Launch Servo with the LCP pref off, as it ships. servoperf otherwise
+    /// turns `largest_contentful_paint_enabled` on to report LCP, and that
+    /// accounting costs display-list instructions (see `Workload::lcp`).
+    #[arg(long)]
+    pub no_lcp: bool,
     #[command(flatten)]
     pub ohos: OhosArgs,
 }

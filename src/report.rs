@@ -863,6 +863,7 @@ mod tests {
             fixture: None,
             scenario: None,
             steps: vec![],
+            lcp: true,
         }
     }
 

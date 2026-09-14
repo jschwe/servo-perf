@@ -23,6 +23,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
     if let Some(f) = args.tracing_filter.clone() {
         w.tracing_filter = f;
     }
+    if args.no_lcp {
+        w.lcp = false;
+    }
     if args.live
         && w.fixture.take().is_some()
         && crate::log_once::first_time("live-instead-of-fixture")
