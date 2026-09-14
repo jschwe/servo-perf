@@ -1260,6 +1260,42 @@ pub struct Profile {
     pub self_by_function: HashMap<String, u64>,
     /// Every distinct function on the chain, once per sample.
     pub inclusive_by_function: HashMap<String, u64>,
+    /// With a `callers_of` pattern: for samples whose self function matches
+    /// it, the nearest enclosing frame that is engine code rather than
+    /// standard-library or container plumbing. Answers "who is doing all this
+    /// refcounting / allocating", which the self table cannot.
+    pub callers: HashMap<String, u64>,
+}
+
+/// Frames that are plumbing rather than a decision anyone in the engine made:
+/// the standard library, refcounting and borrow-checking containers, hashing,
+/// and the `Clone`/`Drop` impls those are reached through.
+fn is_plumbing(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "core::",
+        "<core::",
+        "alloc::",
+        "<alloc::",
+        "std::",
+        "<std::",
+        "<usize",
+        "<u32",
+        "<u64",
+        "<atomic_refcell::",
+        "atomic_refcell::",
+        "servo_arc::",
+        "<servo_arc::",
+        "hashbrown::",
+        "<hashbrown::",
+        "<smallvec::",
+        "smallvec::",
+        "<triomphe::",
+        "triomphe::",
+    ];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+        || name.contains(" as core::clone::Clone>::clone")
+        || name.contains(" as core::ops::drop::Drop>::drop")
+        || name.starts_with("<&")
 }
 
 /// Build a [`Profile`] over one or more captures.
@@ -1273,6 +1309,7 @@ pub fn profile_from_perf_data(
     engine: &EngineConfig,
     workloads_dir: &Path,
     under: Option<&str>,
+    callers_of: Option<&str>,
 ) -> Result<Profile> {
     anyhow::ensure!(
         !engine.symbol_file.is_empty(),
@@ -1405,10 +1442,21 @@ pub fn profile_from_perf_data(
                     profile.samples += 1;
                     // A leaf outside the library (libc, the kernel) is
                     // charged to the innermost engine frame that called it.
-                    let self_name = leaf.unwrap_or_else(|| chain_names[0].clone());
+                    let self_name = leaf.clone().unwrap_or_else(|| chain_names[0].clone());
                     *profile.self_by_function.entry(self_name).or_insert(0) += period;
                     for n in &chain_names {
                         *profile.inclusive_by_function.entry(n.clone()).or_insert(0) += period;
+                    }
+                    if let Some(c) = callers_of {
+                        let leaf_name = profile_leaf(&chain_names);
+                        if leaf_name.is_some_and(|l| name_matches(l, c, &normalize_symbol(c))) {
+                            let who = chain_names
+                                .iter()
+                                .find(|n| !is_plumbing(n))
+                                .cloned()
+                                .unwrap_or_else(|| "<only plumbing on the chain>".to_string());
+                            *profile.callers.entry(who).or_insert(0) += period;
+                        }
                     }
                 }
                 _ => {}
@@ -1416,4 +1464,9 @@ pub fn profile_from_perf_data(
         }
     }
     Ok(profile)
+}
+
+/// The self function of a sample: the innermost name on the chain.
+fn profile_leaf(chain_names: &[String]) -> Option<&str> {
+    chain_names.first().map(String::as_str)
 }

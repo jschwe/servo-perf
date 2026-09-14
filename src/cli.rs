@@ -67,6 +67,11 @@ pub struct ProfileArgs {
     /// this pattern.
     #[arg(long)]
     pub under: Option<String>,
+    /// Also tabulate, for samples whose self function matches this pattern,
+    /// the nearest enclosing engine function — e.g. `--callers-of atomic_add`
+    /// to find who is cloning all those `Arc`s.
+    #[arg(long)]
+    pub callers_of: Option<String>,
     /// Rows per table.
     #[arg(long, default_value_t = 30)]
     pub top: usize,
