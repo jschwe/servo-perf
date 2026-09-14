@@ -99,13 +99,35 @@ $c = "--ohos --ohos-bundle org.openharmonyrs.arkwebtest --with-instructions " +
 .\target\release\servoperf.exe bench mossel-index $c.Split(' ') --engine arkweb --out out\arkweb
 ```
 
-## 4. Later: WPR replay
+## 4. WPR replay
 
-The `mossel-*` workloads currently hit the live site, so network variance is in
-the numbers. Adding a `[fixture]` block pins them to a recorded archive, which
-needs the `wpr` binary on the host — see [wpr-setup.md](wpr-setup.md). That
-does require a Go toolchain (>= 1.23, plus the documented cert-minting patch for
-Go 1.25). A Windows `wpr.exe` can also be cross-compiled from a Linux host with
-`GOOS=windows GOARCH=amd64 go build -o wpr.exe ./src/wpr.go`, which avoids
-installing Go on the Windows machine. Point servoperf at it with
-`SERVOPERF_WPR_BIN`.
+The `mossel-*` workloads replay recorded archives through WPR, so a run needs
+three things on the host. None of them needs Go on Windows:
+
+| what | default location | override |
+| --- | --- | --- |
+| `wpr.exe` | `%USERPROFILE%\bin\wpr.exe`, else `wpr.exe` on `PATH` | `SERVOPERF_WPR_BIN` |
+| `wpr_cert.pem`, `wpr_key.pem`, `deterministic.js` (same directory) | `%USERPROFILE%\wpr\` | `SERVOPERF_WPR_CERT`, `SERVOPERF_WPR_KEY` |
+| `mossel-<route>.wprgo` archives | `wpr-archives\` in the repo root (gitignored) | — |
+
+- **`wpr.exe`** needs the certificate patch from
+  [wpr-setup.md](wpr-setup.md) step 3, so it is built from patched source.
+  Cross-compile it on Linux with
+  `GOOS=windows GOARCH=amd64 go build -o wpr.exe ./src/wpr.go` rather than
+  installing Go on Windows.
+- **Use the same root cert and key as whoever recorded the archives, and as
+  the device trusts.** ArkWeb only loads replayed pages when that root is in
+  the device's user CA store (`ohos-performance-testing` skill,
+  `trusting-a-test-ca.md`); generating a fresh one on Windows means installing
+  that one on the device too.
+- **Archives cannot be recorded on Windows.** Recording stops WPR with SIGINT
+  so it writes the archive out, and Windows has no SIGINT for a child process;
+  servoperf refuses rather than write an empty archive. Record on Linux/macOS
+  and copy the `.wprgo` files over. Replay works on Windows.
+
+Without WPR, `--live` (on `bench` and `suite`) ignores the fixture and loads
+the live site. The numbers are then **not comparable** with replayed ones:
+the network is back in every metric, and Servo's disk cache is off by
+default, so each Servo iteration is a cold fetch while Chromium serves repeats
+from its cache — on a PLR-AL00, `mossel-index` first paint was 7.4 s live
+against 0.9 s replayed.
