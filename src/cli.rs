@@ -77,6 +77,20 @@ pub struct ProfileArgs {
     /// `--parents-of 'BoxFragment>::style'` for who keeps re-borrowing styles.
     #[arg(long, conflicts_with = "callers_of")]
     pub parents_of: Option<String>,
+    /// Symbolize against this library instead of the engine's staged
+    /// `symbol_file` — for captures from a build that is not the one staged.
+    #[arg(long)]
+    pub symbols: Option<PathBuf>,
+    /// Instead of ranking functions, estimate from samples alone how many times
+    /// a function matching this pattern ran (runs of consecutive matching
+    /// samples per thread), one line per capture, next to the capture's
+    /// sampled window. For scoring such estimates against trace markers.
+    #[arg(long)]
+    pub episodes: Option<String>,
+    /// With `--episodes`: two matching samples further apart than this start
+    /// a new episode even with no non-matching sample in between.
+    #[arg(long, default_value_t = 2.0)]
+    pub gap_ms: f64,
     /// Rows per table.
     #[arg(long, default_value_t = 30)]
     pub top: usize,

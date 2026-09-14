@@ -33,6 +33,26 @@ pub fn run(args: ProfileArgs) -> Result<()> {
     }
     anyhow::ensure!(!files.is_empty(), "no perf.data files found in the inputs");
 
+    if let Some(pattern) = args.episodes.as_deref() {
+        let symbols = args
+            .symbols
+            .clone()
+            .unwrap_or_else(|| workloads_dir.join(&engine.symbol_file));
+        println!("capture\tepisodes\tmatching_samples\twindow_lo_ns\twindow_hi_ns");
+        for f in &files {
+            let (episodes, matching, window) = instructions::sample_episodes(
+                f,
+                engine,
+                &symbols,
+                pattern,
+                (args.gap_ms * 1e6) as u64,
+            )?;
+            let (lo, hi) = window.unwrap_or((0, 0));
+            println!("{}\t{episodes}\t{matching}\t{lo}\t{hi}", f.display());
+        }
+        return Ok(());
+    }
+
     let profile = instructions::profile_from_perf_data(
         &files,
         engine,

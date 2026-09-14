@@ -1485,3 +1485,119 @@ pub fn profile_from_perf_data(
 fn profile_leaf(chain_names: &[String]) -> Option<&str> {
     chain_names.first().map(String::as_str)
 }
+
+/// Estimate how many times a function ran from sampled data alone: count
+/// *episodes*, runs of consecutive samples on one thread whose chain contains
+/// `pattern`, split when that thread produces a sample without it or when two
+/// matching samples are more than `gap_ns` apart.
+///
+/// This is how a reflow count is usually guessed from a profile when there is
+/// no trace marker. It exists here to be scored against a marker count, not
+/// to replace one: it cannot see an invocation cheaper than the sampling
+/// period, and it merges invocations that run back to back.
+pub fn sample_episodes(
+    perf_data_path: &Path,
+    engine: &EngineConfig,
+    symbols: &Path,
+    pattern: &str,
+    gap_ns: u64,
+) -> Result<(u64, u64, Option<(u64, u64)>)> {
+    let symbolizer = Symbolizer::load(symbols)?;
+    let symbol_basename = sym_basename_from_path(&engine.symbol_file);
+    let pn = normalize_symbol(pattern);
+    let file = File::open(perf_data_path)
+        .with_context(|| format!("opening {}", perf_data_path.display()))?;
+    let PerfFileReader {
+        mut perf_file,
+        mut record_iter,
+    } = PerfFileReader::parse_file(BufReader::new(file))?;
+    let mut mmaps_by_pid: HashMap<i32, Vec<Mapping>> = HashMap::new();
+    let mut match_cache: rustc_hash::FxHashMap<u64, bool> = Default::default();
+    let mut scratch: Vec<String> = Vec::new();
+    // Per thread: timestamp of the last matching sample, and whether the
+    // thread's previous sample matched.
+    let mut last: HashMap<i32, (u64, bool)> = HashMap::new();
+    let mut episodes = 0u64;
+    let mut matching = 0u64;
+    let mut window: Option<(u64, u64)> = None;
+    while let Some(record) = record_iter.next_record(&mut perf_file)? {
+        let PerfFileRecord::EventRecord { record, .. } = record else {
+            continue;
+        };
+        match record.parse()? {
+            EventRecord::Mmap2(m) => {
+                if matches!(m.cpu_mode, CpuMode::User) && (m.protection & 0x4) != 0 {
+                    mmaps_by_pid.entry(m.pid).or_default().push(Mapping {
+                        start: m.address,
+                        end: m.address.saturating_add(m.length),
+                        page_offset: m.page_offset,
+                        basename: basename_of(&m.path.as_slice()).into_owned(),
+                    });
+                }
+            }
+            EventRecord::Sample(s) => {
+                let (Some(pid), Some(tid), Some(ts)) = (s.pid, s.tid, s.timestamp) else {
+                    continue;
+                };
+                window = Some(match window {
+                    Some((lo, hi)) => (lo.min(ts), hi.max(ts)),
+                    None => (ts, ts),
+                });
+                let Some(mappings) = mmaps_by_pid.get(&pid) else {
+                    continue;
+                };
+                let mut ips: Vec<u64> = Vec::with_capacity(64);
+                if let Some(ip) = s.ip {
+                    ips.push(ip);
+                }
+                if let Some(chain) = s.callchain {
+                    for idx in 0..chain.len() {
+                        let Some(ip) = chain.get(idx) else { break };
+                        if ip < 0xffff_ffff_ffff_ff00 {
+                            ips.push(ip);
+                        }
+                    }
+                }
+                let mut in_library = false;
+                let mut hit = false;
+                for ip in ips {
+                    let Some(m) = find_mapping(mappings, ip) else {
+                        continue;
+                    };
+                    if m.basename != symbol_basename {
+                        continue;
+                    }
+                    in_library = true;
+                    let off = ip - m.start + m.page_offset;
+                    let h = *match_cache.entry(off).or_insert_with(|| {
+                        symbolizer.names_at(off, &mut scratch);
+                        scratch.iter().any(|n| name_matches(n, pattern, &pn))
+                    });
+                    if h {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !in_library {
+                    continue;
+                }
+                let prev = last.get(&tid).copied();
+                if hit {
+                    matching += 1;
+                    let new_episode = match prev {
+                        Some((t, true)) => ts.saturating_sub(t) > gap_ns,
+                        _ => true,
+                    };
+                    if new_episode {
+                        episodes += 1;
+                    }
+                    last.insert(tid, (ts, true));
+                } else {
+                    last.insert(tid, (prev.map(|p| p.0).unwrap_or(0), false));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((episodes, matching, window))
+}
