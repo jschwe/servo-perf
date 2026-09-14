@@ -53,10 +53,14 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         return Ok(());
     }
 
+    let symbols = args
+        .symbols
+        .clone()
+        .unwrap_or_else(|| workloads_dir.join(&engine.symbol_file));
     let profile = instructions::profile_from_perf_data(
         &files,
         engine,
-        &workloads_dir,
+        &symbols,
         args.under.as_deref(),
         args.callers_of.as_deref(),
         args.parents_of.as_deref(),

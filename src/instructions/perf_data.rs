@@ -1307,7 +1307,7 @@ fn is_plumbing(name: &str) -> bool {
 pub fn profile_from_perf_data(
     perf_data_paths: &[std::path::PathBuf],
     engine: &EngineConfig,
-    workloads_dir: &Path,
+    sym_path: &Path,
     under: Option<&str>,
     callers_of: Option<&str>,
     parents_of: Option<&str>,
@@ -1317,8 +1317,7 @@ pub fn profile_from_perf_data(
         "engine {:?} has no symbol_file",
         engine.id
     );
-    let sym_path = workloads_dir.join(&engine.symbol_file);
-    let symbolizer = Symbolizer::load(&sym_path)?;
+    let symbolizer = Symbolizer::load(sym_path)?;
     let symbol_basename = sym_basename_from_path(&engine.symbol_file);
     let under_norm = under.map(normalize_symbol);
     let pool_prefixes: Vec<&str> = match under {
@@ -1343,6 +1342,7 @@ pub fn profile_from_perf_data(
             mut record_iter,
         } = PerfFileReader::parse_file(BufReader::new(file))
             .with_context(|| format!("parsing perf.data at {}", path.display()))?;
+        verify_capture_build_id(path, sym_path)?;
         let mut mmaps_by_pid: HashMap<i32, Vec<Mapping>> = HashMap::new();
         let mut comm_by_tid: HashMap<i32, String> = HashMap::new();
 
@@ -1511,6 +1511,7 @@ pub fn sample_episodes(
         mut perf_file,
         mut record_iter,
     } = PerfFileReader::parse_file(BufReader::new(file))?;
+    verify_capture_build_id(perf_data_path, symbols)?;
     let mut mmaps_by_pid: HashMap<i32, Vec<Mapping>> = HashMap::new();
     let mut match_cache: rustc_hash::FxHashMap<u64, bool> = Default::default();
     let mut scratch: Vec<String> = Vec::new();
@@ -1600,4 +1601,47 @@ pub fn sample_episodes(
         }
     }
     Ok((episodes, matching, window))
+}
+
+/// Refuse to symbolize a capture against a library from a different build.
+///
+/// Symbols from another build do not fail loudly: every address still lands in
+/// *some* function, and the result is a plausible-looking profile of the wrong
+/// code. hiperf records no build ids in its captures, so the anchor is the run
+/// the capture belongs to: `bench` checks the staged symbols against the
+/// installed library before measuring and records the build id in `raw.json`
+/// next to the captures. A capture with no such record cannot be checked,
+/// which is reported once rather than treated as a pass.
+fn verify_capture_build_id(capture: &Path, symbols: &Path) -> Result<()> {
+    let expected = std::fs::read(symbols).ok().and_then(|b| {
+        crate::instructions::symbols::build_id_from_elf_prefix(&b[..b.len().min(1 << 16)])
+    });
+    let recorded = capture
+        .parent()
+        .map(|d| d.join("raw.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("symbols_build_id")?.as_str().map(str::to_owned));
+    match (expected, recorded) {
+        (Some(e), Some(r)) => {
+            anyhow::ensure!(
+                e == r,
+                "{} was captured from a build with id {r}, but {} has build id {e}. \
+                 Pass the matching library with --symbols.",
+                capture.display(),
+                symbols.display()
+            );
+        }
+        _ => {
+            if crate::log_once::first_time("profile-unverified-symbols") {
+                eprintln!(
+                    "warning: cannot check {} against the build these captures came from (no \
+                     symbols_build_id in the run's raw.json -- runs before this check was \
+                     added have none). A mismatched library gives a plausible, wrong profile.",
+                    symbols.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }

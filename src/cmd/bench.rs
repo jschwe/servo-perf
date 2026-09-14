@@ -46,6 +46,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // OHOS run — `reflow.count` needs no PMU — but symbol staging (the
     // merged ELF from a sibling file in `workloads/`) only happens when
     // `--with-instructions` is on.
+    let mut symbols_build_id: Option<String> = None;
     let engine: Option<EngineConfig> = match &target {
         Target::Ohos(ohos) => {
             let cfg = InstructionsConfig::load(&workloads_dir)?;
@@ -58,7 +59,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             match selected {
                 Some(e) => {
                     if args.ohos.with_instructions {
-                        check_engine_symbols(ohos, e, &workloads_dir)?;
+                        symbols_build_id = check_engine_symbols(ohos, e, &workloads_dir)?;
                     }
                     Some(e.clone())
                 }
@@ -480,6 +481,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         workload: w,
         configs,
         deltas: BTreeMap::new(),
+        symbols_build_id,
     };
 
     report::write_json(&out_dir, &data)?;
@@ -502,9 +504,9 @@ fn check_engine_symbols(
     target: &OhosTarget,
     engine: &EngineConfig,
     workloads_dir: &Path,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if engine.symbol_file.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let host_path = workloads_dir.join(&engine.symbol_file);
     if !host_path.exists() {
@@ -516,7 +518,7 @@ fn check_engine_symbols(
             host_path,
             host_path.display(),
         );
-        return Ok(());
+        return Ok(None);
     }
     if engine.device_library.is_empty() {
         eprintln!(
@@ -525,7 +527,7 @@ fn check_engine_symbols(
              old layout and reports plausible wrong numbers.",
             engine.id
         );
-        return Ok(());
+        return Ok(None);
     }
     let Some(device_path) = target.first_existing(&engine.device_library) else {
         anyhow::bail!(
@@ -551,7 +553,7 @@ fn check_engine_symbols(
                 "ohos: {} matches the installed library (build id {a})",
                 engine.symbol_file
             );
-            Ok(())
+            Ok(Some(a))
         }
         (Some(a), Some(b)) => anyhow::bail!(
             "{} is not the installed library: staged build id {a}, {device_path} has {b}. \

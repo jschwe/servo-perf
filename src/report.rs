@@ -55,6 +55,13 @@ pub struct RunResults {
     pub configs: BTreeMap<String, ConfigResults>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub deltas: BTreeMap<String, SummaryDelta>,
+    /// Build id of the engine library, as checked against the device before
+    /// the run: the staged symbol file and the installed library both had it.
+    /// Lets later analysis (`servoperf profile`) refuse symbols from another
+    /// build — the captures themselves carry no build ids, and a mismatch
+    /// yields a plausible profile of the wrong code rather than an error.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub symbols_build_id: Option<String>,
 }
 
 pub fn write_json(out_dir: &Path, data: &RunResults) -> Result<()> {
@@ -898,6 +905,7 @@ mod tests {
             workload: dummy_workload(),
             configs,
             deltas: BTreeMap::new(),
+            symbols_build_id: None,
         };
         let md = super::render_markdown(&data);
         assert!(md.contains("# servoperf — `test`"));

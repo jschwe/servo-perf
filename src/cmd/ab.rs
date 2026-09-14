@@ -172,6 +172,7 @@ pub fn run(args: AbArgs) -> Result<()> {
         workload: w,
         configs,
         deltas,
+        symbols_build_id: None,
     };
     report::write_json(&out_dir, &data)?;
     report::write_markdown(&out_dir, &data)?;
