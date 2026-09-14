@@ -224,6 +224,47 @@ servoperf bench cdn-huaweimossel --ohos --iterations=10
 # Override the record window for slow pages: --ohos-record-seconds=90
 ```
 
+### ArkWeb needs the WPR root in the device's user CA store
+
+servoshell gets past WPR's self-signed leaves with
+`--ignore-certificate-errors`. ArkWeb does not: the test wrapper handles
+`onSslErrorEventReceive`, which only fires for the main frame, and every
+subresource and XHR is rejected at the socket. The page shell loads and
+everything it fetches fails — measured on a PLR-AL00, `mossel-articles` came
+up as the site's own "获取列表失败" error and `mossel-index` as a blank page,
+while WPR logged `tls: unknown certificate` for each connection. A run in that
+state still produces metrics; they describe an empty page.
+
+The fix is to trust the root on the device. The system store
+(`/etc/security/certificates`) is on read-only erofs, so it goes in the cert
+manager's *user* store, which ArkWeb reads:
+
+```sh
+DIR=/data/service/el1/public/cert_manager_service/certificates/user_open/100
+HASH=$(openssl x509 -in ~/wpr/wpr_cert.pem -noout -subject_hash)   # e.g. e2796f2a
+hdc file send ~/wpr/wpr_cert.pem /data/local/tmp/wpr_ca.pem
+hdc shell "cp /data/local/tmp/wpr_ca.pem $DIR/$HASH.0 \
+  && chown cert_manager_server:cert_manager_server $DIR/$HASH.0 \
+  && chmod 644 $DIR/$HASH.0 \
+  && chcon u:object_r:cert_manager_service_file:s0 $DIR/$HASH.0"
+```
+
+- `100` is the user id of the main HarmonyOS user; `user_open/0` is the
+  system user. The name is OpenSSL's `-subject_hash` plus `.0`, matching the
+  system store's convention.
+- The file is placed directly rather than installed through Settings, so the
+  cert manager's database does not list it. It works for ArkWeb; whether the
+  cert manager ever prunes an unregistered file is untested. Re-check with a
+  screenshot after a reboot.
+- Regenerating `wpr_cert.pem` (step 5) changes the hash; install the new one
+  and remove the old file, or the device keeps trusting a root whose key is
+  gone.
+- Remove it when the campaign is over. A trusted root whose private key sits
+  in a home directory is a real hole on a device that is also used for anything
+  else.
+
+Verify with a screenshot, not with metrics: the broken state produces numbers.
+
 ## 9. Troubleshooting
 
 - **`listen tcp 127.0.0.1:4443: bind: address already in use`** — a
