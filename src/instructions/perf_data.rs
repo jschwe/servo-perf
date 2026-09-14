@@ -1310,6 +1310,7 @@ pub fn profile_from_perf_data(
     workloads_dir: &Path,
     under: Option<&str>,
     callers_of: Option<&str>,
+    parents_of: Option<&str>,
 ) -> Result<Profile> {
     anyhow::ensure!(
         !engine.symbol_file.is_empty(),
@@ -1446,6 +1447,20 @@ pub fn profile_from_perf_data(
                     *profile.self_by_function.entry(self_name).or_insert(0) += period;
                     for n in &chain_names {
                         *profile.inclusive_by_function.entry(n.clone()).or_insert(0) += period;
+                    }
+                    if let Some(pat) = parents_of {
+                        // The first engine frame outward from the innermost
+                        // match: who calls the accessor, not what it calls.
+                        let pn = normalize_symbol(pat);
+                        if let Some(i) = chain_names.iter().position(|n| name_matches(n, pat, &pn))
+                        {
+                            let who = chain_names[i + 1..]
+                                .iter()
+                                .find(|n| !is_plumbing(n) && !name_matches(n, pat, &pn))
+                                .cloned()
+                                .unwrap_or_else(|| "<none above>".to_string());
+                            *profile.callers.entry(who).or_insert(0) += period;
+                        }
                     }
                     if let Some(c) = callers_of {
                         let leaf_name = profile_leaf(&chain_names);
