@@ -6,3 +6,21 @@ iterations = 15
 # workload is meant to run inside the arkweb wrapper app, where the viewport
 # comes from the app's window and is identical for both engines.
 servoshell_args = ["--ignore-certificate-errors"]
+
+# Serve the page from a local WPR archive instead of the live site. Two
+# reasons, both of which showed up in the 2026-09-11 PLR campaign:
+#
+#   * Network variance was in every number. The load workloads carried
+#     8-24% spread on first paint, most of it the CDN rather than the engine.
+#   * The legs did not face the same network. Chromium has a persistent disk
+#     cache, so iterations 2..15 were served locally; Servo's disk cache is
+#     off by default (`network_http_disk_cache` is the empty string) and
+#     servoperf force-stops between iterations, so every Servo iteration was
+#     a completely cold fetch over the internet. Measured first paint was
+#     1.2-1.4 s against 6.2-7.9 s -- a caching-policy difference read as an
+#     engine difference.
+#
+# One archive per route, shared by the load and scroll variants of that route.
+[fixture]
+kind = "wpr-replay"
+archive = "mossel-index.wprgo"
