@@ -39,6 +39,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         &workloads_dir,
         args.under.as_deref(),
         args.callers_of.as_deref(),
+        args.parents_of.as_deref(),
     )?;
     anyhow::ensure!(
         profile.total > 0,
@@ -67,6 +68,16 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         profile.total,
         args.top,
     );
+    if let Some(c) = args.parents_of.as_deref() {
+        let sub: u64 = profile.callers.values().sum();
+        println!(
+            "\n{:.1} M instructions ({:.1}% of the total) have `{c}` on the chain; \
+             the engine function calling it:",
+            sub as f64 / 1e6,
+            100.0 * sub as f64 / profile.total as f64
+        );
+        print_table("parents", &profile.callers, sub.max(1), args.top);
+    }
     if let Some(c) = args.callers_of.as_deref() {
         let sub: u64 = profile.callers.values().sum();
         println!(

@@ -72,6 +72,11 @@ pub struct ProfileArgs {
     /// to find who is cloning all those `Arc`s.
     #[arg(long)]
     pub callers_of: Option<String>,
+    /// Tabulate, for samples with a function matching this pattern anywhere
+    /// on the chain, the engine function that called it — e.g.
+    /// `--parents-of 'BoxFragment>::style'` for who keeps re-borrowing styles.
+    #[arg(long, conflicts_with = "callers_of")]
+    pub parents_of: Option<String>,
     /// Rows per table.
     #[arg(long, default_value_t = 30)]
     pub top: usize,
