@@ -314,6 +314,18 @@ pub struct BenchArgs {
     /// Output directory. Defaults to `out/<workload>-<UTC-timestamp>/`.
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// Override the workload's `tracing_filter` for servoshell.
+    ///
+    /// The instrumentation is inside the frames being counted, so a hot span
+    /// inflates the very instructions the run reports. Measured on a
+    /// PLR-AL00: upstream #47669 put spans on
+    /// `ScrollTree::cumulative_node_transform`, called ~1.1 M times per 20 s
+    /// on a busy page, and under the default filter those spans were 46% of
+    /// display-list instructions. `info,layout::layout_impl=debug` keeps only
+    /// what servoperf reads (the `FirstContentfulPaint` and `RanLayout`
+    /// markers) and drops every per-function span.
+    #[arg(long)]
+    pub tracing_filter: Option<String>,
     #[command(flatten)]
     pub ohos: OhosArgs,
 }

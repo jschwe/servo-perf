@@ -54,6 +54,10 @@ pub struct SuiteDefaults {
     /// Whether to collect per-function instruction counts.
     #[serde(default)]
     pub with_instructions: Option<bool>,
+    /// Overrides every workload's `tracing_filter`. See `bench --tracing-filter`
+    /// for why a campaign wants this narrow.
+    #[serde(default)]
+    pub tracing_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

@@ -20,6 +20,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
     if let Some(n) = args.iterations {
         w.iterations = n;
     }
+    if let Some(f) = args.tracing_filter.clone() {
+        w.tracing_filter = f;
+    }
     let target = build_target(&args.ohos, args.bin.as_deref())?;
     let registry = trace::load_registry_named(&workloads_dir, target.registry_stem())?;
     let primary_milestone = target.primary_milestone();
