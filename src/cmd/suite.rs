@@ -89,6 +89,7 @@ pub fn run(args: SuiteArgs) -> Result<()> {
             iterations: args.iterations.or_else(|| suite.iterations_for(w)),
             out: Some(out),
             tracing_filter: suite.defaults.tracing_filter.clone(),
+            live: args.live,
             ohos: leg_ohos_args(&args, &suite, leg, Some(w)),
         };
         if let Err(e) = crate::cmd::bench::run(bench) {

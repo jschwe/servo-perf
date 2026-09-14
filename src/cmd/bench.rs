@@ -23,6 +23,17 @@ pub fn run(args: BenchArgs) -> Result<()> {
     if let Some(f) = args.tracing_filter.clone() {
         w.tracing_filter = f;
     }
+    if args.live
+        && w.fixture.take().is_some()
+        && crate::log_once::first_time("live-instead-of-fixture")
+    {
+        eprintln!(
+            "warning: --live: loading {} from the live site instead of the workload's fixture. \
+             The network is in every number, and Servo's disk cache is off by default, so each \
+             Servo iteration is a cold fetch; do not compare these with replayed runs.",
+            w.url
+        );
+    }
     let target = build_target(&args.ohos, args.bin.as_deref())?;
     let registry = trace::load_registry_named(&workloads_dir, target.registry_stem())?;
     let primary_milestone = target.primary_milestone();

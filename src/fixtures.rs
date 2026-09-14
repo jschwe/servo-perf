@@ -190,17 +190,22 @@ fn spawn_wpr_replay(
     preflight_port(wpr_port)?;
     preflight_port(tunnel_port)?;
 
+    // `wpr.exe` on Windows: both the default location and the PATH lookup
+    // have to carry the suffix, or a correctly installed binary is reported
+    // missing.
+    let wpr_name = format!("wpr{}", std::env::consts::EXE_SUFFIX);
     let wpr_bin = std::env::var_os("SERVOPERF_WPR_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
+        .or_else(|| {
             dirs_home()
-                .map(|h| h.join("bin").join("wpr"))
-                .unwrap_or_else(|| PathBuf::from("wpr"))
-        });
+                .map(|h| h.join("bin").join(&wpr_name))
+                .filter(|p| p.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from(&wpr_name));
     anyhow::ensure!(
         wpr_bin.is_file() || which_on_path(&wpr_bin).is_some(),
-        "wpr binary not found at {} (set SERVOPERF_WPR_BIN to override). \
-         See tools/servoperf/docs/wpr-setup.md.",
+        "wpr binary not found at {} (set SERVOPERF_WPR_BIN to override, or pass --live \
+         to run against the live site instead). See tools/servoperf/docs/wpr-setup.md.",
         wpr_bin.display()
     );
 
@@ -231,6 +236,18 @@ fn spawn_wpr_replay(
     // runs servoshell once at the workload URL, then tears WPR down with
     // SIGINT so it flushes the archive to disk before we start replay.
     if !archive.exists() {
+        // Recording stops WPR with SIGINT so it writes the archive out. Windows
+        // has no SIGINT for a child process; the fallback is TerminateProcess,
+        // which kills WPR before it flushes, leaving an empty archive that
+        // every later run then "replays". Refuse rather than record that.
+        anyhow::ensure!(
+            cfg!(unix),
+            "wpr-replay: archive {} is missing, and recording one is not supported on this \
+             host (WPR can only be stopped cleanly with SIGINT). Record it on Linux/macOS and \
+             copy it into {}, or pass --live.",
+            archive.display(),
+            archives_dir.display()
+        );
         eprintln!(
             "wpr-replay: archive {} missing — recording one pass from live origin",
             archive.display()

@@ -314,6 +314,10 @@ pub struct SuiteArgs {
     /// one leg under changed settings without re-running the other.
     #[arg(long, requires = "out")]
     pub report_only: bool,
+    /// Run every workload against the live site, ignoring `[fixture]` blocks.
+    /// See `bench --live` for what that costs the comparison.
+    #[arg(long)]
+    pub live: bool,
     #[command(flatten)]
     pub ohos: OhosArgs,
 }
@@ -345,6 +349,14 @@ pub struct BenchArgs {
     /// markers) and drops every per-function span.
     #[arg(long)]
     pub tracing_filter: Option<String>,
+    /// Ignore the workload's `[fixture]` and load its URL from the live site —
+    /// for a host without WPR set up. Not comparable with replayed runs: the
+    /// network is back in every number, and Servo's disk cache is off by
+    /// default, so every Servo iteration is a cold fetch while Chromium serves
+    /// repeats from its cache (on a PLR-AL00, mossel-index first paint was
+    /// 7.4 s live against 0.9 s replayed).
+    #[arg(long)]
+    pub live: bool,
     #[command(flatten)]
     pub ohos: OhosArgs,
 }
