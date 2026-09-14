@@ -38,6 +38,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         engine,
         &workloads_dir,
         args.under.as_deref(),
+        args.callers_of.as_deref(),
     )?;
     anyhow::ensure!(
         profile.total > 0,
@@ -66,6 +67,16 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         profile.total,
         args.top,
     );
+    if let Some(c) = args.callers_of.as_deref() {
+        let sub: u64 = profile.callers.values().sum();
+        println!(
+            "\n{:.1} M instructions ({:.1}% of the total) are self time in `{c}`; \
+             nearest engine frame above them:",
+            sub as f64 / 1e6,
+            100.0 * sub as f64 / profile.total as f64
+        );
+        print_table("callers", &profile.callers, sub.max(1), args.top);
+    }
     Ok(())
 }
 

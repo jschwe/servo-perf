@@ -634,14 +634,22 @@ fn resolve_out(explicit: Option<&Path>, workload_name: &str) -> PathBuf {
 /// Does this process name belong to the bundle under test?
 ///
 /// An OHOS app is `<bundle>` plus helpers like `<bundle>:render` and
-/// `<bundle>:gpu`, all expected. The catch is that a process renamed after it
-/// starts carries the kernel's `comm`, truncated to 15 bytes — and
-/// `org.servo.servo` is exactly 15 characters, so an exact comparison would
-/// silently never fire on the Servo leg while firing spuriously on a longer
-/// bundle. Treat a 15-byte name as a prefix.
+/// `<bundle>:gpu`, all expected. The catch is the kernel's `comm`, which is
+/// 15 bytes: a process renamed after it starts carries a truncated name. Both
+/// ends have been seen — on a PLR-AL00 the ArkWeb wrapper's renderer reports
+/// as `kwebtest:render`, the *last* 15 bytes of
+/// `org.openharmonyrs.arkwebtest:render` — so a 15-byte name matches if it is
+/// either end of `<bundle>` or `<bundle>:<suffix>`.
 fn names_this_bundle(name: &str, bundle: &str) -> bool {
     let base = name.split(':').next().unwrap_or(name);
-    base == bundle || (base.len() == 15 && bundle.starts_with(base))
+    if base == bundle {
+        return true;
+    }
+    if name.len() != 15 {
+        return false;
+    }
+    let suffix = name.find(':').map(|i| &name[i..]).unwrap_or("");
+    format!("{bundle}{suffix}").ends_with(name) || bundle.starts_with(base)
 }
 
 #[cfg(test)]
@@ -669,7 +677,10 @@ mod contamination_tests {
             "org.openharmony",
             "org.openharmonyrs.arkwebtest"
         ));
-        assert!(names_this_bundle(
+        // A comm is never longer than 15 bytes, so a prefix-truncated base
+        // with a suffix appended cannot occur; names are either full (hiperf
+        // synthesises them from /proc/<pid>/cmdline) or at most 15 bytes.
+        assert!(!names_this_bundle(
             "org.openharmony:render",
             "org.openharmonyrs.arkwebtest"
         ));
@@ -684,6 +695,20 @@ mod contamination_tests {
         // A 15-byte name that is not a prefix must not be excused.
         assert!(!names_this_bundle(
             "com.huawei.hmo",
+            "org.openharmonyrs.arkwebtest"
+        ));
+        // The browser's renderer truncated from the front is still foreign.
+        assert!(!names_this_bundle(
+            "h.browser:render",
+            "org.openharmonyrs.arkwebtest"
+        ));
+    }
+
+    #[test]
+    fn a_comm_truncated_from_the_front_still_matches() {
+        // Measured on a PLR-AL00: the wrapper's renderer as the kernel names it.
+        assert!(names_this_bundle(
+            "kwebtest:render",
             "org.openharmonyrs.arkwebtest"
         ));
     }
