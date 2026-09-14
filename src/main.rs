@@ -32,6 +32,7 @@ fn main() -> Result<()> {
         #[cfg(feature = "pftrace")]
         cli::Command::Dump(a) => cmd::dump::run(a),
         cli::Command::CpuFreq(a) => cpufreq::run(&a),
+        cli::Command::Profile(a) => cmd::profile::run(a),
         cli::Command::Regression(a) => cmd::regression::run(a),
         cli::Command::Suite(a) => cmd::suite::run(a),
         cli::Command::PrepareArkwebSymbols(a) => cmd::prepare_symbols::run(a),

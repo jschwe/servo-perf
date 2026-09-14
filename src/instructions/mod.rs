@@ -19,7 +19,7 @@
 mod perf_data;
 pub mod symbols;
 
-pub use perf_data::{aggregate_inclusive_from_perf_data, Aggregation};
+pub use perf_data::{aggregate_inclusive_from_perf_data, profile_from_perf_data, Aggregation};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

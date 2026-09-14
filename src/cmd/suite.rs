@@ -77,7 +77,7 @@ pub fn run(args: SuiteArgs) -> Result<()> {
     );
 
     let mut failures: Vec<String> = Vec::new();
-    let mut run_cell = |leg: &Leg, w: &crate::suite::SuiteWorkload, failures: &mut Vec<String>| {
+    let run_cell = |leg: &Leg, w: &crate::suite::SuiteWorkload, failures: &mut Vec<String>| {
         let out = root.join(format!("{}-{}", leg.id, w.name));
         eprintln!("\n=== {} / {} ===", leg.id, w.name);
         let bench = BenchArgs {
