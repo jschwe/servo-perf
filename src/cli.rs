@@ -45,6 +45,31 @@ pub enum Command {
     /// because of the work it does or because the governor never ramped it.
     #[command(name = "cpufreq")]
     CpuFreq(CpuFreqArgs),
+    /// Rank the functions an engine spends its instructions in, from the
+    /// `perf.data` captures of a run — optionally only inside one phase
+    /// (`--under 'Layout>::reflow'`). The per-run report measures phases as a
+    /// whole; this is for finding what inside a phase is worth optimising.
+    Profile(ProfileArgs),
+}
+
+#[derive(clap::Args, Clone)]
+pub struct ProfileArgs {
+    /// `perf.data` files, or run directories to take every
+    /// `iter_*.perf.data` from.
+    #[arg(required = true)]
+    pub inputs: Vec<PathBuf>,
+    /// `_instructions.toml` engine to symbolize against.
+    #[arg(long)]
+    pub engine: String,
+    /// Keep only samples whose callchain contains a function matching this
+    /// substring (same matching as `functions` patterns). Samples on the
+    /// engine's worker-pool threads count too when the pool credits exactly
+    /// this pattern.
+    #[arg(long)]
+    pub under: Option<String>,
+    /// Rows per table.
+    #[arg(long, default_value_t = 30)]
+    pub top: usize,
 }
 
 #[derive(clap::Args, Clone)]

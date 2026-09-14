@@ -1247,3 +1247,173 @@ impl MatchCache {
         &self.map[&file_offset]
     }
 }
+
+/// Where the instructions under one phase actually go, for finding what to
+/// optimise rather than measuring a phase as a whole.
+#[derive(Debug, Default)]
+pub struct Profile {
+    /// Period summed over the samples that were counted (in-library and, when
+    /// a scope was given, inside it).
+    pub total: u64,
+    pub samples: u64,
+    /// Innermost function of the leaf frame.
+    pub self_by_function: HashMap<String, u64>,
+    /// Every distinct function on the chain, once per sample.
+    pub inclusive_by_function: HashMap<String, u64>,
+}
+
+/// Build a [`Profile`] over one or more captures.
+///
+/// `under`, when given, keeps only samples whose chain contains a function
+/// matching it — plus samples on one of the engine's `parallel_pool` threads
+/// when the pool credits that very pattern, since a worker's own chain never
+/// names the phase it is running.
+pub fn profile_from_perf_data(
+    perf_data_paths: &[std::path::PathBuf],
+    engine: &EngineConfig,
+    workloads_dir: &Path,
+    under: Option<&str>,
+) -> Result<Profile> {
+    anyhow::ensure!(
+        !engine.symbol_file.is_empty(),
+        "engine {:?} has no symbol_file",
+        engine.id
+    );
+    let sym_path = workloads_dir.join(&engine.symbol_file);
+    let symbolizer = Symbolizer::load(&sym_path)?;
+    let symbol_basename = sym_basename_from_path(&engine.symbol_file);
+    let under_norm = under.map(normalize_symbol);
+    let pool_prefixes: Vec<&str> = match under {
+        Some(u) => engine
+            .parallel_pools
+            .iter()
+            .filter(|p| p.credit.iter().any(|c| c == u))
+            .flat_map(|p| p.threads.iter().map(String::as_str))
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let mut names_cache: rustc_hash::FxHashMap<u64, Vec<String>> = Default::default();
+    let mut scratch: Vec<String> = Vec::new();
+    let mut profile = Profile::default();
+    let mut chain_names: Vec<String> = Vec::new();
+
+    for path in perf_data_paths {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let PerfFileReader {
+            mut perf_file,
+            mut record_iter,
+        } = PerfFileReader::parse_file(BufReader::new(file))
+            .with_context(|| format!("parsing perf.data at {}", path.display()))?;
+        let mut mmaps_by_pid: HashMap<i32, Vec<Mapping>> = HashMap::new();
+        let mut comm_by_tid: HashMap<i32, String> = HashMap::new();
+
+        while let Some(record) = record_iter
+            .next_record(&mut perf_file)
+            .context("reading next perf record")?
+        {
+            let PerfFileRecord::EventRecord { record, .. } = record else {
+                continue;
+            };
+            match record.parse().context("parsing event record")? {
+                EventRecord::Mmap2(m) => {
+                    if matches!(m.cpu_mode, CpuMode::User) && (m.protection & 0x4) != 0 {
+                        mmaps_by_pid.entry(m.pid).or_default().push(Mapping {
+                            start: m.address,
+                            end: m.address.saturating_add(m.length),
+                            page_offset: m.page_offset,
+                            basename: basename_of(&m.path.as_slice()).into_owned(),
+                        });
+                    }
+                }
+                EventRecord::Mmap(m) => {
+                    if matches!(m.cpu_mode, CpuMode::User) && m.is_executable {
+                        mmaps_by_pid.entry(m.pid).or_default().push(Mapping {
+                            start: m.address,
+                            end: m.address.saturating_add(m.length),
+                            page_offset: m.page_offset,
+                            basename: basename_of(&m.path.as_slice()).into_owned(),
+                        });
+                    }
+                }
+                EventRecord::Comm(c) => {
+                    comm_by_tid.insert(
+                        c.tid,
+                        String::from_utf8_lossy(&c.name.as_slice()).into_owned(),
+                    );
+                }
+                EventRecord::Sample(s) => {
+                    let (Some(pid), Some(period)) = (s.pid, s.period) else {
+                        continue;
+                    };
+                    let Some(mappings) = mmaps_by_pid.get(&pid) else {
+                        continue;
+                    };
+                    let mut ips: Vec<u64> = Vec::with_capacity(64);
+                    if let Some(ip) = s.ip {
+                        ips.push(ip);
+                    }
+                    if let Some(chain) = s.callchain {
+                        for idx in 0..chain.len() {
+                            let Some(ip) = chain.get(idx) else { break };
+                            if ip < 0xffff_ffff_ffff_ff00 {
+                                ips.push(ip);
+                            }
+                        }
+                    }
+                    // Names along the chain, leaf first, inline frames
+                    // innermost first. Frames outside the engine library are
+                    // left out: the question is where the engine spends its
+                    // instructions.
+                    chain_names.clear();
+                    let mut leaf: Option<String> = None;
+                    for (depth, &ip) in ips.iter().enumerate() {
+                        let Some(m) = find_mapping(mappings, ip) else {
+                            continue;
+                        };
+                        if m.basename != symbol_basename {
+                            continue;
+                        }
+                        let off = ip - m.start + m.page_offset;
+                        let names = names_cache.entry(off).or_insert_with(|| {
+                            symbolizer.names_at(off, &mut scratch);
+                            std::mem::take(&mut scratch)
+                        });
+                        if depth == 0 {
+                            leaf = names.first().cloned();
+                        }
+                        for n in names.iter() {
+                            if !chain_names.contains(n) {
+                                chain_names.push(n.clone());
+                            }
+                        }
+                    }
+                    if chain_names.is_empty() {
+                        continue;
+                    }
+                    if let (Some(u), Some(un)) = (under, under_norm.as_deref()) {
+                        let on_chain = chain_names.iter().any(|n| name_matches(n, u, un));
+                        let on_pool = !pool_prefixes.is_empty()
+                            && s.tid
+                                .and_then(|t| comm_by_tid.get(&t))
+                                .is_some_and(|t| pool_prefixes.iter().any(|p| t.starts_with(p)));
+                        if !on_chain && !on_pool {
+                            continue;
+                        }
+                    }
+                    profile.total += period;
+                    profile.samples += 1;
+                    // A leaf outside the library (libc, the kernel) is
+                    // charged to the innermost engine frame that called it.
+                    let self_name = leaf.unwrap_or_else(|| chain_names[0].clone());
+                    *profile.self_by_function.entry(self_name).or_insert(0) += period;
+                    for n in &chain_names {
+                        *profile.inclusive_by_function.entry(n.clone()).or_insert(0) += period;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(profile)
+}
