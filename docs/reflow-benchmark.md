@@ -193,6 +193,21 @@ Two things about the workloads:
   servoperf skips its install cooldown and warmup, and the first cold launch
   after an install runs ~3x slow, skewing iteration 0.
 
+### When sampling starts
+
+Each iteration starts `hiperf` in its `--control` mode *before* `aa start`,
+and stops it once the window closes. Earlier versions launched the app first
+and began a blocking `hiperf record -d` afterwards, so the first sample arrived
+0.4–0.56 s after the app's first trace event. On the mossel pages every layout
+still fell inside the window (checked across all 300 iterations of a baseline),
+but a static page lays out once, in its first ~0.4 s, and Servo's layout was
+missed entirely.
+
+The controlled session prints its summary, including sample loss, to hilog
+rather than to its caller. servoperf reads it from there, matched by the
+server's pid. On a hiperf without `--control`, it falls back to the old
+blocking capture and says so.
+
 ## 5. Reading the results
 
 `out/<dir>/report.md` for the summary, `raw.json` for per-iteration values.

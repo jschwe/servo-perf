@@ -533,10 +533,10 @@ impl OhosTarget {
 
     /// Run one iteration on the device:
     ///   * stop the app, clear any old trace
-    ///   * `hitrace --trace_begin`
+    ///   * `hitrace --trace_begin`, and `hiperf record --control start` when
+    ///     `hiperf_period` is set
     ///   * `aa start … -U <url> [--ps=…]`
-    ///   * blocking capture window (`hiperf record -d …` when
-    ///     `hiperf_period` is set, otherwise `sleep capture_seconds`)
+    ///   * `sleep capture_seconds`, then `hiperf record --control stop`
     ///   * `hitrace --trace_finish -o <on-device-path>`
     ///   * `hdc file recv` → `out_dir/iter_<iter>.hitrace.txt`
     ///   * if hiperf ran: produce + recv `iter_<iter>.stack.txt`
@@ -595,15 +595,25 @@ impl OhosTarget {
         // this iteration rather than to a previous run or another app.
         let faultlog_before = self.newest_faultlog();
 
+        // Sampling has to be running before the launch, not started after it:
+        // `hiperf record` takes ~0.4 s to begin sampling, and measured on a
+        // PLR-AL00 the first sample landed 0.4-0.56 s after the app's first
+        // trace event — after Servo's only layout of a static page, so its
+        // whole load went uncounted.
+        let hiperf = match self.hiperf_period {
+            Some(period) => Some(self.start_hiperf(period)?),
+            None => None,
+        };
+
         let spawn_wall_ns = wall_now_ns();
         self.aa_start(workload, proxy_uri)
             .with_context(|| format!("aa start failed for {}", self.bundle))?;
         let pid_at_start = self.wait_for_app_pid();
 
-        // Hold the capture window open. When `--with-instructions` is on
-        // we run a blocking `hiperf record -d <secs>`; otherwise we just
-        // sleep. Either way the host returns to this line after exactly
-        // `capture_seconds` of device-side activity.
+        // Hold the capture window open: a sleep, or on a hiperf without
+        // `--control` a blocking `hiperf record -d <secs>`. Either way the
+        // host returns to this line after `capture_seconds` of device-side
+        // activity.
         //
         // A scenario workload additionally samples the presented-frame ring
         // throughout that window; the ring only holds ~384 entries, so the
@@ -635,8 +645,8 @@ impl OhosTarget {
                     .flatten();
                 std::thread::scope(|scope| -> Result<()> {
                     let sampler = scope.spawn(|| self.sample_frame_ring(scenario, window));
-                    if let Some(period) = self.hiperf_period {
-                        self.run_hiperf_record(period, window)
+                    if let Some(HiperfCapture::Blocking(period)) = hiperf.as_ref() {
+                        self.run_hiperf_record(*period, window)
                             .context("hiperf record (--with-instructions)")?;
                     }
                     fps_dumps = sampler.join().unwrap_or_default();
@@ -645,14 +655,19 @@ impl OhosTarget {
                 if let Some(before) = cpu_before {
                     thread_cpu = self.sample_thread_cpu().map(|after| (before, after));
                 }
-            } else if let Some(period) = self.hiperf_period {
-                self.run_hiperf_record(period, window)
+            } else if let Some(HiperfCapture::Blocking(period)) = hiperf.as_ref() {
+                self.run_hiperf_record(*period, window)
                     .context("hiperf record (--with-instructions)")?;
             } else {
                 std::thread::sleep(Duration::from_secs(window));
             }
             Ok(())
         })?;
+        if let Some(HiperfCapture::Controlled(session)) = hiperf {
+            session
+                .stop()
+                .context("hiperf record (--with-instructions)")?;
+        }
 
         // Did the app survive its own measurement? Nothing above notices a
         // crash: the window elapses on a timer, hitrace and hiperf keep
@@ -805,6 +820,59 @@ impl OhosTarget {
         Some(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
+    /// Prepare and start a system-wide `hiperf record` that samples until
+    /// [`HiperfSession::stop`]. `--control start` returns once sampling runs,
+    /// which is what lets the launch happen inside the capture rather than
+    /// before it. Falls back to [`HiperfCapture::Blocking`] on a hiperf
+    /// without `--control`.
+    fn start_hiperf(&self, period: u64) -> Result<HiperfCapture> {
+        let _ = self.hdc(&["shell", "hiperf", "record", "--control", "stop"]);
+        let period_str = period.to_string();
+        let mut argv: Vec<&str> = vec!["shell", "hiperf", "record", "--control", "prepare"];
+        let sampling = hiperf_sampling_args(&period_str);
+        argv.extend(sampling.iter().copied());
+        let prepared = self.hdc(&argv).context("hiperf record --control prepare")?;
+        let prepared = String::from_utf8_lossy(&prepared.stdout).to_string();
+        if !prepared.contains("success") {
+            if crate::log_once::first_time("hiperf-no-control") {
+                eprintln!(
+                    "warning: `hiperf record --control prepare` did not succeed ({}); falling \
+                     back to a capture started after the launch, which misses the first \
+                     ~0.5 s of the app — all of a fast page load.",
+                    prepared.trim()
+                );
+            }
+            let _ = self.hdc(&["shell", "hiperf", "record", "--control", "stop"]);
+            return Ok(HiperfCapture::Blocking(period));
+        }
+        let t = self.clone();
+        let cleanup = crate::cancel::register_cleanup(move || {
+            let _ = t.hdc(&["shell", "hiperf", "record", "--control", "stop"]);
+            let _ = t.hdc(&["shell", "killall", "hiperf"]);
+        });
+        let mut session = HiperfSession {
+            target: Some(self.clone()),
+            cleanup,
+            server_pid: None,
+        };
+        let started = self
+            .hdc(&["shell", "hiperf", "record", "--control", "start"])
+            .context("hiperf record --control start")?;
+        let started = String::from_utf8_lossy(&started.stdout);
+        anyhow::ensure!(
+            started.contains("success"),
+            "hiperf record --control start refused the capture: {}",
+            started.trim()
+        );
+        session.server_pid = self.hdc(&["shell", "pidof", "hiperf"]).ok().and_then(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
+        });
+        Ok(HiperfCapture::Controlled(session))
+    }
+
     /// Run `hiperf record -a -e hw-instructions -d <capture_seconds>` on
     /// the device. The call blocks until hiperf finishes — replacing the
     /// host-side sleep. `--exclude-hiperf` keeps the recorder's own
@@ -839,30 +907,10 @@ impl OhosTarget {
         // came back with no instruction metrics at all. The contamination is
         // caught after the fact instead, from the per-process sample counts in
         // `Aggregation::library_samples_by_process`.
-        let mut argv: Vec<&str> = vec!["shell", "hiperf", "record", "-a", "--exclude-hiperf"];
-        argv.extend_from_slice(&[
-            // Sample timestamps must be on the same clock as the hitrace
-            // slices, or `per_reflow` divides a numerator and a denominator
-            // taken over different intervals. hitrace's default `trace_clock`
-            // is `boot` (CLOCK_BOOTTIME, verified on a PLR-AL00 by matching
-            // trace timestamps against /proc/uptime); hiperf's default clockid
-            // is unset, which leaves samples on the kernel's perf clock — that
-            // one stops across suspend, so the two drift apart by however long
-            // the device has slept. Pin it rather than hope.
-            "--clockid",
-            "boottime",
-            "--delay-unwind",
-            "-d",
-            &duration,
-            "-s",
-            "dwarf",
-            "--period",
-            &period_str,
-            "-e",
-            "hw-instructions",
-            "-o",
-            DevicePaths::PERF_DATA,
-        ]);
+        let mut argv: Vec<&str> = vec!["shell", "hiperf", "record"];
+        let sampling = hiperf_sampling_args(&period_str);
+        argv.extend(sampling.iter().copied());
+        argv.extend_from_slice(&["-d", &duration]);
         let out = self.hdc(&argv);
         // Unregister on both paths, so an hdc failure does not leave a stale
         // cleanup registered.
@@ -883,24 +931,7 @@ impl OhosTarget {
         // than letting it pass as a clean run — with the total, because the
         // absolute number means nothing on its own (a PLR-class phone takes
         // ~800k samples in a 20 s capture at period 100000).
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if let Some(lost) = parse_hiperf_count(&stdout, "Sample lost:") {
-            if lost > 0 {
-                let kept = parse_hiperf_count(&stdout, "Sample records:").unwrap_or(0);
-                let pct = if kept + lost > 0 {
-                    100.0 * lost as f64 / (kept + lost) as f64
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "warning: hiperf dropped {lost} of {} samples ({pct:.1}%) this iteration. \
-                     Loss concentrates in the busiest phase, so it biases rather than thins: \
-                     raise --instructions-period until it reaches 0 (measured loss-free on \
-                     PLR-AL00 at 1000000). Under ~1% the effect is within sampling error.",
-                    kept + lost,
-                );
-            }
-        }
+        warn_on_sample_loss(&String::from_utf8_lossy(&out.stdout));
         Ok(())
     }
 
@@ -1024,6 +1055,116 @@ pub struct RunArtifact {
     /// SoC thermal zone reading sampled right after the capture window.
     /// `None` if the read failed.
     pub thermal_after_milli_c: Option<i64>,
+}
+
+/// How an iteration's instruction capture is being taken.
+enum HiperfCapture {
+    /// Sampling since before the launch; stopped after the window.
+    Controlled(HiperfSession),
+    /// A hiperf without `--control`: one blocking `record -d <window>` call,
+    /// started only after the launch.
+    Blocking(u64),
+}
+
+/// A `hiperf record --control` session that is sampling. Stops it on drop, so
+/// an early return cannot leave the device profiling system-wide and holding
+/// the PMU for the next iteration.
+struct HiperfSession {
+    target: Option<OhosTarget>,
+    cleanup: u64,
+    /// The sampling server's pid, which tags its hilog lines.
+    server_pid: Option<String>,
+}
+
+impl HiperfSession {
+    fn stop(mut self) -> Result<()> {
+        let target = self.target.take().expect("stopped once");
+        crate::cancel::unregister_cleanup(self.cleanup);
+        let out = target
+            .hdc(&["shell", "hiperf", "record", "--control", "stop"])
+            .context("hiperf record --control stop")?;
+        let out = String::from_utf8_lossy(&out.stdout);
+        anyhow::ensure!(
+            out.contains("success"),
+            "hiperf record --control stop failed, so the capture was not saved: {}",
+            out.trim()
+        );
+        // A controlled session prints its summary to hilog, not to the caller.
+        if let Some(pid) = self.server_pid.as_deref() {
+            if let Ok(log) = target.hdc(&["shell", "hilog", "-x", "-T", "hiperf"]) {
+                let needle = format!(" {pid} ");
+                let ours: String = String::from_utf8_lossy(&log.stdout)
+                    .lines()
+                    .filter(|l| l.contains(&needle))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                warn_on_sample_loss(&ours);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HiperfSession {
+    fn drop(&mut self) {
+        if let Some(t) = self.target.take() {
+            crate::cancel::unregister_cleanup(self.cleanup);
+            let _ = t.hdc(&["shell", "hiperf", "record", "--control", "stop"]);
+        }
+    }
+}
+
+/// Warn when hiperf's summary (`[ Sample records: N, ... ]`,
+/// `[ Sample lost: N, ... ]`) reports dropped samples. `perf.data` carries no
+/// record of them — a capture that lost 20% of its samples has no LOST records
+/// — so this summary is the only place the loss shows.
+fn warn_on_sample_loss(summary: &str) {
+    let Some(lost) = parse_hiperf_count(summary, "Sample lost:") else {
+        return;
+    };
+    if lost == 0 {
+        return;
+    }
+    let kept = parse_hiperf_count(summary, "Sample records:").unwrap_or(0);
+    let pct = if kept + lost > 0 {
+        100.0 * lost as f64 / (kept + lost) as f64
+    } else {
+        0.0
+    };
+    eprintln!(
+        "warning: hiperf dropped {lost} of {} samples ({pct:.1}%) this iteration. \
+         Loss concentrates in the busiest phase, so it biases rather than thins: \
+         raise --instructions-period until it reaches 0 (measured loss-free on \
+         PLR-AL00 at 1000000). Under ~1% the effect is within sampling error.",
+        kept + lost,
+    );
+}
+
+/// `hiperf record` options shared by the controlled and blocking captures.
+fn hiperf_sampling_args(period: &str) -> Vec<&str> {
+    vec![
+        "-a",
+        "--exclude-hiperf",
+        // Sample timestamps must be on the same clock as the hitrace
+        // slices, or `per_reflow` divides a numerator and a denominator
+        // taken over different intervals. hitrace's default `trace_clock`
+        // is `boot` (CLOCK_BOOTTIME, verified on a PLR-AL00 by matching
+        // trace timestamps against /proc/uptime); hiperf's default clockid
+        // is unset, which leaves samples on the kernel's perf clock — that
+        // one stops across suspend, so the two drift apart by however long
+        // the device has slept. Pin it rather than hope.
+        "--clockid",
+        "boottime",
+        "--delay-unwind",
+        "-s",
+        "dwarf",
+        "--period",
+        period,
+        "-e",
+        "hw-instructions",
+        "-o",
+        DevicePaths::PERF_DATA,
+    ]
 }
 
 /// RAII handle that drops `hdc rport` forwards on scope exit. Holds its
