@@ -236,6 +236,15 @@ between launches and Servo by default does not, so otherwise ArkWeb's later
 iterations would read the page from disk while every Servo iteration fetched
 it.
 
+ArkWeb's first paint is taken from Blink's own
+`PaintTiming::SetFirstContentfulPaintPresentation` marker, not from the test
+app's `onFirstContentfulPaint` callback. The callback arrives about 150 ms later
+(151–153 ms in each of 5 loads on a PLR-AL00) and never fires for `file://`
+pages. Servo's marker is emitted when the frame is painted. Blink's is emitted
+when the frame's presentation is reported back, which can run a frame or two
+later, so a small bias against ArkWeb remains. ArkWeb first-paint numbers from
+before this change read ~150 ms slow.
+
 First paint in these results is slowed by the instruction sampling that runs
 through the whole load. hiperf copies every sampled thread's stack, and on a
 PLR-AL00 that took a static page's first paint from 0.72 s to 1.42 s under
