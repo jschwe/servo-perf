@@ -27,6 +27,11 @@ pub enum Command {
     /// Run a whole measurement matrix — every workload of a suite against
     /// every engine leg — from a checked-in `suites/<name>.toml`.
     Suite(SuiteArgs),
+    /// Measure a static page of your own — a directory of HTML and resources,
+    /// or one HTML file — loading and scrolling, against every leg of a page
+    /// suite. The directory is served from the host and reached from the
+    /// device through `hdc rport`; nothing is installed on the device.
+    Page(PageArgs),
     /// Build an unstripped `libarkweb_engine.so` from a stripped on-device
     /// copy by re-attaching the `.symtab`/`.strtab` carried in the
     /// `.gnu_debugdata` MiniDebugInfo section, then push it to the device.
@@ -318,6 +323,60 @@ pub struct SuiteArgs {
     /// See `bench --live` for what that costs the comparison.
     #[arg(long)]
     pub live: bool,
+    /// Take no instruction samples, whatever the suite says, for a run whose
+    /// milestones are to be compared. See `PageArgs::no_instructions`.
+    #[arg(long)]
+    pub no_instructions: bool,
+    #[command(flatten)]
+    pub ohos: OhosArgs,
+}
+
+#[derive(clap::Args, Clone)]
+pub struct PageArgs {
+    /// Directory holding the page and everything it loads, or a single HTML
+    /// file, in which case its directory is served.
+    pub path: PathBuf,
+    /// Page to open, relative to the served directory. Defaults to the file
+    /// given, or `index.html` for a directory.
+    #[arg(long)]
+    pub entry: Option<String>,
+    /// Prefix for the cells' names and output directories. Defaults to the
+    /// directory's name, or the file's stem.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Page suite supplying the legs, device settings and the measurement
+    /// templates (looked up in tools/servoperf/suites/).
+    #[arg(long, default_value = "page-plr")]
+    pub suite: String,
+    /// Host port the page is served on, and forwarded to on the device.
+    #[arg(long, default_value_t = crate::workload::default_static_port())]
+    pub port: u16,
+    /// Only these measurements, comma-separated — the suite's template names
+    /// without their `_page-` prefix, e.g. `load` or `scroll`.
+    #[arg(long)]
+    pub only: Option<String>,
+    /// Restrict the run to these leg ids, comma-separated.
+    #[arg(long)]
+    pub legs: Option<String>,
+    /// Override every measurement's repetition count, for a smoke run.
+    #[arg(long)]
+    pub iterations: Option<u32>,
+    /// Root output directory. Each cell lands in `<out>/<leg>-<name>-<kind>/`.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// `.hap` to install once before each leg, as for `bench --bin`.
+    #[arg(long)]
+    pub bin: Option<PathBuf>,
+    /// Do not pause for a manual engine switch on legs without a `setup`.
+    #[arg(long)]
+    pub assume_yes: bool,
+    /// Take no instruction samples, for a run whose first-paint times are to
+    /// be compared. DWARF sampling slows the page load it is measuring: on a
+    /// PLR-AL00, a static page's first paint went from 0.76 s to 1.42 s under
+    /// Servo and from 1.18 s to 2.00 s under ArkWeb, which also narrows the
+    /// gap between them.
+    #[arg(long)]
+    pub no_instructions: bool,
     #[command(flatten)]
     pub ohos: OhosArgs,
 }
@@ -362,6 +421,10 @@ pub struct BenchArgs {
     /// display-list instructions (see `Workload::lcp`).
     #[arg(long)]
     pub lcp: bool,
+    /// Measure this workload instead of loading `workload` from disk; for
+    /// commands that build one, like `page`.
+    #[arg(skip)]
+    pub workload_def: Option<crate::workload::Workload>,
     #[command(flatten)]
     pub ohos: OhosArgs,
 }

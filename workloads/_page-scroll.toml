@@ -1,0 +1,27 @@
+name = "_page-scroll"
+# Template for `servoperf page`: the page is loaded, then swiped six times down
+# and six times back up, 2 s apart -- the cadence of the mossel scroll
+# workloads (see mossel-index-scroll.toml for where it comes from), started
+# earlier because a page served from the host has settled after 5 s.
+#
+# The coordinates are absolute pixels for a PLR-AL00 (1316x2832). On another
+# device, change them here: x is the horizontal centre, and the travel has to
+# stay inside the page's scrolling content or the swipe scrolls something else.
+#
+# `uinput -T -m`'s trailing argument would be the gesture time; the default
+# 1000 ms plus the 2 s gap gives `every_ms = 3000`. The window must reach past
+# the last swipe: see `capture_seconds` in the page suite.
+url = "/"
+iterations = 10
+
+[[steps]]
+after_ms = 5000
+every_ms = 3000
+times = 6
+run = "uinput -T -m 630 1904 630 954"
+
+[[steps]]
+after_ms = 23000
+every_ms = 3000
+times = 6
+run = "uinput -T -m 630 816 630 1766"

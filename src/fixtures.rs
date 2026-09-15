@@ -2,8 +2,8 @@
 //! RAII lifecycle for localhost fixture servers.
 //!
 //! Three kinds of fixtures are supported:
-//!   * `Fixture::Http1` / `Fixture::Http2` — a Rust static-file server
-//!     spawned from the sibling `fixture_server` binary.
+//!   * `Fixture::Http1` / `Fixture::Http2` / `Fixture::Static` — a Rust
+//!     static-file server spawned from the sibling `fixture_server` binary.
 //!   * `Fixture::WprReplay` — a Web Page Replay archive served through
 //!     the patched `wpr` binary plus a small CONNECT-tunneling shim
 //!     (the sibling `wpr_tunnel` binary). If the archive file doesn't
@@ -99,6 +99,9 @@ pub fn spawn(
         Fixture::Http2 { port, doc_root } => {
             spawn_local_server(workloads_dir, "http2", *port, doc_root, out_dir)
         }
+        Fixture::Static { dir, port } => {
+            spawn_local_server(workloads_dir, "plain", *port, dir, out_dir)
+        }
         Fixture::WprReplay {
             archive,
             wpr_port,
@@ -135,11 +138,12 @@ fn spawn_local_server(
         doc_root.display()
     );
 
-    // Ensure TLS cert exists.
-    let _ = Command::new("sh")
-        .arg(fixtures_dir.join("gen_cert.sh"))
-        .status()
-        .context("running gen_cert.sh")?;
+    if mode != "plain" {
+        let _ = Command::new("sh")
+            .arg(fixtures_dir.join("gen_cert.sh"))
+            .status()
+            .context("running gen_cert.sh")?;
+    }
 
     preflight_port(port)?;
 
@@ -150,7 +154,7 @@ fn spawn_local_server(
         .arg(port.to_string())
         .arg(&doc_root)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(open_log(out_dir, ACCESS_LOG)?)
         .stderr(open_log(out_dir, "fixture_server.stderr")?)
         .spawn()
         .context("spawning fixture_server")?;
@@ -162,6 +166,32 @@ fn spawn_local_server(
     };
     wait_for_accept(&mut handle, port, "fixture_server")?;
     Ok(handle)
+}
+
+/// `fixture_server`'s request log, one `[srv <ts>] <status> <method> <path>`
+/// line per request, in the run's output directory.
+pub const ACCESS_LOG: &str = "fixture_server.log";
+
+/// Paths the page asked for that the fixture did not have, deduplicated, from
+/// a run's [`ACCESS_LOG`]. A page measured without its fonts or images is
+/// measured doing less work than it would with them, and neither engine says so.
+pub fn missing_resources(out_dir: &Path) -> Vec<String> {
+    let Ok(log) = std::fs::read_to_string(out_dir.join(ACCESS_LOG)) else {
+        return Vec::new();
+    };
+    let mut missing: Vec<String> = log
+        .lines()
+        .filter_map(|l| {
+            let mut fields = l.split_once("] ")?.1.split(' ');
+            let status = fields.next()?;
+            let path = fields.nth(1)?;
+            // Engines ask for a favicon unprompted; its absence costs nothing.
+            (status == "404" && path != "/favicon.ico").then(|| path.to_string())
+        })
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 // -- WPR replay fixture -------------------------------------------------
@@ -676,6 +706,36 @@ mod tests {
         let w = workload_with(fx);
         let handle = spawn(&workloads_dir, &w, &PanickingDriver, out_dir.path())
             .expect("spawn http/2 fixture");
+        assert!(TcpStream::connect(format!("127.0.0.1:{}", handle.port())).is_ok());
+    }
+
+    #[test]
+    fn missing_resources_lists_404s_but_not_the_favicon() {
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(
+            out.path().join(ACCESS_LOG),
+            "listening on http://127.0.0.1:4490/ doc_root=/x mode=plain\n\
+             [srv 1.000] 200 GET /index.html (10B)\n\
+             [srv 1.100] 404 GET /fonts/a.woff2 (0B)\n\
+             [srv 1.200] 404 GET /favicon.ico (0B)\n\
+             [srv 2.100] 404 GET /fonts/a.woff2 (0B)\n",
+        )
+        .unwrap();
+        assert_eq!(missing_resources(out.path()), vec!["/fonts/a.woff2"]);
+    }
+
+    #[test]
+    fn static_fixture_serves_a_directory_without_certificates() {
+        let workloads_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("index.html"), b"<p>hi</p>").unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let w = workload_with(Fixture::Static {
+            dir: root.path().to_path_buf(),
+            port: pick_free_port(),
+        });
+        let handle = spawn(&workloads_dir, &w, &PanickingDriver, out_dir.path())
+            .expect("spawn static fixture");
         assert!(TcpStream::connect(format!("127.0.0.1:{}", handle.port())).is_ok());
     }
 

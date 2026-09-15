@@ -16,7 +16,10 @@ use crate::workload;
 
 pub fn run(args: BenchArgs) -> Result<()> {
     let workloads_dir = workloads_dir();
-    let mut w = workload::load(&workloads_dir, &args.workload)?;
+    let mut w = match args.workload_def.clone() {
+        Some(w) => w,
+        None => workload::load(&workloads_dir, &args.workload)?,
+    };
     if let Some(n) = args.iterations {
         w.iterations = n;
     }
@@ -475,6 +478,18 @@ pub fn run(args: BenchArgs) -> Result<()> {
             summary,
         },
     );
+
+    if matches!(w.fixture, Some(workload::Fixture::Static { .. })) {
+        let missing = fixtures::missing_resources(&out_dir);
+        if !missing.is_empty() {
+            eprintln!(
+                "warning: the page asked for {} file(s) the served directory does not have, so it \
+                 was measured without them: {}",
+                missing.len(),
+                missing.join(", ")
+            );
+        }
+    }
 
     let data = RunResults {
         cancelled: crate::cancel::requested(),

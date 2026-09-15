@@ -1,0 +1,7 @@
+name = "_page-load"
+# Template for `servoperf page`: one cold load of the page, then the window is
+# held open so late layouts (web fonts, images, timers) are counted too.
+# `servoperf page` fills in the URL and the static fixture; this file only
+# holds what differs between the load and scroll measurements.
+url = "/"
+iterations = 10

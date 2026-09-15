@@ -35,6 +35,7 @@ fn main() -> Result<()> {
         cli::Command::Profile(a) => cmd::profile::run(a),
         cli::Command::Regression(a) => cmd::regression::run(a),
         cli::Command::Suite(a) => cmd::suite::run(a),
+        cli::Command::Page(a) => cmd::page::run(a),
         cli::Command::PrepareArkwebSymbols(a) => cmd::prepare_symbols::run(a),
     }
 }

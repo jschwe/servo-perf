@@ -1,0 +1,45 @@
+# Measure your own static page on a HarmonyOS phone, servoshell against ArkWeb.
+#
+# Run with:  servoperf page <dir-or-html-file> --ohos
+#
+# A page suite: its workloads are templates (`workloads/_page-*.toml`) that
+# `servoperf page` fills in with the page, so `servoperf suite page-plr` on its
+# own refuses to run. The page is served from the host over cleartext HTTP and
+# reached through `hdc rport`, with caching forbidden so neither engine serves
+# a later iteration from its disk cache.
+#
+# Legs, device and filter are the mossel-plr campaign's; see that file for why
+# each is what it is.
+
+name = "page-plr"
+
+[device]
+# PLR-AL00's soc_thermal reads a flat 30000 m°C under any load.
+thermal_zone = "board_thermal"
+
+[defaults]
+iterations = 10
+capture_seconds = 10
+instructions_period = 1000000
+trace_tags = "app,nweb"
+with_instructions = true
+tracing_filter = "info,layout::layout_impl=debug"
+
+[[leg]]
+id = "arkweb"
+engine = "arkweb"
+bundle = "org.openharmonyrs.arkwebtest"
+trace_level = ""
+
+[[leg]]
+id = "servo"
+engine = "servo"
+bundle = "org.servo.servo"
+
+[[workload]]
+name = "_page-load"
+
+# The last swipe starts at 38 s and takes 1 s.
+[[workload]]
+name = "_page-scroll"
+capture_seconds = 42

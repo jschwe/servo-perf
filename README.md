@@ -74,6 +74,10 @@ servoperf ab cdn-huaweimossel-live --ohos \
 # Regression check on-device.
 servoperf regression cdn-huaweimossel-live --ohos \
   --baseline=baselines/cdn-huaweimossel-live.ohos.json --threshold=5
+
+# Your own static page (a directory, or one HTML file), load + scroll,
+# servoshell vs ArkWeb. See docs/reflow-benchmark.md §4a.
+servoperf page ./my-page/
 ```
 
 The OHOS path uses a separate critical-path registry

@@ -15,6 +15,10 @@ use tokio_rustls::TlsAcceptor;
 enum Mode {
     Http1,
     Http2,
+    /// Cleartext HTTP/1.1 with `cache-control: no-store`, for pages that
+    /// several engines load: none of them has to trust a certificate, and no
+    /// engine gets to serve a later iteration from its disk cache.
+    Plain,
 }
 
 #[derive(Debug, PartialEq)]
@@ -27,20 +31,23 @@ struct Args {
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     if argv.len() != 3 {
         return Err(format!(
-            "expected 3 arguments, got {} (usage: --mode=http1|http2 <port> <doc_root>)",
+            "expected 3 arguments, got {} (usage: --mode=http1|http2|plain <port> <doc_root>)",
             argv.len()
         ));
     }
     let mode_arg = &argv[0];
     let mode_str = mode_arg.strip_prefix("--mode=").ok_or_else(|| {
-        format!("first argument must be --mode=http1 or --mode=http2, got {mode_arg:?}")
+        format!(
+            "first argument must be --mode=http1, --mode=http2 or --mode=plain, got {mode_arg:?}"
+        )
     })?;
     let mode = match mode_str {
         "http1" => Mode::Http1,
         "http2" => Mode::Http2,
+        "plain" => Mode::Plain,
         other => {
             return Err(format!(
-                "unknown --mode value {other:?} (expected http1 or http2)"
+                "unknown --mode value {other:?} (expected http1, http2 or plain)"
             ))
         }
     };
@@ -55,11 +62,38 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     })
 }
 
+/// Decode `%XX` escapes, so a page can reference files whose names need them.
+fn percent_decode(path: &str) -> Result<String, u16> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = path.get(i + 1..i + 3).ok_or(400u16)?;
+            out.push(u8::from_str_radix(hex, 16).map_err(|_| 400u16)?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| 400)
+}
+
 fn resolve_safe_path(doc_root: &Path, req_path: &str) -> Result<PathBuf, u16> {
+    let decoded = percent_decode(req_path)?;
+    let req_path = decoded.as_str();
+    let with_index;
     let relative = if req_path == "/" {
         "index.html"
     } else {
-        req_path.strip_prefix('/').ok_or(400u16)?
+        let rel = req_path.strip_prefix('/').ok_or(400u16)?;
+        if rel.ends_with('/') {
+            with_index = format!("{rel}index.html");
+            &with_index
+        } else {
+            rel
+        }
     };
     if relative.is_empty() || relative.starts_with('/') {
         return Err(400);
@@ -87,12 +121,26 @@ fn content_type_for(path: &Path) -> &'static str {
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
-        "html" => "text/html",
+        "html" | "htm" => "text/html",
         "css" => "text/css",
-        "js" => "application/javascript",
+        "js" | "mjs" => "application/javascript",
+        "json" => "application/json",
+        "txt" => "text/plain",
+        "xml" => "application/xml",
+        "svg" => "image/svg+xml",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
         "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "wasm" => "application/wasm",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
         _ => "application/octet-stream",
     }
 }
@@ -130,6 +178,7 @@ fn build_tls_config(
     config.alpn_protocols = match mode {
         Mode::Http1 => vec![b"http/1.1".to_vec()],
         Mode::Http2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        Mode::Plain => unreachable!("plain mode does not use TLS"),
     };
     Ok(Arc::new(config))
 }
@@ -137,20 +186,21 @@ fn build_tls_config(
 async fn serve(
     req: Request<Incoming>,
     doc_root: Arc<PathBuf>,
+    mode: Mode,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let method = req.method().clone();
     let uri_path = req.uri().path().to_string();
 
     let is_head = method == hyper::Method::HEAD;
     if method != hyper::Method::GET && !is_head {
-        log_request(method.as_str(), &uri_path, 0);
+        log_request(method.as_str(), &uri_path, 405, 0);
         return Ok(status_response(405, Bytes::new()));
     }
 
     let resolved = match resolve_safe_path(&doc_root, &uri_path) {
         Ok(p) => p,
         Err(code) => {
-            log_request(method.as_str(), &uri_path, 0);
+            log_request(method.as_str(), &uri_path, code, 0);
             return Ok(status_response(code, Bytes::new()));
         }
     };
@@ -159,37 +209,39 @@ async fn serve(
         Ok(bytes) => {
             let ct = content_type_for(&resolved);
             let body_len = bytes.len();
-            log_request(method.as_str(), &uri_path, body_len);
+            log_request(method.as_str(), &uri_path, 200, body_len);
             let body = if is_head {
                 Bytes::new()
             } else {
                 Bytes::from(bytes)
             };
-            let resp = Response::builder()
+            let mut resp = Response::builder()
                 .status(200)
                 .header("content-type", ct)
-                .header("content-length", body_len.to_string())
-                .body(Full::new(body))
-                .unwrap();
-            Ok(resp)
+                .header("content-length", body_len.to_string());
+            if mode == Mode::Plain {
+                resp = resp.header("cache-control", "no-store");
+            }
+            Ok(resp.body(Full::new(body)).unwrap())
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            log_request(method.as_str(), &uri_path, 0);
+            log_request(method.as_str(), &uri_path, 404, 0);
             Ok(status_response(404, Bytes::from_static(b"nf")))
         }
         Err(e) => {
             eprintln!("serve: IO error reading {}: {e}", resolved.display());
+            log_request(method.as_str(), &uri_path, 500, 0);
             Ok(status_response(500, Bytes::new()))
         }
     }
 }
 
-fn log_request(method: &str, path: &str, body_len: usize) {
+fn log_request(method: &str, path: &str, status: u16, body_len: usize) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
-    println!("[srv {ts:.3}] {method} {path} ({body_len}B)");
+    println!("[srv {ts:.3}] {status} {method} {path} ({body_len}B)");
 }
 
 fn status_response(code: u16, body: Bytes) -> Response<Full<Bytes>> {
@@ -212,27 +264,32 @@ async fn main() -> anyhow::Result<()> {
         Ok(a) => a,
         Err(msg) => {
             eprintln!("{msg}");
-            eprintln!("usage: fixture_server --mode=http1|http2 <port> <doc_root>");
+            eprintln!("usage: fixture_server --mode=http1|http2|plain <port> <doc_root>");
             std::process::exit(2);
         }
     };
 
-    let cert_path = args.doc_root.join("..").join("cert.pem");
-    let key_path = args.doc_root.join("..").join("key.pem");
-    let tls_config = build_tls_config(&cert_path, &key_path, args.mode)?;
-    let acceptor = TlsAcceptor::from(tls_config);
+    let mode = args.mode;
+    let acceptor = if mode == Mode::Plain {
+        None
+    } else {
+        let cert_path = args.doc_root.join("..").join("cert.pem");
+        let key_path = args.doc_root.join("..").join("key.pem");
+        let tls_config = build_tls_config(&cert_path, &key_path, mode)?;
+        Some(TlsAcceptor::from(tls_config))
+    };
 
     let listener = TcpListener::bind(("127.0.0.1", args.port))
         .await
         .with_context(|| format!("binding 127.0.0.1:{}", args.port))?;
     let doc_root = Arc::new(args.doc_root);
-    let mode_str = if args.mode == Mode::Http1 {
-        "http1"
-    } else {
-        "http2"
+    let (scheme, mode_str) = match mode {
+        Mode::Http1 => ("https", "http1"),
+        Mode::Http2 => ("https", "http2"),
+        Mode::Plain => ("http", "plain"),
     };
     println!(
-        "listening on https://127.0.0.1:{}/ doc_root={} mode={mode_str}",
+        "listening on {scheme}://127.0.0.1:{}/ doc_root={} mode={mode_str}",
         args.port,
         doc_root.display()
     );
@@ -242,19 +299,22 @@ async fn main() -> anyhow::Result<()> {
         let acceptor = acceptor.clone();
         let doc_root = Arc::clone(&doc_root);
         tokio::spawn(async move {
-            let Ok(tls) = acceptor.accept(tcp).await else {
-                return;
-            };
-            let io = TokioIo::new(tls);
-            let _ = auto::Builder::new(TokioExecutor::new())
-                .serve_connection(
-                    io,
-                    service_fn(move |req| {
-                        let doc_root = Arc::clone(&doc_root);
-                        async move { serve(req, doc_root).await }
-                    }),
-                )
-                .await;
+            let service = service_fn(move |req| {
+                let doc_root = Arc::clone(&doc_root);
+                async move { serve(req, doc_root, mode).await }
+            });
+            let builder = auto::Builder::new(TokioExecutor::new());
+            match acceptor {
+                Some(acceptor) => {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let _ = builder.serve_connection(TokioIo::new(tls), service).await;
+                }
+                None => {
+                    let _ = builder.serve_connection(TokioIo::new(tcp), service).await;
+                }
+            }
         });
     }
 }
@@ -278,6 +338,12 @@ mod arg_tests {
                 doc_root: PathBuf::from("/tmp/root"),
             }
         );
+    }
+
+    #[test]
+    fn parses_plain_mode() {
+        let got = parse_args(&argv(&["--mode=plain", "4490", "/tmp/root"])).unwrap();
+        assert_eq!(got.mode, Mode::Plain);
     }
 
     #[test]
@@ -320,6 +386,27 @@ mod path_happy_tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn escaped_names_resolve_to_the_file() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a b.css"), b"").unwrap();
+        let got = resolve_safe_path(tmp.path(), "/a%20b.css").unwrap();
+        assert_eq!(got, tmp.path().canonicalize().unwrap().join("a b.css"));
+        assert_eq!(resolve_safe_path(tmp.path(), "/%2e%2e/x"), Err(400));
+    }
+
+    #[test]
+    fn a_directory_resolves_to_its_index_html() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/index.html"), b"<html></html>").unwrap();
+        let got = resolve_safe_path(tmp.path(), "/sub/").unwrap();
+        assert_eq!(
+            got,
+            tmp.path().canonicalize().unwrap().join("sub/index.html")
+        );
+    }
 
     #[test]
     fn root_resolves_to_index_html() {

@@ -15,9 +15,26 @@ use crate::cli::{BenchArgs, SuiteArgs};
 use crate::suite::{Leg, Suite};
 
 pub fn run(args: SuiteArgs) -> Result<()> {
-    let suites_dir = suites_dir();
-    let suite = Suite::load(&suites_dir, &args.suite)?;
+    let suite = Suite::load(&suites_dir(), &args.suite)?;
+    if let Some(t) = suite.workloads.iter().find(|w| w.name.starts_with('_')) {
+        anyhow::bail!(
+            "suite {:?} is a page suite ({:?} is a template, not a workload); run it with \
+             `servoperf page <dir-or-html-file> --suite {}`",
+            suite.name,
+            t.name,
+            suite.name
+        );
+    }
+    run_matrix(&args, &suite, &HashMap::new())
+}
 
+/// Run `suite`'s matrix. A workload named in `defs` is measured as given there
+/// rather than loaded from `workloads/`.
+pub fn run_matrix(
+    args: &SuiteArgs,
+    suite: &Suite,
+    defs: &HashMap<String, crate::workload::Workload>,
+) -> Result<()> {
     let legs: Vec<&Leg> = match &args.legs {
         Some(only) => {
             let wanted: Vec<&str> = only.split(',').map(str::trim).collect();
@@ -61,14 +78,14 @@ pub fn run(args: SuiteArgs) -> Result<()> {
         .unwrap_or_else(|| crate::report::default_out_dir(&suite.name));
     std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
     if args.report_only {
-        return write_comparison(&root, &suite, &legs, &workloads);
+        return write_comparison(&root, suite, &legs, &workloads);
     }
 
     // Held across the whole matrix, not per cell: the gaps between cells — and
     // especially the wait at an engine-switch prompt — are exactly when the
     // screen would sleep, and a screen-off freezes the app mid-campaign.
     let _screen_guard =
-        crate::ohos::OhosTarget::from_args(&leg_ohos_args(&args, &suite, legs[0], None))
+        crate::ohos::OhosTarget::from_args(&leg_ohos_args(args, suite, legs[0], None))
             .guard_screen_awake();
 
     eprintln!(
@@ -91,7 +108,8 @@ pub fn run(args: SuiteArgs) -> Result<()> {
             tracing_filter: suite.defaults.tracing_filter.clone(),
             live: args.live,
             lcp: false,
-            ohos: leg_ohos_args(&args, &suite, leg, Some(w)),
+            workload_def: defs.get(&w.name).cloned(),
+            ohos: leg_ohos_args(args, suite, leg, Some(w)),
         };
         if let Err(e) = crate::cmd::bench::run(bench) {
             eprintln!("suite: {} / {} FAILED: {e:#}", leg.id, w.name);
@@ -112,7 +130,7 @@ pub fn run(args: SuiteArgs) -> Result<()> {
     let interleave = legs.iter().all(|l| l.bundle.is_some() && l.setup.is_none());
     if interleave {
         for leg in &legs {
-            prepare_leg(leg, &args, &suite)?;
+            prepare_leg(leg, args, suite)?;
         }
         eprintln!("suite: legs interleaved per workload, order alternating");
         'workloads: for (i, w) in workloads.iter().enumerate() {
@@ -133,7 +151,7 @@ pub fn run(args: SuiteArgs) -> Result<()> {
             if crate::cancel::requested() {
                 break;
             }
-            prepare_leg(leg, &args, &suite)?;
+            prepare_leg(leg, args, suite)?;
             for w in &workloads {
                 if crate::cancel::requested() {
                     eprintln!("suite: cancelled; skipping the rest of the matrix");
@@ -144,7 +162,7 @@ pub fn run(args: SuiteArgs) -> Result<()> {
         }
     }
 
-    if let Err(e) = write_comparison(&root, &suite, &legs, &workloads) {
+    if let Err(e) = write_comparison(&root, suite, &legs, &workloads) {
         eprintln!("suite: could not write the comparison: {e:#}");
     }
     eprintln!("\nsuite {} complete: {}", suite.name, root.display());
@@ -152,6 +170,11 @@ pub fn run(args: SuiteArgs) -> Result<()> {
         eprintln!("failed cells: {}", failures.join(", "));
     }
     println!("{}", root.display());
+    let cells = legs.len() * workloads.len();
+    anyhow::ensure!(
+        cells == 0 || failures.len() < cells,
+        "every cell of the matrix failed ({cells}); see the errors above"
+    );
     Ok(())
 }
 
@@ -271,6 +294,9 @@ fn leg_ohos_args(
     }
     if let Some(v) = suite.defaults.with_instructions {
         ohos.with_instructions = v;
+    }
+    if args.no_instructions {
+        ohos.with_instructions = false;
     }
     if let Some(v) = suite.defaults.instructions_period {
         ohos.instructions_period = v;
@@ -558,6 +584,17 @@ fn write_comparison(
         writeln!(s).unwrap();
     }
 
+    if cells.contains_key("FirstContentfulPaint")
+        && cells.keys().any(|m| m.starts_with("instructions."))
+    {
+        notes.push(
+            "`FirstContentfulPaint` was measured while hiperf sampled every thread, which slows \
+             the load it is timing (on a PLR-AL00 a static page's first paint went from 0.76 s \
+             to 1.42 s under Servo and 1.18 s to 2.00 s under ArkWeb). Compare first-paint \
+             times from a run with `--no-instructions`."
+                .to_string(),
+        );
+    }
     if crate::cancel::requested() {
         notes.push(
             "the campaign was interrupted, so some cells hold fewer iterations than the \

@@ -211,6 +211,17 @@ pub enum Fixture {
     Http1 { port: u16, doc_root: PathBuf },
     /// Same as `Http1` but negotiates HTTP/2 via ALPN.
     Http2 { port: u16, doc_root: PathBuf },
+    /// A directory of static pages served over cleartext HTTP/1.1 with
+    /// caching forbidden, so every engine loads it the same way: no
+    /// certificate to trust, no disk cache that serves one engine's later
+    /// iterations locally. `dir` is resolved under
+    /// `<workloads_dir>/../fixtures/` if not absolute. What `servoperf page`
+    /// serves.
+    Static {
+        dir: PathBuf,
+        #[serde(default = "default_static_port")]
+        port: u16,
+    },
     /// Replay a Web Page Replay archive through a local CONNECT shim so
     /// servoshell talks to a deterministic on-disk recording instead of
     /// the live origin. On first use (archive missing), a single
@@ -244,12 +255,17 @@ impl Fixture {
     /// connects to the WPR server itself.
     pub fn ports_to_forward(&self) -> Vec<u16> {
         match self {
-            Fixture::Http1 { port, .. } | Fixture::Http2 { port, .. } => vec![*port],
+            Fixture::Http1 { port, .. }
+            | Fixture::Http2 { port, .. }
+            | Fixture::Static { port, .. } => vec![*port],
             Fixture::WprReplay { tunnel_port, .. } => vec![*tunnel_port],
         }
     }
 }
 
+pub fn default_static_port() -> u16 {
+    4490
+}
 fn default_wpr_port() -> u16 {
     4443
 }

@@ -137,12 +137,12 @@ grouping, with a percentage column when there are exactly two legs. A failing
 cell is reported and the run continues.
 
 Each cell reads `median ±cv (n)`, because a median alone cannot say whether a
-difference between legs is a result. A delta in **bold** exceeds the combined
-standard error of the two legs; one marked *within noise* does not, and
-repeating the campaign will move it. Cells whose spread passes 20% are flagged
-`⚠` and get a note saying what size of difference is resolvable at that `n` —
-computed from both legs' error, the same floor the table's bold/within-noise
-decision uses, so the two cannot disagree. That makes "raise `iterations`" a
+difference between legs is a result. The delta column is the difference of the
+two medians beside it, followed by a 95% bootstrap interval on it, e.g.
+`+12.3% [+8.1, +15.0]`; it is **bold** when the interval excludes zero. With
+fewer than 5 iterations in either leg the delta is printed with *no verdict*.
+Cells whose spread passes 20% are flagged `⚠` and get a note saying roughly what
+size of difference is resolvable at that `n`, which makes "raise `iterations`" a
 judgement about the effect you are chasing rather than a guess. Iterations far from their median — Tukey's far-out rule *and* at
 least 25% off, so tight metrics do not raise false alarms — are named
 individually rather than trimmed: an outlier is usually evidence about the run,
@@ -173,8 +173,8 @@ Useful for a first pass:
 servoperf suite mossel --only mossel-index --legs arkweb --iterations 1
 ```
 
-Budget ~7 minutes per workload per leg. The `-scroll` variants need `uitest` on
-the device.
+Budget ~7 minutes per workload per leg. The `-scroll` variants inject swipes
+with `uinput`, at coordinates for a PLR-AL00 screen.
 
 Both engines are launched with `--chrome=none`, which hides the app's own
 toolbar so the web content fills the window. That is not cosmetic: the toolbar
@@ -192,6 +192,69 @@ Two things about the workloads:
 - **Launch the app once by hand after installing it.** Without `--bin`,
   servoperf skips its install cooldown and warmup, and the first cold launch
   after an install runs ~3x slow, skewing iteration 0.
+
+## 4a. Your own static page
+
+To measure a page of your own rather than a site, point `servoperf page` at a
+directory holding it and everything it loads, or at one HTML file:
+
+```sh
+servoperf page ./my-page/                 # opens my-page/index.html
+servoperf page ./pages/grid.html          # serves ./pages/, opens grid.html
+servoperf page ./my-page/ --only load --legs servo --iterations 3
+```
+
+It runs the page suite [`suites/page-plr.toml`](../suites/page-plr.toml): both
+legs of `mossel-plr` and two measurements, interleaved like any suite:
+
+- `<name>-load`: a cold load, with a 10 s window so late layouts (web fonts,
+  images, timers) are counted too.
+- `<name>-scroll`: the load, then six swipes down and six back up, 2 s apart,
+  in a 42 s window.
+
+The two measurements are the templates `workloads/_page-load.toml` and
+`workloads/_page-scroll.toml`. Edit those to change the gesture or add a
+measurement; a new `_page-<kind>.toml` listed in the suite becomes
+`<name>-<kind>`. The swipe coordinates are pixels for a PLR-AL00 and need
+changing on another screen.
+
+Output is `out/page-<name>-<timestamp>/` (or `--out`), laid out like a
+suite's, with `comparison.md` at the top.
+
+The page is served from the host, not copied to the device. `fixture_server`
+serves the directory over cleartext HTTP on `127.0.0.1:4490` (`--port`), and
+`hdc rport` makes that address reach the host from the device. Two
+alternatives were ruled out:
+
+- **Files pushed into each app's sandbox:** the ArkWeb test wrapper does not
+  enable `fileAccess`, and `file://` changes how both engines load subresources.
+- **A server on the device:** there is none; its toybox has no `httpd` or
+  `nc`.
+
+Every response carries `cache-control: no-store`. ArkWeb keeps a disk cache
+between launches and Servo by default does not, so otherwise ArkWeb's later
+iterations would read the page from disk while every Servo iteration fetched
+it.
+
+First paint in these results is slowed by the instruction sampling that runs
+through the whole load. hiperf copies every sampled thread's stack, and on a
+PLR-AL00 that took a static page's first paint from 0.72 s to 1.42 s under
+Servo and from 1.14 s to 2.00 s under ArkWeb, which also narrows the gap
+between them. `comparison.md` notes this whenever it prints both. To compare
+first paint, measure it in a separate run without sampling:
+
+```sh
+servoperf page ./my-page/ --only load --no-instructions
+```
+
+Each cell keeps the server's request log as `fixture_server.log`. A path the
+page asked for but the directory lacks is reported as a warning, per cell and
+again at the end, because a page measured without its fonts or images did less
+work than it would with them.
+
+The same fixture works in a hand-written workload:
+`[fixture] kind = "static"`, `dir = "<absolute path, or one under fixtures/>"`,
+and `url = "http://127.0.0.1:4490/<page>"`.
 
 ### When sampling starts
 
