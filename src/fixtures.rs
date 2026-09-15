@@ -611,7 +611,7 @@ mod tests {
             fixture: Some(fx),
             scenario: None,
             steps: vec![],
-            lcp: true,
+            lcp: false,
         }
     }
 

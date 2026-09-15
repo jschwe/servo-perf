@@ -38,7 +38,7 @@ pub fn run(args: RegressionArgs) -> Result<()> {
         out: args.out.clone(),
         tracing_filter: None,
         live: false,
-        no_lcp: false,
+        lcp: false,
         ohos: args.ohos.clone(),
     };
     bench::run(bench_args)?;

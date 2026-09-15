@@ -25,18 +25,17 @@ pub struct Workload {
     #[serde(default)]
     pub steps: Vec<Step>,
     /// Launch Servo with `largest_contentful_paint_enabled=true`, so the run
-    /// reports LCP. Servo ships with the pref *off*, and turning it on is not
-    /// free: since upstream #47212 every painted text fragment on every
-    /// display-list rebuild walks the scroll tree to its root, hashes its node
-    /// and pushes a rect — +14% display-list instructions per layout on
-    /// mossel-index, measured on a PLR-AL00. Turn it off (`bench --no-lcp`) to
-    /// measure Servo as it ships.
-    #[serde(default = "default_lcp")]
+    /// can report LCP. Off by default, as Servo ships.
+    ///
+    /// Turning it on is not free: since upstream #47212 every painted text
+    /// fragment on every display-list rebuild walks the scroll tree to its
+    /// root, hashes its node and pushes a rect. Measured on a PLR-AL00 with
+    /// ohos-main (upstream 2026-08-28), mossel-index: display-list instructions
+    /// per layout -16.5% with the pref off, whole reflow -15.9%. And builds
+    /// after mid-August emitted no LCP marker in a 20 s load even with it on,
+    /// so it bought nothing. `bench --lcp` turns it on for a run.
+    #[serde(default)]
     pub lcp: bool,
-}
-
-fn default_lcp() -> bool {
-    true
 }
 
 /// One device-side action executed inside the capture window, so a workload

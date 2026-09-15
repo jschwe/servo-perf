@@ -1264,8 +1264,8 @@ fn workload_args_to_aa_params(
     }
     synthetic.push(format!("--tracing-filter={}", workload.tracing_filter));
     // LCP fragment-area accounting is gated by an off-by-default pref
-    // (`largest_contentful_paint_enabled`). servoperf turns it on unless the
-    // workload says otherwise — see `Workload::lcp` for what it costs.
+    // (`largest_contentful_paint_enabled`). servoperf leaves it off, as Servo
+    // ships, unless the workload asks — see `Workload::lcp` for what it costs.
     // Mirrored in `crate::runner::run_once` for the local path.
     if workload.lcp {
         synthetic.push("--pref=largest_contentful_paint_enabled=true".to_string());
@@ -1816,7 +1816,7 @@ mod tests {
             fixture: None,
             scenario: None,
             steps: vec![],
-            lcp: true,
+            lcp: false,
         };
         // Engine-scoped now: a workload is shared by every engine, and
         // servoshell exits on an argument it does not recognise, so a
@@ -1846,25 +1846,22 @@ mod tests {
         assert_eq!(parse_hiperf_count(out, "Nonexistent:"), None);
     }
 
-    /// Servo ships with LCP accounting off; a workload that says `lcp = false`
-    /// must launch it that way, or `--no-lcp` measures nothing.
+    /// Servo ships with LCP accounting off and so do servoperf runs, unless
+    /// the workload (or `bench --lcp`) asks for it.
     #[test]
     fn lcp_pref_follows_the_workload() {
         let mut w: crate::workload::Workload =
             toml::from_str("name = \"w\"\nurl = \"https://example.com/\"").unwrap();
-        assert!(
-            w.lcp,
-            "LCP stays on by default so existing runs keep reporting it"
-        );
-        let on = super::workload_args_to_aa_params(&w, None, &[], &[]);
-        assert!(on
-            .iter()
-            .any(|a| a.contains("largest_contentful_paint_enabled=true")));
-        w.lcp = false;
+        assert!(!w.lcp, "LCP is off by default, as Servo ships");
         let off = super::workload_args_to_aa_params(&w, None, &[], &[]);
         assert!(!off
             .iter()
             .any(|a| a.contains("largest_contentful_paint_enabled")));
+        w.lcp = true;
+        let on = super::workload_args_to_aa_params(&w, None, &[], &[]);
+        assert!(on
+            .iter()
+            .any(|a| a.contains("largest_contentful_paint_enabled=true")));
     }
 
     use crate::workload::Step;
@@ -2055,7 +2052,7 @@ mod tests {
             fixture: None,
             scenario: None,
             steps: vec![],
-            lcp: true,
+            lcp: false,
         };
         let aa = workload_args_to_aa_params(&w, Some("http://127.0.0.1:9999"), &[], &[]);
         // headless / exit dropped
