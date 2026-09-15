@@ -23,6 +23,42 @@ pub fn run(args: PageArgs) -> Result<()> {
     });
 
     let templates = Suite::load(&manifest.join("suites"), &args.suite)?;
+    let root = args
+        .out
+        .clone()
+        .unwrap_or_else(|| crate::report::default_out_dir(&format!("page-{name}")));
+    let suite_args = SuiteArgs {
+        suite: templates.name.clone(),
+        legs: args.legs.clone(),
+        only: None,
+        iterations: args.iterations,
+        out: Some(root.clone()),
+        bin: args.bin.clone(),
+        assume_yes: args.assume_yes,
+        report_only: false,
+        live: false,
+        no_instructions: args.no_instructions,
+        ohos: args.ohos.clone(),
+    };
+
+    // Where each measurement opens the page, and what puts it there.
+    let (url, fixture) = if args.file {
+        (
+            format!("file://{}/{name}/{entry}", crate::ohos::PAGES_ON_DEVICE),
+            Fixture::DeviceFiles {
+                dir: dir.clone(),
+                name: name.clone(),
+            },
+        )
+    } else {
+        (
+            format!("http://127.0.0.1:{}/{entry}", args.port),
+            Fixture::Static {
+                dir: dir.clone(),
+                port: args.port,
+            },
+        )
+    };
     let wanted: Option<Vec<&str>> = args
         .only
         .as_deref()
@@ -45,11 +81,8 @@ pub fn run(args: PageArgs) -> Result<()> {
         let mut w = workload::load(&manifest.join("workloads"), &t.name)?;
         let cell = format!("{name}-{kind}");
         w.name = cell.clone();
-        w.url = format!("http://127.0.0.1:{}/{entry}", args.port);
-        w.fixture = Some(Fixture::Static {
-            dir: dir.clone(),
-            port: args.port,
-        });
+        w.url = url.clone();
+        w.fixture = Some(fixture.clone());
         defs.insert(cell.clone(), w);
         suite.workloads.push(SuiteWorkload {
             name: cell,
@@ -72,28 +105,13 @@ pub fn run(args: PageArgs) -> Result<()> {
         }
     }
 
-    eprintln!(
-        "page: serving {} as http://127.0.0.1:{}/{entry}",
-        dir.display(),
-        args.port
-    );
-    let root = args
-        .out
-        .clone()
-        .unwrap_or_else(|| crate::report::default_out_dir(&format!("page-{name}")));
-    let suite_args = SuiteArgs {
-        suite: suite.name.clone(),
-        legs: args.legs,
-        only: None,
-        iterations: args.iterations,
-        out: Some(root.clone()),
-        bin: args.bin,
-        assume_yes: args.assume_yes,
-        report_only: false,
-        live: false,
-        no_instructions: args.no_instructions,
-        ohos: args.ohos,
-    };
+    match fixture {
+        Fixture::DeviceFiles { .. } => eprintln!(
+            "page: copying {} into each app before each cell, opened as {url}",
+            dir.display()
+        ),
+        _ => eprintln!("page: serving {} as {url}", dir.display()),
+    }
     super::suite::run_matrix(&suite_args, &suite, &defs)?;
 
     // Repeated here because each cell's warning has long scrolled away.

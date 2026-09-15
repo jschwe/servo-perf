@@ -261,6 +261,38 @@ impl OhosTarget {
         crate::instructions::symbols::build_id_from_elf_prefix(&bytes)
     }
 
+    /// Copy the directory `local` into this bundle's files directory as
+    /// `<PAGES_ON_DEVICE>/<name>`, replacing any earlier copy so a file
+    /// deleted locally cannot linger. Goes through `hdc file send -b`, so the
+    /// app must be debuggable.
+    pub fn push_page(&self, local: &Path, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            is_plain_dir_name(name),
+            "page name {name:?} is not a plain directory name"
+        );
+        let pages = PAGES_ON_DEVICE.trim_start_matches('/');
+        let rel = format!("{pages}/{name}");
+        self.hdc(&[
+            "shell",
+            "-b",
+            &self.bundle,
+            &format!("rm -rf {rel} && mkdir -p {pages}"),
+        ])
+        .with_context(|| format!("clearing {rel} in {}", self.bundle))?;
+        let local = local
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("{} is not valid UTF-8", local.display()))?;
+        let out = self.hdc(&["file", "send", "-b", &self.bundle, local, &rel])?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        anyhow::ensure!(
+            text.contains("FileTransfer finish"),
+            "could not copy the page into {}: {} (`hdc file send -b` needs a debuggable app)",
+            self.bundle,
+            text.trim()
+        );
+        Ok(())
+    }
+
     /// Run one `hdc shell <command>` on the device, for a caller that has a
     /// command string rather than an argv (a suite leg's `setup`). The string
     /// reaches the device's shell verbatim.
@@ -1056,6 +1088,19 @@ pub struct RunArtifact {
     /// `None` if the read failed.
     pub thermal_after_milli_c: Option<i64>,
 }
+
+/// `name` ends up in an `rm -rf` on the device: allow only names that cannot
+/// climb out of the directory they are joined to, nor be empty.
+fn is_plain_dir_name(name: &str) -> bool {
+    name.chars().any(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
+/// Where `device-files` fixtures land, as the app sees its own sandbox. The
+/// same path in every app, each in its own sandbox.
+pub const PAGES_ON_DEVICE: &str = "/data/storage/el2/base/files/servoperf-page";
 
 /// How an iteration's instruction capture is being taken.
 enum HiperfCapture {
@@ -2147,6 +2192,15 @@ mod tests {
         let slices = parse_hitrace_text(txt);
         assert_eq!(slices.len(), 1);
         assert_eq!(slices[0].name, "x");
+    }
+
+    #[test]
+    fn only_plain_names_reach_the_devices_rm() {
+        assert!(super::is_plain_dir_name("static-demo"));
+        assert!(super::is_plain_dir_name("v1.2_final"));
+        for bad in ["", "..", ".", "a/b", "../x", "a b", "*", "x;rm"] {
+            assert!(!super::is_plain_dir_name(bad), "{bad:?}");
+        }
     }
 
     #[test]

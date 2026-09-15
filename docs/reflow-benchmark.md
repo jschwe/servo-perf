@@ -221,17 +221,32 @@ changing on another screen.
 Output is `out/page-<name>-<timestamp>/` (or `--out`), laid out like a
 suite's, with `comparison.md` at the top.
 
-The page is served from the host, not copied to the device. `fixture_server`
-serves the directory over cleartext HTTP on `127.0.0.1:4490` (`--port`), and
-`hdc rport` makes that address reach the host from the device. Two
-alternatives were ruled out:
+By default the page is served from the host: `fixture_server` serves the
+directory over cleartext HTTP on `127.0.0.1:4490` (`--port`), and `hdc rport`
+makes that address reach the host from the device. The device itself has no
+HTTP server; its toybox has no `httpd` or `nc`.
 
-- **Files pushed into each app's sandbox:** the ArkWeb test wrapper does not
-  enable `fileAccess`, and `file://` changes how both engines load subresources.
-- **A server on the device:** there is none; its toybox has no `httpd` or
-  `nc`.
+With `--file`, the directory is instead copied into each app's own files
+directory before every cell, as `/data/storage/el2/base/files/servoperf-page/<name>/`,
+and opened as a `file://` URL. That takes the host connection out of the load
+entirely. It has three requirements and one limitation:
 
-Every response carries `cache-control: no-store`. ArkWeb keeps a disk cache
+- **Debuggable apps:** the copy goes through `hdc file send -b`.
+- **Copying per cell:** installing with `--bin` uninstalls first, which empties
+  the app's files directory.
+- **Wrapper support:** the ArkWeb test app only opens `file://` pages since
+  arkweb-test `1c4cc72` turned on `fileAccess`, which has been off by default
+  since API 12.
+- **The limitation:** Chromium gives every `file://` page an opaque origin, so
+  under ArkWeb a page's `fetch`, XHR and module imports of neighbouring files
+  fail. Use HTTP for pages that need them.
+
+A hand-written workload can do the same with `[fixture] kind = "device-files"`,
+`dir = "..."` and `name = "..."`, opening
+`file:///data/storage/el2/base/files/servoperf-page/<name>/<page>`. Missing
+files are not reported in this mode, since there is no request log.
+
+Every HTTP response carries `cache-control: no-store`. ArkWeb keeps a disk cache
 between launches and Servo by default does not, so otherwise ArkWeb's later
 iterations would read the page from disk while every Servo iteration fetched
 it.

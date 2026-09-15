@@ -106,6 +106,15 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let driver = build_record_driver(&target, args.ohos.ohos_record_seconds);
     let (fx, _rport): (Option<FixtureHandle>, Option<crate::ohos::RPortGuard>) =
         match (w.fixture.as_ref(), &target) {
+            // Copied per cell, after any install: `install_hap` uninstalls
+            // first, which empties the app's files directory.
+            (Some(workload::Fixture::DeviceFiles { dir, name }), Target::Ohos(ohos)) => {
+                ohos.push_page(&fixtures::fixture_dir(&workloads_dir, dir)?, name)?;
+                (None, None)
+            }
+            (Some(workload::Fixture::DeviceFiles { .. }), Target::Local { .. }) => {
+                anyhow::bail!("a device-files fixture needs --ohos")
+            }
             (Some(fx_def), Target::Ohos(ohos)) => {
                 let handle = fixtures::spawn(&workloads_dir, &w, driver.as_ref(), &out_dir)?;
                 let guard = ohos.setup_rport(&fx_def.ports_to_forward())?;

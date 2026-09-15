@@ -222,6 +222,11 @@ pub enum Fixture {
         #[serde(default = "default_static_port")]
         port: u16,
     },
+    /// A directory of static pages copied into the app's own files directory
+    /// before each cell, as `<PAGES_ON_DEVICE>/<name>`, for the workload to
+    /// open as a `file://` URL. OHOS only, and the app must be debuggable.
+    /// `dir` resolves as for `Static`.
+    DeviceFiles { dir: PathBuf, name: String },
     /// Replay a Web Page Replay archive through a local CONNECT shim so
     /// servoshell talks to a deterministic on-disk recording instead of
     /// the live origin. On first use (archive missing), a single
@@ -259,6 +264,7 @@ impl Fixture {
             | Fixture::Http2 { port, .. }
             | Fixture::Static { port, .. } => vec![*port],
             Fixture::WprReplay { tunnel_port, .. } => vec![*tunnel_port],
+            Fixture::DeviceFiles { .. } => vec![],
         }
     }
 }
@@ -398,6 +404,12 @@ url = "https://example.test/"
             tunnel_port: 4480,
         };
         assert_eq!(f.ports_to_forward(), vec![4480]);
+        // device-files → nothing: the app reads its own sandbox.
+        let f = Fixture::DeviceFiles {
+            dir: "www".into(),
+            name: "www".into(),
+        };
+        assert!(f.ports_to_forward().is_empty());
     }
 
     #[test]

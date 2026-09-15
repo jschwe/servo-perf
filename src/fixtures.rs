@@ -102,6 +102,9 @@ pub fn spawn(
         Fixture::Static { dir, port } => {
             spawn_local_server(workloads_dir, "plain", *port, dir, out_dir)
         }
+        Fixture::DeviceFiles { .. } => {
+            anyhow::bail!("a device-files fixture is copied to the device, not spawned")
+        }
         Fixture::WprReplay {
             archive,
             wpr_port,
@@ -116,6 +119,16 @@ pub fn spawn(
             out_dir,
         ),
     }
+}
+
+/// Where a fixture's `dir` lives on the host: as given if absolute, else under
+/// `<workloads_dir>/../fixtures/`.
+pub fn fixture_dir(workloads_dir: &Path, dir: &Path) -> Result<PathBuf> {
+    Ok(workloads_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("workloads_dir has no parent"))?
+        .join("fixtures")
+        .join(dir))
 }
 
 // -- Http1 / Http2 static-file fixtures ---------------------------------

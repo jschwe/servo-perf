@@ -351,6 +351,14 @@ pub struct PageArgs {
     /// Host port the page is served on, and forwarded to on the device.
     #[arg(long, default_value_t = crate::workload::default_static_port())]
     pub port: u16,
+    /// Copy the page into each app's files directory and open it as a
+    /// `file://` URL, instead of serving it from the host. Takes the host
+    /// connection out of the load, but both apps must be debuggable (it goes
+    /// through `hdc file send -b`), the ArkWeb wrapper needs `fileAccess` on,
+    /// and under ArkWeb a page's `fetch`, XHR and module imports of its
+    /// neighbours fail: Chromium gives every `file://` page an opaque origin.
+    #[arg(long)]
+    pub file: bool,
     /// Only these measurements, comma-separated — the suite's template names
     /// without their `_page-` prefix, e.g. `load` or `scroll`.
     #[arg(long)]
