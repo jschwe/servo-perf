@@ -304,6 +304,21 @@ mod tests {
         crate::cancel::clear_for_test();
     }
 
+    /// The delta must come from the medians printed beside it: one outlier
+    /// drags the mean of `b` to +18% while its median is +2%.
+    #[test]
+    fn the_delta_is_a_bootstrap_of_the_medians() {
+        let a = vec![100.0, 101.0, 99.0, 100.0, 102.0, 98.0, 100.0];
+        let b = vec![102.0, 103.0, 101.0, 102.0, 104.0, 100.0, 220.0];
+        let cell = super::format_delta(Some(&a), Some(&b));
+        assert!(cell.starts_with(" **+2.0% ["), "{cell}");
+        let noisy = vec![60.0, 140.0, 100.0, 70.0, 130.0, 90.0, 110.0];
+        let cell = super::format_delta(Some(&a), Some(&noisy));
+        assert!(!cell.contains("**"), "{cell}");
+        let cell = super::format_delta(Some(&a[..3].to_vec()), Some(&b[..3].to_vec()));
+        assert!(cell.contains("no verdict"), "{cell}");
+    }
+
     #[test]
     fn metrics_render_in_their_own_units() {
         assert_eq!(
@@ -536,18 +551,7 @@ fn write_comparison(
                 }
             }
             if legs.len() == 2 {
-                match (stats[0], stats[1]) {
-                    (Some(a), Some(b)) if a.mean != 0.0 => {
-                        let delta = 100.0 * (b.mean - a.mean) / a.mean;
-                        let noise = pairwise.unwrap_or(0.0);
-                        if delta.abs() < noise {
-                            write!(s, " {delta:+.1}% (within noise, ±{noise:.1}%) |").unwrap();
-                        } else {
-                            write!(s, " **{delta:+.1}%** |").unwrap();
-                        }
-                    }
-                    _ => write!(s, " — |").unwrap(),
-                }
+                s.push_str(&format_delta(samples_by_leg[0], samples_by_leg[1]));
             }
             writeln!(s).unwrap();
         }
@@ -581,6 +585,35 @@ fn write_comparison(
     std::fs::write(&path, s).with_context(|| format!("writing {}", path.display()))?;
     eprintln!("suite: comparison written to {}", path.display());
     Ok(())
+}
+
+/// The delta column of the comparison: the difference of the two medians, with
+/// its bootstrap interval, bold only when that interval excludes zero.
+fn format_delta(a: Option<&Vec<f64>>, b: Option<&Vec<f64>>) -> String {
+    let (Some(a), Some(b)) = (a, b) else {
+        return " — |".to_string();
+    };
+    if let Some((d, lo, hi)) = crate::stats::bootstrap_median_delta(a, b) {
+        let text = format!(
+            "{:+.1}% [{:+.1}, {:+.1}]",
+            100.0 * d,
+            100.0 * lo,
+            100.0 * hi
+        );
+        return if lo > 0.0 || hi < 0.0 {
+            format!(" **{text}** |")
+        } else {
+            format!(" {text} |")
+        };
+    }
+    match (crate::stats::spread(a), crate::stats::spread(b)) {
+        (Some(sa), Some(sb)) if sa.median != 0.0 => format!(
+            " {:+.1}% (n<{}, no verdict) |",
+            100.0 * (sb.median - sa.median) / sa.median,
+            crate::stats::MIN_N_FOR_VERDICT
+        ),
+        _ => " — |".to_string(),
+    }
 }
 
 /// The metrics worth putting side by side; the per-cell report keeps the rest.
