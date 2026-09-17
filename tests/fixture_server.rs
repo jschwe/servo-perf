@@ -107,9 +107,9 @@ async fn http1_serves_png_with_correct_content_type() {
 }
 
 /// Plain mode serves any directory — no certificate beside it — over
-/// cleartext, and forbids caching so no engine can skip later fetches.
+/// cleartext, reusable only briefly and with nothing to revalidate against.
 #[tokio::test]
-async fn plain_serves_cleartext_and_forbids_caching() {
+async fn plain_serves_cleartext_briefly_cacheable() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("index.html"), b"<p>hi</p>").unwrap();
     std::fs::write(root.path().join("font.woff2"), b"wOF2").unwrap();
@@ -120,7 +120,9 @@ async fn plain_serves_cleartext_and_forbids_caching() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.headers().get("cache-control").unwrap(), "no-store");
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "max-age=5");
+    assert!(resp.headers().get("last-modified").is_none());
+    assert!(resp.headers().get("etag").is_none());
     assert_eq!(resp.bytes().await.unwrap().as_ref(), b"<p>hi</p>");
     let resp = client()
         .get(format!("http://127.0.0.1:{}/font.woff2", srv.port))

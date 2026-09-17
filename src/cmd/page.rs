@@ -263,5 +263,11 @@ mod tests {
             last + 1000 <= window * 1000,
             "the last swipe ({last} ms) must finish inside the {window} s window"
         );
+        // fixture_server's plain responses stay fresh for 5 s; a shorter window
+        // would let one iteration's responses serve the next from disk cache.
+        for w in &suite.workloads {
+            let window = suite.capture_seconds_for(w).unwrap();
+            assert!(window > 5, "{}: {window} s window", w.name);
+        }
     }
 }

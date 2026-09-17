@@ -15,11 +15,20 @@ use tokio_rustls::TlsAcceptor;
 enum Mode {
     Http1,
     Http2,
-    /// Cleartext HTTP/1.1 with `cache-control: no-store`, for pages that
-    /// several engines load: none of them has to trust a certificate, and no
-    /// engine gets to serve a later iteration from its disk cache.
+    /// Cleartext HTTP/1.1 with a short `max-age` and no validators, for pages
+    /// that several engines load: none of them has to trust a certificate, and
+    /// no engine gets to serve a later iteration from its disk cache.
     Plain,
 }
+
+/// How long a `plain` response may be reused. Long enough for a response to be
+/// reused within one page load: Servo's HTML prefetch only warms the HTTP
+/// cache, so under `no-store` every prefetched script, image and stylesheet
+/// was downloaded twice (17 requests for a page of 10 files, against 10 with
+/// this). Short enough to have expired by the next iteration, which is at
+/// least one capture window later; with no `Last-Modified` or `ETag` to
+/// revalidate against, an expired response is fetched again in full.
+const PLAIN_MAX_AGE_SECONDS: u64 = 5;
 
 #[derive(Debug, PartialEq)]
 struct Args {
@@ -220,7 +229,7 @@ async fn serve(
                 .header("content-type", ct)
                 .header("content-length", body_len.to_string());
             if mode == Mode::Plain {
-                resp = resp.header("cache-control", "no-store");
+                resp = resp.header("cache-control", format!("max-age={PLAIN_MAX_AGE_SECONDS}"));
             }
             Ok(resp.body(Full::new(body)).unwrap())
         }

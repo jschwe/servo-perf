@@ -246,10 +246,15 @@ A hand-written workload can do the same with `[fixture] kind = "device-files"`,
 `file:///data/storage/el2/base/files/servoperf-page/<name>/<page>`. Missing
 files are not reported in this mode, since there is no request log.
 
-Every HTTP response carries `cache-control: no-store`. ArkWeb keeps a disk cache
-between launches and Servo by default does not, so otherwise ArkWeb's later
-iterations would read the page from disk while every Servo iteration fetched
-it.
+Every HTTP response carries `cache-control: max-age=5` and no `Last-Modified`
+or `ETag`. ArkWeb keeps a disk cache between launches and Servo by default does
+not. A response that outlived one iteration would let ArkWeb read the page from
+disk while every Servo iteration fetched it. Five seconds is shorter than any
+capture window, and an expired response has nothing to revalidate against, so
+each iteration fetches everything again. It was `no-store` until 2026-09-17,
+but that doubled Servo's downloads: its HTML prefetch only warms the HTTP
+cache, so every prefetched script, image and stylesheet was fetched twice. On
+a page of 10 files that was 17 requests instead of 10.
 
 ArkWeb's first paint is taken from Blink's own
 `PaintTiming::SetFirstContentfulPaintPresentation` marker, not from the test
