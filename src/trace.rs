@@ -22,6 +22,10 @@ pub struct Phase {
     /// first-occurrence value is uninformative.
     #[serde(default)]
     pub aggregate: bool,
+    /// Other span names that mark the same moment in another engine. A
+    /// milestone is taken from the earliest span matching `name` or any alias.
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -429,7 +433,11 @@ pub fn analyse(
             });
             continue;
         }
-        if let Some(s) = first_by_name.get(phase.name.as_str()) {
+        let first = std::iter::once(phase.name.as_str())
+            .chain(phase.aliases.iter().map(String::as_str))
+            .filter_map(|n| first_by_name.get(n))
+            .min_by_key(|s| s.ts_ns);
+        if let Some(s) = first {
             let ts_ms = rel_ms(s.ts_ns);
             let dur_ms = s.dur_ns as f64 / 1_000_000.0;
             if phase.is_milestone {
@@ -549,18 +557,21 @@ flag_threshold_ms = 10
                     owner_thread: "main".into(),
                     is_milestone: false,
                     aggregate: false,
+                    aliases: vec![],
                 },
                 Phase {
                     name: "B".into(),
                     owner_thread: "main".into(),
                     is_milestone: false,
                     aggregate: false,
+                    aliases: vec![],
                 },
                 Phase {
                     name: "FirstContentfulPaint".into(),
                     owner_thread: "main".into(),
                     is_milestone: true,
                     aggregate: false,
+                    aliases: vec![],
                 },
             ],
             edges: vec![Edge {
@@ -631,6 +642,7 @@ flag_threshold_ms = 10
                 owner_thread: "main".into(),
                 is_milestone: true,
                 aggregate: false,
+                aliases: vec![],
             }],
             edges: vec![],
         };
@@ -649,6 +661,34 @@ flag_threshold_ms = 10
         );
     }
 
+    /// ArkWeb's app-side first-paint marker arrives ~150 ms after Blink's own;
+    /// the milestone must come from whichever named span fired first.
+    #[test]
+    fn a_milestone_takes_the_earliest_of_its_aliases() {
+        let registry = SpanRegistry {
+            phases: vec![Phase {
+                name: "FirstContentfulPaint".into(),
+                owner_thread: "main".into(),
+                is_milestone: true,
+                aggregate: false,
+                aliases: vec!["PaintTiming::SetFirstContentfulPaintPresentation".into()],
+            }],
+            edges: vec![],
+        };
+        let slices = vec![
+            slice("start", 0.0, 1.0),
+            slice("FirstContentfulPaint", 350.0, 0.0),
+            slice(
+                "PaintTiming::SetFirstContentfulPaintPresentation",
+                200.0,
+                0.0,
+            ),
+        ];
+        let r = super::analyse(&slices, &registry, 0);
+        assert_eq!(r.milestones.len(), 1);
+        assert!((r.milestones[0].ts_ms - 200.0).abs() < 0.01);
+    }
+
     #[test]
     fn aggregate_cutoff_extends_to_latest_milestone() {
         // Two milestones fire (FCP at 100, LCP at 300). Aggregate
@@ -660,18 +700,21 @@ flag_threshold_ms = 10
                     owner_thread: "main".into(),
                     is_milestone: false,
                     aggregate: true,
+                    aliases: vec![],
                 },
                 Phase {
                     name: "FirstContentfulPaint".into(),
                     owner_thread: "main".into(),
                     is_milestone: true,
                     aggregate: false,
+                    aliases: vec![],
                 },
                 Phase {
                     name: "LargestContentfulPaint".into(),
                     owner_thread: "main".into(),
                     is_milestone: true,
                     aggregate: false,
+                    aliases: vec![],
                 },
             ],
             edges: vec![],

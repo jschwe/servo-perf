@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
-use std::time::SystemTime;
 
 use crate::cli::{BenchArgs, OhosArgs};
 use crate::fixtures::{self, FixtureHandle};
@@ -17,9 +16,29 @@ use crate::workload;
 
 pub fn run(args: BenchArgs) -> Result<()> {
     let workloads_dir = workloads_dir();
-    let mut w = workload::load(&workloads_dir, &args.workload)?;
+    let mut w = match args.workload_def.clone() {
+        Some(w) => w,
+        None => workload::load(&workloads_dir, &args.workload)?,
+    };
     if let Some(n) = args.iterations {
         w.iterations = n;
+    }
+    if let Some(f) = args.tracing_filter.clone() {
+        w.tracing_filter = f;
+    }
+    if args.lcp {
+        w.lcp = true;
+    }
+    if args.live
+        && w.fixture.take().is_some()
+        && crate::log_once::first_time("live-instead-of-fixture")
+    {
+        eprintln!(
+            "warning: --live: loading {} from the live site instead of the workload's fixture. \
+             The network is in every number, and Servo's disk cache is off by default, so each \
+             Servo iteration is a cold fetch; do not compare these with replayed runs.",
+            w.url
+        );
     }
     let target = build_target(&args.ohos, args.bin.as_deref())?;
     let registry = trace::load_registry_named(&workloads_dir, target.registry_stem())?;
@@ -29,32 +48,40 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     // Resolve which engine the bench is exercising, so we know which list of
     // function-name substrings to aggregate inclusive instruction counts
-    // for. Only consulted when `--with-instructions` is on (the target is
-    // OHOS). Engines whose `symbol_file` is non-empty get the merged ELF
-    // auto-pushed if a sibling file is present in `workloads/`.
-    let engine: Option<EngineConfig> = if args.ohos.with_instructions {
-        match &target {
-            Target::Ohos(ohos) => {
-                let cfg = InstructionsConfig::load(&workloads_dir)?;
-                match cfg.engine_for_bundle(&ohos.bundle) {
-                    Some(e) => {
-                        push_engine_symbols(ohos, e, &workloads_dir)?;
-                        Some(e.clone())
+    // for, and which trace spans count as one reflow. Resolved on every
+    // OHOS run — `reflow.count` needs no PMU — but symbol staging (the
+    // merged ELF from a sibling file in `workloads/`) only happens when
+    // `--with-instructions` is on.
+    let mut symbols_build_id: Option<String> = None;
+    let engine: Option<EngineConfig> = match &target {
+        Target::Ohos(ohos) => {
+            let cfg = InstructionsConfig::load(&workloads_dir)?;
+            let selected = match args.ohos.engine.as_deref() {
+                Some(id) => Some(cfg.engine_by_id(id).ok_or_else(|| {
+                    anyhow::anyhow!("--engine {id:?} not found in _instructions.toml")
+                })?),
+                None => cfg.engine_for_bundle(&ohos.bundle),
+            };
+            match selected {
+                Some(e) => {
+                    if args.ohos.with_instructions {
+                        symbols_build_id = check_engine_symbols(ohos, e, &workloads_dir)?;
                     }
-                    None => {
+                    Some(e.clone())
+                }
+                None => {
+                    if args.ohos.with_instructions {
                         eprintln!(
                             "warning: --with-instructions: no engine matches bundle {:?} in \
                              _instructions.toml; per-function counts will be skipped",
                             ohos.bundle
                         );
-                        None
                     }
+                    None
                 }
             }
-            _ => None,
         }
-    } else {
-        None
+        _ => None,
     };
 
     // Local fixtures (http1/h2 servers, wpr) live on the host's
@@ -66,6 +93,12 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // bump it for the duration of the run; the guard restores on
     // Drop. Held alongside `fx` / `_rport` so scope-exit ordering
     // is: tear down rport → stop fixture → restore trace level.
+    // Held for the whole run: a screen-off mid-capture freezes the app and
+    // silently invalidates every iteration after it.
+    let _screen_guard = match &target {
+        Target::Ohos(ohos) => Some(ohos.guard_screen_awake()),
+        Target::Local { .. } => None,
+    };
     let _trace_level_guard = match &target {
         Target::Ohos(ohos) => Some(ohos.guard_trace_level(&ohos.trace_level.clone())?),
         Target::Local { .. } => None,
@@ -73,6 +106,15 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let driver = build_record_driver(&target, args.ohos.ohos_record_seconds);
     let (fx, _rport): (Option<FixtureHandle>, Option<crate::ohos::RPortGuard>) =
         match (w.fixture.as_ref(), &target) {
+            // Copied per cell, after any install: `install_hap` uninstalls
+            // first, which empties the app's files directory.
+            (Some(workload::Fixture::DeviceFiles { dir, name }), Target::Ohos(ohos)) => {
+                ohos.push_page(&fixtures::fixture_dir(&workloads_dir, dir)?, name)?;
+                (None, None)
+            }
+            (Some(workload::Fixture::DeviceFiles { .. }), Target::Local { .. }) => {
+                anyhow::bail!("a device-files fixture needs --ohos")
+            }
             (Some(fx_def), Target::Ohos(ohos)) => {
                 let handle = fixtures::spawn(&workloads_dir, &w, driver.as_ref(), &out_dir)?;
                 let guard = ohos.setup_rport(&fx_def.ports_to_forward())?;
@@ -102,11 +144,16 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // recording on the device, so wallclock for the whole bench is
     // bounded by max(recording_time, analyser_time) per iteration instead
     // of their sum. Joined in a single pass after the iteration loop.
-    let mut instr_jobs: Vec<(
-        u32,
-        JoinHandle<Result<std::collections::HashMap<String, u64>>>,
-    )> = Vec::new();
+    // Reflow-span timestamps per iteration, held until the matching
+    // perf.data yields the window to narrow them to.
+    let mut reflow_starts_by_iter: BTreeMap<u32, BTreeMap<String, Vec<u64>>> = BTreeMap::new();
+    let mut instr_jobs: Vec<(u32, JoinHandle<Result<instructions::Aggregation>>)> = Vec::new();
+    let mut attempted_instr_jobs: std::collections::HashSet<u32> = Default::default();
     for i in 0..w.iterations {
+        if crate::cancel::requested() {
+            eprintln!("bench: cancelled after {i} iteration(s); writing what was collected");
+            break;
+        }
         let timeout = runner::pick_timeout(&successful_wall);
         match runner::run_once(&target, &w, i, &out_dir, proxy_uri.as_deref(), timeout) {
             Ok(art) => {
@@ -115,7 +162,23 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 );
                 successful_wall.push(wall);
                 let pftrace = art.pftrace;
-                let slices = parse_trace(&target, &pftrace)?;
+                // A trace that will not parse is one bad iteration, not a lost
+                // campaign: propagating here would discard every iteration
+                // already collected, since the results are written after the
+                // loop.
+                let slices = match parse_trace(&target, &pftrace) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        eprintln!("iter {i} failed: {err:#}");
+                        iterations.push(Iteration {
+                            index: i,
+                            status: IterationStatus::Failed {
+                                error: format!("{err:#}"),
+                            },
+                        });
+                        continue;
+                    }
+                };
                 let cp = trace::analyse(&slices, &registry, art.spawn_wall_ns);
                 let mut metrics = BTreeMap::new();
                 // The "FirstContentfulPaint" key in the metrics map is
@@ -151,6 +214,17 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 for row in &cp.named_spans {
                     metrics.insert(format!("{}.dur_ms", row.name), row.dur_ms);
                 }
+                // Reflow count from the same trace the timing metrics come
+                // from. Independent of `--with-instructions`: it needs no
+                // PMU, only the engine's span names.
+                // The reflow count is deliberately *not* computed here: it has
+                // to be narrowed to the window the instruction samples came
+                // from, which is only known once this iteration's perf.data
+                // has been parsed. Keep the span timestamps until then.
+                let reflow_starts = engine
+                    .as_ref()
+                    .map(|e| instructions::reflow_span_starts(&slices, e))
+                    .unwrap_or_default();
                 // Thermal snapshots (OHOS only). Absent on local targets.
                 if let Some(v) = art.thermal_before_milli_c {
                     metrics.insert("soc_thermal_milli_c.before".to_string(), v as f64);
@@ -162,6 +236,18 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 {
                     metrics.insert("soc_thermal_milli_c.delta".to_string(), (a - b) as f64);
                 }
+                // Presented-frame and page-reported metrics for scenario
+                // workloads; a no-op for page-load ones.
+                crate::fps::merge_scenario_metrics(
+                    &mut metrics,
+                    &w,
+                    &art.fps_dumps,
+                    art.log.as_deref(),
+                    art.thread_cpu
+                        .as_ref()
+                        .map(|(b, a)| (b.as_str(), a.as_str())),
+                    Some(&pftrace),
+                );
                 // Per-function inclusive instruction counts run on a
                 // background thread so the next iteration's recording
                 // starts immediately. Results are joined at the end of
@@ -178,7 +264,9 @@ pub fn run(args: BenchArgs) -> Result<()> {
                         )
                     });
                     instr_jobs.push((i, handle));
+                    attempted_instr_jobs.insert(i);
                 }
+                reflow_starts_by_iter.insert(i, reflow_starts);
                 iterations.push(Iteration {
                     index: i,
                     status: IterationStatus::Ok {
@@ -205,7 +293,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         .filter(|i| matches!(i.status, IterationStatus::Ok { .. }))
         .count();
     anyhow::ensure!(
-        2 * ok >= iterations.len(),
+        crate::cancel::requested() || 2 * ok >= iterations.len(),
         "more than 50% of iterations failed ({}/{}); aborting",
         iterations.len() - ok,
         iterations.len()
@@ -224,18 +312,125 @@ pub fn run(args: BenchArgs) -> Result<()> {
                 continue;
             }
         };
-        let totals = match result {
+        let aggregation = match result {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("iter {idx}: instruction aggregator failed: {e:#}");
                 continue;
             }
         };
+        // Attribution is by library, so any process mapping the engine `.so`
+        // is in these totals. Measured on a PLR-AL00: the stock browser keeps
+        // a second `:render` alive for a background tab and it was counted
+        // into the ArkWeb leg. Name the contributors once per run so the next
+        // one is noticed rather than quietly absorbed.
+        // The app's own helper processes are expected — an ArkWeb app is
+        // `<bundle>` plus `<bundle>:render` and `<bundle>:gpu`. Only names
+        // outside the bundle are a problem.
+        if let Target::Ohos(ohos) = &target {
+            let mut foreign: Vec<(&String, &u64)> = aggregation
+                .library_samples_by_process
+                .iter()
+                .filter(|(name, _)| !names_this_bundle(name, &ohos.bundle))
+                .collect();
+            // Keyed per cell, not per process: a suite is twenty cells in one
+            // process, so a single global key would report contamination in
+            // the first cell and stay silent for the other nineteen.
+            let key = format!("instructions-foreign-process:{}", out_dir.display());
+            if !foreign.is_empty() && crate::log_once::first_time(&key) {
+                foreign.sort_by(|a, b| b.1.cmp(a.1));
+                let list = foreign
+                    .iter()
+                    .map(|(name, n)| format!("{name} ({n} samples)"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eprintln!(
+                    "warning: processes outside {:?} contributed samples inside the engine \
+                     library: {list}. Attribution is by library, not by process, so their work \
+                     is in every instruction total — force-stop whatever else is running this \
+                     engine and re-run.",
+                    ohos.bundle
+                );
+            }
+        }
+        let starts = reflow_starts_by_iter.remove(&idx).unwrap_or_default();
         if let Some(it) = iterations.iter_mut().find(|it| it.index == idx) {
             if let IterationStatus::Ok { metrics, .. } = &mut it.status {
-                for (func, events) in totals {
-                    metrics.insert(format!("instructions.{func}"), events as f64);
+                // A target that never resolved is absent, not zero: a zero
+                // here is indistinguishable from "this phase costs nothing"
+                // and drags every median it lands in. `explain_zeros` has
+                // already said which of the two it was.
+                for (func, events) in &aggregation.totals {
+                    // A target whose pattern matched no symbol has no number to
+                    // report, and a zero there would be read as "this phase is
+                    // free". A target that *did* resolve and scored zero really
+                    // did no work this iteration, and dropping it biases its
+                    // median upward — every iteration that skipped the phase
+                    // would be excluded from the summary of that phase.
+                    if *events > 0 || aggregation.resolved_targets.contains(func) {
+                        metrics.insert(format!("instructions.{func}"), *events as f64);
+                    }
                 }
+                // Now the window is known, so the denominator can describe the
+                // same interval as the numerator.
+                let counts = instructions::count_reflow_spans_in(&starts, aggregation.window);
+                if counts.get("reflow.count") == Some(&0.0) {
+                    eprintln!(
+                        "iter {idx}: warning: no reflow spans inside the sampled window — \
+                         reflow.count is 0. Check the engine build emits them, that \
+                         --ohos-trace-tags includes their tag (`nweb` for ArkWeb), and that \
+                         the capture window is short enough that the ring buffer still holds \
+                         the page load."
+                    );
+                }
+                metrics.extend(counts);
+                // instructions ÷ reflows, from the same iteration. Both
+                // inputs are per-iteration, so the ratio never mixes a
+                // numerator and denominator from different runs.
+                if let Some(engine) = engine.as_ref() {
+                    let count = metrics.get("reflow.count").copied().unwrap_or(0.0);
+                    if count > 0.0 {
+                        // One per group, so a reader never has to guess which
+                        // numerator a bare `per_reflow` came from.
+                        let mut derived: Vec<(String, f64)> = Vec::new();
+                        for group in &engine.groups {
+                            if let Some(v) = metrics.get(&format!("instructions.{}", group.name)) {
+                                derived.push((
+                                    format!("instructions.per_reflow.{}", group.name),
+                                    v / count,
+                                ));
+                            }
+                        }
+                        // Plus the engine's configured numerator, kept under
+                        // its own symbol name for the same reason.
+                        if let Some(num) = engine.reflow_instructions.as_ref() {
+                            if let Some(v) = metrics.get(&format!("instructions.{num}")) {
+                                derived.push((format!("instructions.per_reflow.{num}"), v / count));
+                                derived.push(("instructions.per_reflow".to_string(), v / count));
+                            }
+                        }
+                        metrics.extend(derived);
+                    }
+                }
+            }
+        }
+    }
+
+    // Iterations that never had an instruction job — `--with-instructions` off
+    // — still get a count, over the whole trace. It is not a denominator
+    // there, so there is no window to narrow it to.
+    //
+    // An iteration whose aggregator *failed* is deliberately not given one: the
+    // trace runs from before `aa start` until the `--trace_finish` flush ends,
+    // so a whole-trace count is roughly twice a windowed one, and mixing the
+    // two into a single median is worse than a missing point.
+    for (idx, starts) in std::mem::take(&mut reflow_starts_by_iter) {
+        if attempted_instr_jobs.contains(&idx) {
+            continue;
+        }
+        if let Some(it) = iterations.iter_mut().find(|it| it.index == idx) {
+            if let IterationStatus::Ok { metrics, .. } = &mut it.status {
+                metrics.extend(instructions::count_reflow_spans_in(&starts, None));
             }
         }
     }
@@ -250,8 +445,26 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // One summary entry per configured instruction symbol, across every
     // iteration that resolved it.
     if let Some(engine) = engine.as_ref() {
-        for func in &engine.functions {
-            let key = format!("instructions.{func}");
+        let mut derived = vec![
+            "reflow.count".to_string(),
+            "instructions.per_reflow".to_string(),
+        ];
+        derived.extend(
+            engine
+                .groups
+                .iter()
+                .map(|g| format!("instructions.per_reflow.{}", g.name)),
+        );
+        if let Some(num) = engine.reflow_instructions.as_ref() {
+            derived.push(format!("instructions.per_reflow.{num}"));
+        }
+        let keys = engine
+            .functions
+            .iter()
+            .chain(engine.groups.iter().map(|g| &g.name))
+            .map(|f| format!("instructions.{f}"))
+            .chain(derived);
+        for key in keys {
             let samples: Vec<f64> = iterations
                 .iter()
                 .filter_map(|i| match &i.status {
@@ -275,12 +488,27 @@ pub fn run(args: BenchArgs) -> Result<()> {
         },
     );
 
+    if matches!(w.fixture, Some(workload::Fixture::Static { .. })) {
+        let missing = fixtures::missing_resources(&out_dir);
+        if !missing.is_empty() {
+            eprintln!(
+                "warning: the page asked for {} file(s) the served directory does not have, so it \
+                 was measured without them: {}",
+                missing.len(),
+                missing.join(", ")
+            );
+        }
+    }
+
     let data = RunResults {
+        cancelled: crate::cancel::requested(),
+        command: crate::report::invocation(),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        timestamp_utc: now_rfc3339(),
+        timestamp_utc: crate::report::now_utc(),
         workload: w,
         configs,
         deltas: BTreeMap::new(),
+        symbols_build_id,
     };
 
     report::write_json(&out_dir, &data)?;
@@ -293,36 +521,82 @@ fn workloads_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("workloads")
 }
 
-/// If the engine declares a `symbol_file`, look for the file under
-/// `workloads/` and (if found) push it to the device's symbol-dir so
-/// hiperf's per-iteration `report -s --symbol-dir …` resolves library
-/// symbols. Missing file emits a hint but isn't fatal — the bench still
-/// captures perf.data, and the user can re-run with the file present.
-fn push_engine_symbols(
+/// Warn if the engine declares a `symbol_file` that isn't staged under
+/// `workloads/`. Symbol resolution happens on the host (`perf_data.rs` reads
+/// this ELF directly), so nothing is pushed to the device — the merged ArkWeb
+/// ELF is ~290 MB and pushing it per run cost more than the capture itself.
+/// Missing file isn't fatal: the bench still captures perf.data, and the
+/// counts can be re-derived once the file is in place.
+fn check_engine_symbols(
     target: &OhosTarget,
     engine: &EngineConfig,
     workloads_dir: &Path,
-) -> Result<()> {
+) -> Result<Option<String>> {
     if engine.symbol_file.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let host_path = workloads_dir.join(&engine.symbol_file);
     if !host_path.exists() {
         eprintln!(
-            "warning: engine {:?} symbol_file {:?} not found — symbols won't resolve. \
-             Run: servoperf prepare-arkweb-symbols --input <stripped-libarkweb_engine.so> \
-             --output {}",
+            "warning: engine {:?} symbol_file {:?} not found — instruction counts will all \
+             be 0. For ArkWeb run: servoperf prepare-arkweb-symbols --input \
+             <stripped-libarkweb_engine.so> --output {}",
             engine.id,
             host_path,
             host_path.display(),
         );
-        return Ok(());
+        return Ok(None);
     }
-    eprintln!(
-        "ohos: pushing engine symbols ({} → device)",
-        host_path.display()
-    );
-    target.push_arkweb_symbols(&host_path)
+    if engine.device_library.is_empty() {
+        eprintln!(
+            "warning: engine {:?} has no `device_library`, so the staged symbol file cannot be \
+             checked against what is installed. A stale file resolves every sample against the \
+             old layout and reports plausible wrong numbers.",
+            engine.id
+        );
+        return Ok(None);
+    }
+    let Some(device_path) = target.first_existing(&engine.device_library) else {
+        anyhow::bail!(
+            "none of engine {:?}'s device_library paths exist on the device: {:?}. Add the \
+             right one, or clear the list to measure without the check.",
+            engine.id,
+            engine.device_library
+        );
+    };
+    let device_path = device_path.as_str();
+    {}
+
+    // Read both build ids and refuse to measure unless they agree. Failing
+    // here costs a minute; not failing costs a campaign, because a mismatch
+    // produces attributions that look entirely reasonable.
+    let staged = std::fs::read(&host_path).ok().and_then(|b| {
+        crate::instructions::symbols::build_id_from_elf_prefix(&b[..b.len().min(1 << 16)])
+    });
+    let installed = target.remote_build_id(device_path);
+    match (staged, installed) {
+        (Some(a), Some(b)) if a == b => {
+            eprintln!(
+                "ohos: {} matches the installed library (build id {a})",
+                engine.symbol_file
+            );
+            Ok(Some(a))
+        }
+        (Some(a), Some(b)) => anyhow::bail!(
+            "{} is not the installed library: staged build id {a}, {device_path} has {b}. \
+             Re-stage the symbol file for the build that is on the device.",
+            host_path.display()
+        ),
+        (None, _) => anyhow::bail!(
+            "{} carries no GNU build id, so it cannot be checked against the device. Link it \
+             with --build-id, or clear `device_library` to measure without the check.",
+            host_path.display()
+        ),
+        (_, None) => anyhow::bail!(
+            "could not read a build id from {device_path} on the device — wrong path, or the \
+             library has none. Fix `device_library`, or clear it to measure without the check."
+        ),
+    }
 }
 
 /// Build the [`Target`] for this run. For local mode, validates the bin
@@ -336,6 +610,7 @@ pub(crate) fn build_target(ohos: &OhosArgs, bin: Option<&Path>) -> Result<Target
         });
     }
     let mut target = OhosTarget::from_args(ohos);
+    target.resolve_thermal_zone(&ohos.ohos_thermal_zone);
     // Hydrate engine-specific proxy-arg templates from the global
     // _instructions.toml. Done here (not in OhosTarget::from_args) so
     // workloads_dir is reachable. Bench callers don't pay for this unless
@@ -344,6 +619,7 @@ pub(crate) fn build_target(ohos: &OhosArgs, bin: Option<&Path>) -> Result<Target
     let workloads_dir = workloads_dir();
     if let Ok(cfg) = InstructionsConfig::load(&workloads_dir) {
         if let Some(engine) = cfg.engine_for_bundle(&target.bundle) {
+            target.engine_launch_args = engine.launch_args.clone();
             target.engine_proxy_args = engine.proxy_args.clone();
         }
     }
@@ -395,17 +671,88 @@ fn resolve_out(explicit: Option<&Path>, workload_name: &str) -> PathBuf {
     if let Some(p) = explicit {
         return p.to_path_buf();
     }
-    let ts = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    PathBuf::from("out").join(format!("{}-{}", workload_name, ts))
+    crate::report::default_out_dir(workload_name)
 }
 
-fn now_rfc3339() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0) as i64;
-    format!("@{}s", secs)
+/// Does this process name belong to the bundle under test?
+///
+/// An OHOS app is `<bundle>` plus helpers like `<bundle>:render` and
+/// `<bundle>:gpu`, all expected. The catch is the kernel's `comm`, which is
+/// 15 bytes: a process renamed after it starts carries a truncated name. Both
+/// ends have been seen — on a PLR-AL00 the ArkWeb wrapper's renderer reports
+/// as `kwebtest:render`, the *last* 15 bytes of
+/// `org.openharmonyrs.arkwebtest:render` — so a 15-byte name matches if it is
+/// either end of `<bundle>` or `<bundle>:<suffix>`.
+fn names_this_bundle(name: &str, bundle: &str) -> bool {
+    let base = name.split(':').next().unwrap_or(name);
+    if base == bundle {
+        return true;
+    }
+    if name.len() != 15 {
+        return false;
+    }
+    let suffix = name.find(':').map(|i| &name[i..]).unwrap_or("");
+    format!("{bundle}{suffix}").ends_with(name) || bundle.starts_with(base)
+}
+
+#[cfg(test)]
+mod contamination_tests {
+    use super::names_this_bundle;
+
+    #[test]
+    fn helper_processes_are_not_foreign() {
+        for name in [
+            "org.openharmonyrs.arkwebtest",
+            "org.openharmonyrs.arkwebtest:render",
+            "org.openharmonyrs.arkwebtest:gpu",
+        ] {
+            assert!(
+                names_this_bundle(name, "org.openharmonyrs.arkwebtest"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_comm_still_matches_its_bundle() {
+        // What the kernel gives for a renamed `org.openharmonyrs.arkwebtest`.
+        assert!(names_this_bundle(
+            "org.openharmony",
+            "org.openharmonyrs.arkwebtest"
+        ));
+        // A comm is never longer than 15 bytes, so a prefix-truncated base
+        // with a suffix appended cannot occur; names are either full (hiperf
+        // synthesises them from /proc/<pid>/cmdline) or at most 15 bytes.
+        assert!(!names_this_bundle(
+            "org.openharmony:render",
+            "org.openharmonyrs.arkwebtest"
+        ));
+    }
+
+    #[test]
+    fn another_app_is_foreign() {
+        assert!(!names_this_bundle(
+            "com.huawei.hmos.browser:render",
+            "org.openharmonyrs.arkwebtest"
+        ));
+        // A 15-byte name that is not a prefix must not be excused.
+        assert!(!names_this_bundle(
+            "com.huawei.hmo",
+            "org.openharmonyrs.arkwebtest"
+        ));
+        // The browser's renderer truncated from the front is still foreign.
+        assert!(!names_this_bundle(
+            "h.browser:render",
+            "org.openharmonyrs.arkwebtest"
+        ));
+    }
+
+    #[test]
+    fn a_comm_truncated_from_the_front_still_matches() {
+        // Measured on a PLR-AL00: the wrapper's renderer as the kernel names it.
+        assert!(names_this_bundle(
+            "kwebtest:render",
+            "org.openharmonyrs.arkwebtest"
+        ));
+    }
 }

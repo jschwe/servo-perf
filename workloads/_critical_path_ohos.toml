@@ -154,10 +154,18 @@ name = "FirstPaint"
 owner_thread = "org.servo.servo"
 is_milestone = true
 
+# Blink's own marker, emitted in the renderer when the first contentful
+# frame's presentation is reported. The ArkWeb test app's
+# `FirstContentfulPaint` comes from its onFirstContentfulPaint callback, which
+# arrives ~150 ms later (measured on a PLR-AL00: 151-153 ms in each of 5
+# loads) and never fires for file:// pages; Servo's marker is emitted when the
+# frame is painted. Taking the earliest of the two keeps both engines on
+# engine-side timing.
 [[phase]]
 name = "FirstContentfulPaint"
 owner_thread = "org.servo.servo"
 is_milestone = true
+aliases = ["PaintTiming::SetFirstContentfulPaintPresentation"]
 
 [[phase]]
 name = "LargestContentfulPaint"

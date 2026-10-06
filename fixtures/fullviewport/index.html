@@ -1,0 +1,76 @@
+<!doctype html><meta charset=utf-8><title>ohdraw-12</title>
+<style>html,body{margin:0;padding:0;background:#202020;overflow:hidden}canvas{display:block}</style>
+<canvas id=c></canvas>
+<script>
+// One full-viewport canvas, created once and animated forever. Deliberately unlike the
+// candle page: no canvas recreation, so exactly one presentation buffer pool exists and
+// the external-image path is measured on its own, without the memory churn of a page
+// that calls echarts.init on a timer.
+//
+// Each frame clears and redraws a candlestick-shaped scene whose primitive count scales
+// with the canvas area, then reports fps over 1 s windows via console.log (which reaches
+// hilog on OHOS).
+const c = document.getElementById('c');
+const W = c.width = Math.round(window.innerWidth * window.devicePixelRatio);
+const H = c.height = Math.round(window.innerHeight * window.devicePixelRatio);
+c.style.width = window.innerWidth + 'px';
+c.style.height = window.innerHeight + 'px';
+const ctx = c.getContext('2d');
+console.log(`INSTRUMENT: canvas=${W}x${H} dpr=${window.devicePixelRatio}`);
+
+const params = new URLSearchParams(location.search);
+const DENSITY = parseFloat(params.get('density') || '1');
+const N = Math.round((W * H) / (64 * 64) * DENSITY);
+
+let seed = 0x5EED;
+function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+
+let frames = 0, t0 = performance.now(), phase = 0;
+function draw() {
+  seed = 0x5EED;
+  phase += 0.03;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = '#ddd';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 24; i++) {
+    const y = H * i / 24;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  }
+
+  for (let i = 0; i < N; i++) {
+    const x = rnd() * W, y = rnd() * H;
+    const bw = 6 + rnd() * 8, bh = 10 + rnd() * 60;
+    const up = (i % 2) === 0;
+    ctx.fillStyle = up ? '#dc143c' : '#2e8b57';
+    ctx.fillRect(x, y + Math.sin(phase + i) * 4, bw, bh);
+    ctx.strokeStyle = up ? 'rgba(220,20,60,.85)' : 'rgba(46,139,87,.85)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(x + bw / 2, y - 20); ctx.lineTo(x + bw / 2, y + bh + 20); ctx.stroke();
+  }
+
+  ctx.strokeStyle = 'rgba(70,130,180,.9)';
+  ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  let px = 0, py = H * 0.5;
+  ctx.moveTo(px, py);
+  while (px < W) {
+    const nx = px + 18, ny = H * 0.3 + rnd() * H * 0.4;
+    ctx.bezierCurveTo(px + 6, py, nx - 6, ny, nx, ny);
+    px = nx; py = ny;
+  }
+  ctx.stroke();
+
+  frames++;
+  const now = performance.now();
+  if (now - t0 >= 1000) {
+    console.log(`INSTRUMENT: t=${Math.round(now / 1000)}s fps=${Math.round(frames * 1000 / (now - t0))}`);
+    frames = 0; t0 = now;
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script>

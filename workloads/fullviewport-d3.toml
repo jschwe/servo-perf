@@ -1,0 +1,30 @@
+name = "fullviewport-d3"
+url = "https://127.0.0.1:4444/index.html?density=3"
+iterations = 8
+servoshell_args = ["--ignore-certificate-errors", "--pref=dom_canvas_backend=vello_cpu"]
+
+# One full-viewport 2D canvas, created once and animated forever. Unlike
+# `candle`, nothing is recreated and there is no idle phase, so every presented
+# frame is animation and per-frame costs mean what they say. This is the probe
+# for "what stops a canvas reaching 60 fps"; candle answers a different question
+# (a charting library's rebuild cycle) and spends a third of its window idle.
+[scenario]
+surface = "ServoDemoSurface"
+capture_seconds = 30
+sample_interval_seconds = 3
+refresh_hz = 60
+thread_cpu = true
+
+# Deliberately NO exclude-idle-gaps: this page never idles, so every interval is
+# a real frame and `presented.fps` is the honest number. Filtering here would
+# hide exactly the slow frames being investigated.
+
+[[scenario.log_metric]]
+name = "raf_fps"
+pattern = 'INSTRUMENT: t=[0-9]+s fps=([0-9]+)'
+aggregate = "median"
+
+[fixture]
+kind = "http1"
+port = 4444
+doc_root = "fullviewport"

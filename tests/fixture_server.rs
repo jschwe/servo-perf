@@ -106,6 +106,32 @@ async fn http1_serves_png_with_correct_content_type() {
     assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
 }
 
+/// Plain mode serves any directory — no certificate beside it — over
+/// cleartext, reusable only briefly and with nothing to revalidate against.
+#[tokio::test]
+async fn plain_serves_cleartext_briefly_cacheable() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("index.html"), b"<p>hi</p>").unwrap();
+    std::fs::write(root.path().join("font.woff2"), b"wOF2").unwrap();
+    let srv = spawn("plain", root.path());
+    let resp = client()
+        .get(format!("http://127.0.0.1:{}/", srv.port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("cache-control").unwrap(), "max-age=5");
+    assert!(resp.headers().get("last-modified").is_none());
+    assert!(resp.headers().get("etag").is_none());
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"<p>hi</p>");
+    let resp = client()
+        .get(format!("http://127.0.0.1:{}/font.woff2", srv.port))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("content-type").unwrap(), "font/woff2");
+}
+
 #[tokio::test]
 async fn http2_serves_simple_html_over_h2() {
     let srv = spawn("http2", &www_dir());

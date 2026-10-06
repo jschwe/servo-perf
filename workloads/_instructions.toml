@@ -37,6 +37,10 @@ bundles = [
 # servo worktree that produced the .hap). Host-side perf.data parsing
 # needs it to resolve sample IPs to function names.
 symbol_file = "libservoshell.symbols.so"
+# The installed-bundle path, not the `/data/storage/...` sandbox one, which
+# resolves only inside the app's own mount namespace. Clearing the list skips
+# the build-id check, at the cost of trusting the staging.
+device_library = ["/data/app/el1/bundle/public/org.servo.servo/libs/arm64/libservoshell.so"]
 # Inclusive instruction counts for these symbols are exported as
 # per-iteration metrics named `instructions.<func>`.
 functions = [
@@ -46,7 +50,7 @@ functions = [
   # other reflow-related symbol (handle_reflow has no `>` in its name).
   "Layout>::reflow",
   "Window>::reflow",
-  "LayoutThread::handle_reflow",
+  "LayoutThread>::handle_reflow",
   # Vsync paths. `on_vsync_cb` fires per OHOS vsync callback (every frame
   # under the legacy per-frame-resubscribe path; only when an observer
   # asks under the on-demand path). `Paint::perform_updates` covers the
@@ -62,6 +66,12 @@ functions = [
   "update_the_rendering",
   "update_active_frames",
 ]
+# Hides the app's own toolbar and tab bar so the XComponent fills the window,
+# matching what `--chrome=none` does for the arkweb wrapper. The servoshell
+# ArkTS app consumes the flag in EntryAbility.ets and does not forward it to
+# servoshell, whose parser exits on an unknown option — so this only works on a
+# hap built from servo commit 1d0c5b0 or later.
+launch_args = ["--chrome=none"]
 # Servoperf injects these flags (one per line) when the workload uses a
 # fixture-side proxy (e.g. wpr-replay). `$PROXY` is replaced with the
 # host-side proxy URI (already reachable from device via `hdc rport`).
@@ -71,6 +81,91 @@ proxy_args = [
   "--pref=network_https_proxy_uri=$PROXY",
   "--pref=network_http_proxy_uri=$PROXY",
   "--ignore-certificate-errors",
+]
+# One marker per layout that actually ran, to match Blink's
+# `LocalFrameView::performLayout`.
+#
+# Two earlier choices were both wrong, in the same direction:
+#   * `handle_reflow` fires once per reflow *request*, and most requests find
+#     style and the trees clean and return without laying anything out.
+#     Measured on a PLR-AL00, mossel-user-scroll, one 20 s capture: 11947
+#     `handle_reflow` against 410 `restyle_and_build_trees` and 34 display
+#     lists -- 97% of the calls did no layout work.
+#   * `restyle_and_build_trees` is better but still not "a layout ran": it
+#     emits its span and then returns early in three places (layout_impl.rs:
+#     no restyle, `!token.should_traverse()`, or damage that is
+#     Repaint/RecalculateOverflow with no layout root). That last one is what
+#     a CSS transition or a hover toggle produces -- Blink records zero
+#     `performLayout`, Servo recorded one "reflow".
+#
+# `RanLayout` is an explicit marker emitted from `handle_reflow` only when
+# `ReflowPhasesRun::RanLayout` came back set. It needs a hap built with
+# `--features tracing-hitrace`; a plain release build emits no Servo spans at
+# all and `reflow.count` stays 0. The markers also need a filter at launch:
+# servoperf synthesizes `--tracing-filter=<workload.tracing_filter>`, and
+# without it servoshell leaves the subscriber at LevelFilter::OFF.
+#
+# Only one pattern may be listed: `reflow.count` is the sum across patterns, so
+# adding a diagnostic pattern back would double the total.
+reflow_spans = ["RanLayout"]
+# `<LayoutThread as Layout>::reflow` is the outer entry point and survives
+# LTO. `handle_reflow` and `build_display_list` are inlined into it at
+# codegen-units=1: they resolve to 0 unless the staged symbol file carries
+# DWARF, in which case servoperf attributes the inline chain and they report
+# real numbers. Build with `CARGO_PROFILE_PRODUCTION_DEBUG=1` to get that;
+# without it only this outer symbol is trustworthy.
+reflow_instructions = "Layout>::reflow"
+
+
+# --- Comparison groupings -------------------------------------------------
+# Each is reported as `instructions.<name>`. A group counts a sample once if
+# the chain contains ANY member, so where a group is smaller than the sum of
+# its members' own metrics, the difference is the overlap between them.
+
+# Style recalc + box/fragment trees: what Blink accounts to
+# `LocalFrameView::UpdateStyleAndLayout`. `restyle_and_build_trees` is inlined
+# at codegen-units=1, so this is a true figure only when the staged symbol file
+# carries DWARF (`CARGO_PROFILE_PRODUCTION_DEBUG=1`); without it the group sees
+# only the parallel restyle and fragment-tree jobs and reads about 3x low.
+[[engines.group]]
+name = "layout_proper"
+functions = ["restyle_and_build_trees"]
+
+# Stacking-context tree + display list. `handle_reflow` runs these, but Blink
+# does the equivalent in its paint lifecycle, so they must be compared against
+# `paint_prep` on the other engine rather than folded into layout.
+[[engines.group]]
+name = "paint_prep"
+functions = ["build_stacking_context_tree", "build_display_list"]
+
+# The grouping used elsewhere in the team: the script-side reflow entry point,
+# which covers style, layout, paint prep, the a11y tree and scroll nodes.
+[[engines.group]]
+name = "colleagues_reflow"
+functions = ["Window>::reflow"]
+
+# Servo hands restyle and box/fragment-tree building to stylo's rayon pool
+# (`layout_threads`, default 3). A worker's stack is rooted at the rayon loop,
+# so nothing in it names `restyle_and_build_trees` or `Layout>::reflow` and the
+# sample would be dropped -- while Blink's single-threaded equivalent is
+# counted in full. Measured on a PLR-AL00 by serialising the pool
+# (`--pref layout_threads=1`): `layout_proper` rose 34.8% and
+# `colleagues_reflow` 5.9%, i.e. at least a quarter of Servo's style and layout
+# work was invisible, always in the direction that flattered Servo.
+#
+# The pool is used for nothing but restyle and layout, so a sample on one of
+# its threads is layout work by construction. Credit it to the phases that
+# contain it. `paint_prep` is deliberately absent: the stacking-context tree
+# and the display list are built on the script thread.
+[[engines.parallel_pool]]
+threads = ["StyleThread#"]
+credit = [
+  "layout_proper",
+  "colleagues_reflow",
+  "Layout>::reflow",
+  "Window>::reflow",
+  "LayoutThread>::handle_reflow",
+  "update_the_rendering",
 ]
 
 [[engines]]
@@ -85,6 +180,25 @@ bundles = [
 # result. Path here is host-side; the device-side push target is fixed at
 # /data/local/tmp/symbols/libarkweb_engine.so.
 symbol_file = "libarkweb_engine.merged.so"
+# Checked against the staged symbol file's build id before a run: a stale
+# staging resolves every sample against the old layout and reports plausible
+# wrong numbers rather than failing.
+# The installed-bundle path, not the `/data/storage/...` sandbox one: that
+# resolves only inside the app's own mount namespace, so an `hdc shell` cannot
+# read it. The bundle name differs by image (com.ohos.arkwebcore here,
+# com.huawei.hmos.arkwebcore on a HarmonyOS phone) — adjust if the check
+# reports it cannot read the path.
+# Hides the wrapper app's toolbar so the Web component fills the window: the
+# toolbar costs ArkUI layout every frame and shrinks the viewport, which
+# changes how much the page has to lay out. Engine-scoped, because servoshell
+# exits on an argument it does not recognise.
+launch_args = ["--chrome=none"]
+device_library = [
+  # OpenHarmony board, then HarmonyOS phone: the arkwebcore bundle is named
+  # differently, and one checkout drives both.
+  "/data/app/el1/bundle/public/com.ohos.arkwebcore/libs/arm64/libarkweb_engine.so",
+  "/data/app/el1/bundle/public/com.huawei.hmos.arkwebcore/libs/arm64/libarkweb_engine.so",
+]
 functions = [
   "WebFrameWidgetImpl::UpdateLifecycle",
   "LocalFrameView::UpdateAllLifecyclePhases",
@@ -99,4 +213,167 @@ functions = [
 proxy_args = [
   "--proxy-uri=$PROXY",
   "--ignore-certificate-errors",
+]
+# Blink emits these under the `nweb` hitrace tag. `performLayout` counts
+# layouts that actually ran (forced or lifecycle-driven), which is the
+# denominator that holds still: measured across 5 cold loads of
+# m.huaweimossel.com it varied 2.9% (251-270), while
+# `Blink.ForcedStyleAndLayout.UpdateTime` varied 21% (6 892-10 869)
+# because most of those calls find style already clean and do no layout.
+reflow_spans = ["LocalFrameView::performLayout"]
+# `LocalFrameView::UpdateStyleAndLayout(`, not the `Document::` one: in Blink
+# the Document entry is the *forced* path (script touching offsetWidth and
+# friends, document.cc), while the lifecycle path reaches
+# LocalFrameView::UpdateStyleAndLayout directly and never passes through it.
+# Servo's counterpart covers every reflow, so using the Document entry divided
+# forced-only Blink instructions by all layouts.
+reflow_instructions = "LocalFrameView::UpdateStyleAndLayout("
+
+
+# --- Comparison groupings (see the servo entry for the semantics) ---------
+
+# Style recalc + layout, excluding paint. The like-for-like counterpart of
+# Servo's `layout_proper`.
+[[engines.group]]
+name = "layout_proper"
+functions = ["LocalFrameView::UpdateStyleAndLayout("]
+
+# Paint lifecycle: the counterpart of Servo's stacking-context tree and
+# display-list building.
+[[engines.group]]
+name = "paint_prep"
+functions = ["LocalFrameView::RunPaintLifecyclePhase", "PrePaintTreeWalk"]
+
+# The grouping used elsewhere in the team. Note these two overlap — lifecycle
+# style+layout runs under `UpdateLifecycle` — so this group deliberately comes
+# out *below* `instructions.Document::UpdateStyleAndLayout(` plus
+# `instructions.WebFrameWidgetImpl::UpdateLifecycle` added by hand. The gap is
+# the double-count in that arithmetic. `UpdateLifecycle` is also mostly not
+# layout: measured 2026-07, only 18% of its inclusive instructions contained a
+# layout frame, the rest being paint and compositing.
+[[engines.group]]
+name = "colleagues_reflow"
+functions = ["Document::UpdateStyleAndLayout(", "WebFrameWidgetImpl::UpdateLifecycle"]
+
+# Servo running as the ArkWeb backend, inside the same wrapper app as the
+# entry above. Bundle matching cannot tell the two apart — both run in the
+# same app — so this entry is selected explicitly with `--engine servo-arkweb`
+# and claims no bundles of its own.
+[[engines]]
+id = "servo-arkweb"
+bundles = []
+# Unstripped `libservo_arkweb.so` from the build that produced the copy on the
+# device — check `/proc/<pid>/maps` for the library that is actually mapped.
+# Stage it under workloads/ with this name.
+symbol_file = "libservo_arkweb.symbols.so"
+launch_args = ["--chrome=none"]
+device_library = ["/system/lib64/libservo_arkweb.so"]
+functions = [
+  # Patterns are matched against rustc-demangled names. An inherent method
+  # renders as `Type::method` under legacy mangling and `<Type>::method` under
+  # v0, so either form here matches either build — servoperf collapses `>::`
+  # when comparing. A target that still reports zero says which of "no symbol
+  # matches" and "symbol found but never sampled" it is.
+  "Layout>::reflow",
+  "Window>::reflow",
+  "LayoutThread>::handle_reflow",
+  # Paint-prep, which `handle_reflow` runs but Blink accounts to the paint
+  # lifecycle rather than to reflow. Subtract these to get the number that
+  # compares like-for-like against `LocalFrameView::UpdateStyleAndLayout`.
+  # `build_stacking_context_tree` survives as a LayoutThread method;
+  # `build_display_list` is inlined and only matches the per-Fragment
+  # helpers, so it undercounts the serial part.
+  "build_display_list",
+  "build_stacking_context_tree",
+  # `restyle_and_build_trees` is inlined into handle_reflow at
+  # codegen-units=1, leaving only rayon job closures — it therefore measures
+  # the *parallel* portions of restyle and fragment-tree building, not the
+  # whole subtree. Add `#[inline(never)]` to it in a measurement build if you
+  # want the Blink-comparable subtree directly.
+  "restyle_and_build_trees",
+  "update_the_rendering",
+]
+# One marker per layout that actually ran, to match Blink's
+# `LocalFrameView::performLayout`.
+#
+# Two earlier choices were both wrong, in the same direction:
+#   * `handle_reflow` fires once per reflow *request*, and most requests find
+#     style and the trees clean and return without laying anything out.
+#     Measured on a PLR-AL00, mossel-user-scroll, one 20 s capture: 11947
+#     `handle_reflow` against 410 `restyle_and_build_trees` and 34 display
+#     lists -- 97% of the calls did no layout work.
+#   * `restyle_and_build_trees` is better but still not "a layout ran": it
+#     emits its span and then returns early in three places (layout_impl.rs:
+#     no restyle, `!token.should_traverse()`, or damage that is
+#     Repaint/RecalculateOverflow with no layout root). That last one is what
+#     a CSS transition or a hover toggle produces -- Blink records zero
+#     `performLayout`, Servo recorded one "reflow".
+#
+# `RanLayout` is an explicit marker emitted from `handle_reflow` only when
+# `ReflowPhasesRun::RanLayout` came back set. It needs a hap built with
+# `--features tracing-hitrace`; a plain release build emits no Servo spans at
+# all and `reflow.count` stays 0. The markers also need a filter at launch:
+# servoperf synthesizes `--tracing-filter=<workload.tracing_filter>`, and
+# without it servoshell leaves the subscriber at LevelFilter::OFF.
+#
+# Only one pattern may be listed: `reflow.count` is the sum across patterns, so
+# adding a diagnostic pattern back would double the total.
+reflow_spans = ["RanLayout"]
+# `<LayoutThread as Layout>::reflow` is the outer entry point and survives
+# LTO. `handle_reflow` and `build_display_list` are inlined into it at
+# codegen-units=1: they resolve to 0 unless the staged symbol file carries
+# DWARF, in which case servoperf attributes the inline chain and they report
+# real numbers. Build with `CARGO_PROFILE_PRODUCTION_DEBUG=1` to get that;
+# without it only this outer symbol is trustworthy.
+reflow_instructions = "Layout>::reflow"
+
+# --- Comparison groupings -------------------------------------------------
+# Each is reported as `instructions.<name>`. A group counts a sample once if
+# the chain contains ANY member, so where a group is smaller than the sum of
+# its members' own metrics, the difference is the overlap between them.
+
+# Style recalc + box/fragment trees: what Blink accounts to
+# `LocalFrameView::UpdateStyleAndLayout`. `restyle_and_build_trees` is inlined
+# at codegen-units=1, so this is a true figure only when the staged symbol file
+# carries DWARF (`CARGO_PROFILE_PRODUCTION_DEBUG=1`); without it the group sees
+# only the parallel restyle and fragment-tree jobs and reads about 3x low.
+[[engines.group]]
+name = "layout_proper"
+functions = ["restyle_and_build_trees"]
+
+# Stacking-context tree + display list. `handle_reflow` runs these, but Blink
+# does the equivalent in its paint lifecycle, so they must be compared against
+# `paint_prep` on the other engine rather than folded into layout.
+[[engines.group]]
+name = "paint_prep"
+functions = ["build_stacking_context_tree", "build_display_list"]
+
+# The grouping used elsewhere in the team: the script-side reflow entry point,
+# which covers style, layout, paint prep, the a11y tree and scroll nodes.
+[[engines.group]]
+name = "colleagues_reflow"
+functions = ["Window>::reflow"]
+
+# Servo hands restyle and box/fragment-tree building to stylo's rayon pool
+# (`layout_threads`, default 3). A worker's stack is rooted at the rayon loop,
+# so nothing in it names `restyle_and_build_trees` or `Layout>::reflow` and the
+# sample would be dropped -- while Blink's single-threaded equivalent is
+# counted in full. Measured on a PLR-AL00 by serialising the pool
+# (`--pref layout_threads=1`): `layout_proper` rose 34.8% and
+# `colleagues_reflow` 5.9%, i.e. at least a quarter of Servo's style and layout
+# work was invisible, always in the direction that flattered Servo.
+#
+# The pool is used for nothing but restyle and layout, so a sample on one of
+# its threads is layout work by construction. Credit it to the phases that
+# contain it. `paint_prep` is deliberately absent: the stacking-context tree
+# and the display list are built on the script thread.
+[[engines.parallel_pool]]
+threads = ["StyleThread#"]
+credit = [
+  "layout_proper",
+  "colleagues_reflow",
+  "Layout>::reflow",
+  "Window>::reflow",
+  "LayoutThread>::handle_reflow",
+  "update_the_rendering",
 ]

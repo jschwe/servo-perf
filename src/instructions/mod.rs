@@ -1,9 +1,9 @@
 //! Per-function instruction counting via `hiperf record -a -e hw-instructions`.
 //!
 //! Disabled by default; opt in with `--with-instructions`. When enabled, each
-//! iteration runs `hiperf record` in parallel with the existing hitrace
-//! capture (same time window, same device), then post-processes the perf.data
-//! into per-function inclusive instruction counts using
+//! iteration runs `hiperf record` alongside the hitrace capture, then
+//! post-processes the perf.data into per-function inclusive instruction counts
+//! using
 //! [`crate::instructions::perf_data`].
 //!
 //! Engine selection (which set of function-name substrings to aggregate) is
@@ -19,7 +19,9 @@
 mod perf_data;
 pub mod symbols;
 
-pub use perf_data::aggregate_inclusive_from_perf_data;
+pub use perf_data::{
+    aggregate_inclusive_from_perf_data, profile_from_perf_data, sample_episodes, Aggregation,
+};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -54,6 +56,91 @@ pub struct EngineConfig {
     /// `workload_args_to_aa_params`.
     #[serde(default)]
     pub proxy_args: Vec<String>,
+    /// Trace-span name substrings that each denote one completed layout
+    /// run. Counted from the iteration's hitrace capture to give the
+    /// denominator of `instructions.per_reflow`. Case-sensitive substring
+    /// match, so it works against both Servo's bare span names and the
+    /// `H:`-prefixed markers OHOS system emitters use.
+    #[serde(default)]
+    pub reflow_spans: Vec<String>,
+    /// Which entry of `functions` — or which `group` name — is the reflow
+    /// numerator. When set (and `reflow_spans` produced a non-zero count) the
+    /// bench also reports `instructions.per_reflow`.
+    #[serde(default)]
+    pub reflow_instructions: Option<String>,
+    /// Launch flags this engine's app understands, injected on every run.
+    ///
+    /// Engine-scoped rather than per workload because they are app-specific:
+    /// servoshell's argument parser exits on a flag it does not know, so a
+    /// wrapper-app flag in a shared workload silently kills every servoshell
+    /// iteration.
+    #[serde(default)]
+    pub launch_args: Vec<String>,
+    /// Where this engine's library lives on the device, so its build id can
+    /// be checked against the staged symbol file before a run.
+    ///
+    /// A list, because the path is device-specific — the arkwebcore bundle is
+    /// named differently on an OpenHarmony board and a HarmonyOS phone — and
+    /// one checkout drives both. The first that exists is used.
+    ///
+    /// Empty skips the check, and the run then trusts that the staged file is
+    /// the build that is installed, which is exactly the assumption that
+    /// produces confident wrong attributions after a rebuild.
+    #[serde(default)]
+    pub device_library: Vec<String>,
+    /// Named sums over several `functions` patterns, for reporting a phase
+    /// that no single symbol covers — Servo's paint prep is a stacking-context
+    /// tree plus a display list, for instance.
+    ///
+    /// A group is **not** the sum of its members' individual metrics: a sample
+    /// is credited to the group once if its callchain contains *any* member,
+    /// so nested members are not double-counted. Where a group sits below the
+    /// arithmetic sum of its parts, the difference is exactly that overlap.
+    #[serde(default, rename = "group")]
+    pub groups: Vec<MetricGroup>,
+    /// Worker pools whose samples belong to a phase their own callchain does
+    /// not name. See [`ParallelPool`].
+    #[serde(default, rename = "parallel_pool")]
+    pub parallel_pools: Vec<ParallelPool>,
+}
+
+/// A thread pool that runs part of a phase off the thread that entered it.
+///
+/// Attribution here is per sample, against that sample's own callchain. That
+/// works for a single-threaded engine and breaks for a parallel one: Servo
+/// hands style and box/fragment-tree building to a rayon pool, and a worker's
+/// stack is rooted at the rayon loop, so no frame names
+/// `restyle_and_build_trees` or `<LayoutThread as Layout>::reflow`. Those
+/// samples were dropped while Blink's single-threaded equivalent was counted
+/// in full — a one-sided undercount. Measured on a PLR-AL00 by serialising the
+/// pool (`--pref layout_threads=1`), Servo's `layout_proper` rose 34.8% and
+/// `colleagues_reflow` 5.9%, so at least a quarter of its style and layout
+/// work was invisible.
+///
+/// Forcing the pool off would measure a configuration nobody ships, so instead
+/// the in-library samples taken *on* these threads are credited to the named
+/// targets, once each per sample like any other match.
+///
+/// This is only sound for a pool dedicated to the phase being credited. Servo's
+/// `StyleThread#N` pool is used solely for restyle and layout, so a sample on
+/// one is layout work by construction.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ParallelPool {
+    /// Thread-name prefixes, matched against `PERF_RECORD_COMM`. The kernel
+    /// truncates `comm` to 15 bytes, so keep these short.
+    pub threads: Vec<String>,
+    /// `functions` entries and `group` names to credit. A name that matches
+    /// neither is rejected at load time rather than silently crediting
+    /// nothing.
+    pub credit: Vec<String>,
+}
+
+/// One named sum over `functions` patterns. Reported as
+/// `instructions.<name>` alongside the per-symbol counts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricGroup {
+    pub name: String,
+    pub functions: Vec<String>,
 }
 
 impl InstructionsConfig {
@@ -63,6 +150,28 @@ impl InstructionsConfig {
             .with_context(|| format!("reading instructions config at {}", path.display()))?;
         let cfg: InstructionsConfig =
             toml::from_str(&text).with_context(|| format!("parsing TOML at {}", path.display()))?;
+        // A `credit` name that matches no target would silently credit
+        // nothing, which looks exactly like the undercount the pool exists to
+        // fix. Reject it here instead.
+        for engine in &cfg.engines {
+            for pool in &engine.parallel_pools {
+                for name in &pool.credit {
+                    let known = engine.functions.iter().any(|f| f == name)
+                        || engine.groups.iter().any(|g| &g.name == name);
+                    anyhow::ensure!(
+                        known,
+                        "engine {:?}: parallel_pool credits {name:?}, which is neither one of \
+                         its `functions` nor one of its `group` names",
+                        engine.id
+                    );
+                }
+                anyhow::ensure!(
+                    !pool.threads.is_empty(),
+                    "engine {:?}: parallel_pool has no `threads`",
+                    engine.id
+                );
+            }
+        }
         Ok(cfg)
     }
 
@@ -70,6 +179,12 @@ impl InstructionsConfig {
     /// claims the bundle — caller falls back to skipping instruction
     /// collection (with a one-line stderr warning) so an unknown bundle
     /// doesn't fail the bench.
+    /// Engine selection by explicit `id` (`--engine`). Takes precedence over
+    /// bundle matching, for bundles whose engine is switchable at runtime.
+    pub fn engine_by_id(&self, id: &str) -> Option<&EngineConfig> {
+        self.engines.iter().find(|e| e.id == id)
+    }
+
     pub fn engine_for_bundle(&self, bundle: &str) -> Option<&EngineConfig> {
         self.engines
             .iter()
@@ -88,4 +203,208 @@ impl DevicePaths {
     pub const PERF_REPORT_TXT: &str = "/data/local/tmp/servoperf_iter.stack.txt";
     pub const SYMBOL_DIR: &str = "/data/local/tmp/symbols";
     pub const SYMBOL_FILE: &str = "/data/local/tmp/symbols/libarkweb_engine.so";
+}
+
+/// Count completed reflows in one iteration's trace.
+///
+/// Returns `reflow.count` (the total across every configured pattern)
+/// plus one `reflow.count.<pattern>` per pattern, so a mis-specified
+/// pattern is visible rather than silently folded into the total.
+///
+/// Counting *spans* rather than begin-markers means a layout that starts
+/// inside the capture window but ends after it is not counted; that
+/// undercounts by at most one per run.
+pub fn reflow_span_starts(
+    slices: &[crate::trace::Slice],
+    engine: &EngineConfig,
+) -> std::collections::BTreeMap<String, Vec<u64>> {
+    let mut out = std::collections::BTreeMap::new();
+    for pattern in &engine.reflow_spans {
+        let starts: Vec<u64> = slices
+            .iter()
+            .filter(|s| s.name.contains(pattern))
+            .map(|s| s.ts_ns)
+            .collect();
+        out.insert(pattern.clone(), starts);
+    }
+    out
+}
+
+/// Count the reflows inside `window`, the interval the instruction counts
+/// actually came from.
+///
+/// Without this the two halves of `instructions.per_reflow` describe different
+/// intervals: hitrace is running before `aa start` and keeps recording while
+/// `--trace_finish` flushes, so the denominator spans measurably more than the
+/// PMU window (measured on one 20 s capture: a 49.5 s trace against a 20.0 s
+/// sample window).
+///
+/// Both clocks are pinned to CLOCK_BOOTTIME — hitrace's default, and
+/// hiperf's only because `run_hiperf_record` passes `--clockid boottime`;
+/// hiperf's own default leaves samples on the perf clock, which stops across
+/// suspend.
+///
+/// `window` is `None` when instruction counting is off, or when the capture
+/// produced no timestamped sample; the whole trace is then counted, which is
+/// the right answer for a `reflow.count` that is not a denominator.
+pub fn count_reflow_spans_in(
+    starts: &std::collections::BTreeMap<String, Vec<u64>>,
+    window: Option<(u64, u64)>,
+) -> std::collections::BTreeMap<String, f64> {
+    let mut out = std::collections::BTreeMap::new();
+    if starts.is_empty() {
+        return out;
+    }
+    let mut total = 0u64;
+    for (pattern, ts) in starts {
+        let n = ts
+            .iter()
+            .filter(|t| match window {
+                Some((lo, hi)) => **t >= lo && **t <= hi,
+                None => true,
+            })
+            .count() as u64;
+        total += n;
+        out.insert(format!("reflow.count.{pattern}"), n as f64);
+    }
+    if total == 0 {
+        // No reflow was seen at all. That is a measurement that did not
+        // happen, not a measurement of zero: recording it would drag the
+        // median of every other iteration in the run. The caller warns.
+        return std::collections::BTreeMap::new();
+    }
+    out.insert("reflow.count".to_string(), total as f64);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::Slice;
+
+    fn slice_at(name: &str, ts_ns: u64) -> Slice {
+        Slice {
+            ts_ns,
+            ..slice(name)
+        }
+    }
+
+    fn slice(name: &str) -> Slice {
+        Slice {
+            name: name.to_string(),
+            thread: "t".into(),
+            ts_ns: 0,
+            dur_ns: 0,
+            debug_annotations: vec![],
+        }
+    }
+
+    #[test]
+    fn groups_are_seeded_and_named_alongside_functions() {
+        let cfg = InstructionsConfig::load(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/workloads"
+        )))
+        .expect("workloads/_instructions.toml parses");
+        for engine in &cfg.engines {
+            let names: Vec<&str> = engine.groups.iter().map(|g| g.name.as_str()).collect();
+            assert!(
+                names.contains(&"layout_proper")
+                    && names.contains(&"paint_prep")
+                    && names.contains(&"colleagues_reflow"),
+                "engine {:?} is missing a comparison group: {names:?}",
+                engine.id
+            );
+            for g in &engine.groups {
+                assert!(!g.functions.is_empty(), "group {:?} is empty", g.name);
+                // A group name that collides with a symbol pattern would have
+                // the two fight over the same metric key.
+                assert!(
+                    !engine.functions.contains(&g.name),
+                    "group {:?} collides with a functions entry",
+                    g.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn counts_only_the_spans_inside_the_sampled_window() {
+        let engine = EngineConfig {
+            id: "arkweb".into(),
+            bundles: vec![],
+            symbol_file: String::new(),
+            functions: vec![],
+            proxy_args: vec![],
+            reflow_spans: vec!["performLayout".into()],
+            reflow_instructions: None,
+            groups: vec![],
+            parallel_pools: vec![],
+            launch_args: vec![],
+            device_library: vec![],
+        };
+        let mut slices = vec![
+            slice_at("H:LocalFrameView::performLayout", 50), // before the window
+            slice_at("H:LocalFrameView::performLayout", 150),
+            slice_at("H:LocalFrameView::performLayout", 250),
+            slice_at("H:LocalFrameView::performLayout", 950), // after the window
+        ];
+        slices.push(slice_at("H:Something::else", 150));
+        let starts = reflow_span_starts(&slices, &engine);
+
+        // Narrowed to the interval the instruction samples came from.
+        let m = count_reflow_spans_in(&starts, Some((100, 300)));
+        assert_eq!(m["reflow.count"], 2.0);
+        // A window containing none of them yields no metric at all, rather
+        // than a zero that would be averaged in as if it were data.
+        assert!(count_reflow_spans_in(&starts, Some((400, 500))).is_empty());
+        // Without a window — no instruction counting — the whole trace counts.
+        let m = count_reflow_spans_in(&starts, None);
+        assert_eq!(m["reflow.count"], 4.0);
+    }
+
+    #[test]
+    fn counts_reflow_spans_by_substring() {
+        let engine = EngineConfig {
+            id: "arkweb".into(),
+            bundles: vec![],
+            symbol_file: String::new(),
+            functions: vec![],
+            proxy_args: vec![],
+            reflow_spans: vec!["LocalFrameView::performLayout".into()],
+            reflow_instructions: None,
+            groups: vec![],
+            parallel_pools: vec![],
+            launch_args: vec![],
+            device_library: vec![],
+        };
+        let slices = vec![
+            slice("H:LocalFrameView::performLayout"),
+            slice("H:LocalFrameView::performLayout"),
+            slice("H:UpdateLayoutTree"),
+        ];
+        let m = count_reflow_spans_in(&reflow_span_starts(&slices, &engine), None);
+        assert_eq!(m["reflow.count"], 2.0);
+        assert_eq!(m["reflow.count.LocalFrameView::performLayout"], 2.0);
+    }
+
+    #[test]
+    fn no_patterns_yields_no_metrics() {
+        let engine = EngineConfig {
+            id: "x".into(),
+            bundles: vec![],
+            symbol_file: String::new(),
+            functions: vec![],
+            proxy_args: vec![],
+            reflow_spans: vec![],
+            reflow_instructions: None,
+            groups: vec![],
+            parallel_pools: vec![],
+            launch_args: vec![],
+            device_library: vec![],
+        };
+        assert!(
+            count_reflow_spans_in(&reflow_span_starts(&[slice("a")], &engine), None).is_empty()
+        );
+    }
 }

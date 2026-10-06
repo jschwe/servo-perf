@@ -40,12 +40,28 @@ pub struct ConfigResults {
 
 #[derive(Debug, Serialize)]
 pub struct RunResults {
+    /// True when the run was interrupted rather than completing its planned
+    /// iterations. Without it a stopped run is indistinguishable from a
+    /// finished one: it writes the same files and exits 0.
+    #[serde(default)]
+    pub cancelled: bool,
+    /// The command line this run was invoked with, so the report reproduces
+    /// what actually ran rather than a guess reassembled from the results.
+    #[serde(default)]
+    pub command: String,
     pub tool_version: String,
     pub timestamp_utc: String,
     pub workload: Workload,
     pub configs: BTreeMap<String, ConfigResults>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub deltas: BTreeMap<String, SummaryDelta>,
+    /// Build id of the engine library, as checked against the device before
+    /// the run: the staged symbol file and the installed library both had it.
+    /// Lets later analysis (`servoperf profile`) refuse symbols from another
+    /// build — the captures themselves carry no build ids, and a mismatch
+    /// yields a plausible profile of the wrong code rather than an error.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub symbols_build_id: Option<String>,
 }
 
 pub fn write_json(out_dir: &Path, data: &RunResults) -> Result<()> {
@@ -55,6 +71,77 @@ pub fn write_json(out_dir: &Path, data: &RunResults) -> Result<()> {
     serde_json::to_writer_pretty(file, data)
         .with_context(|| format!("writing JSON to {}", path.display()))?;
     Ok(())
+}
+
+/// Render a Unix timestamp as `YYYY-MM-DD HH:MM:SS UTC`.
+///
+/// Civil-from-days per Howard Hinnant's algorithm, so the report carries a
+/// date a reader can compare against a lab notebook without pulling in a
+/// date-time crate for one line of output.
+pub fn format_utc(secs: i64) -> String {
+    let (y, m, d, h, mi, sec) = civil_from_unix(secs);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{sec:02} UTC")
+}
+
+/// The same instant as a directory-name component: `20260910-163045`.
+///
+/// No colons or spaces — a path with either is awkward on Windows, and these
+/// names end up in shell commands and report links.
+pub fn format_utc_compact(secs: i64) -> String {
+    let (y, m, d, h, mi, sec) = civil_from_unix(secs);
+    format!("{y:04}{m:02}{d:02}-{h:02}{mi:02}{sec:02}")
+}
+
+fn civil_from_unix(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, sec) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Shift the epoch to 0000-03-01 so leap days land at the end of the cycle.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d, h, mi, sec)
+}
+
+/// The current process's command line, shell-quoted well enough to paste back.
+pub fn invocation() -> String {
+    std::env::args()
+        .map(|a| {
+            if a.is_empty() || a.contains([' ', '"', '\'', '$', '`']) {
+                format!("'{}'", a.replace('\'', "'\\''"))
+            } else {
+                a
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The current time, formatted for a report header.
+pub fn now_utc() -> String {
+    format_utc(unix_now())
+}
+
+/// Default output directory for a run: `out/<name>-<YYYYMMDD-HHMMSS>`.
+///
+/// Shared by every command. Three copies of this is how `suite` kept writing
+/// epoch seconds after the other two were fixed.
+pub fn default_out_dir(name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from("out").join(format!("{}-{}", name, format_utc_compact(unix_now())))
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64
 }
 
 pub fn write_markdown(out_dir: &Path, data: &RunResults) -> Result<()> {
@@ -124,6 +211,9 @@ fn fcp_bar(ms: f64, max: f64, width: usize) -> String {
 /// stays aligned with the iteration list.
 fn render_per_iter_chart(s: &mut String, short: &str, metric: &str, cfg: &ConfigResults) {
     writeln!(s, "### Per-iteration {}\n", short).unwrap();
+    // Fenced: without it Markdown reflows the rows into one paragraph and the
+    // bars stop lining up.
+    writeln!(s, "```").unwrap();
     let bar_width = 30usize;
     let max_v = cfg
         .iterations
@@ -152,7 +242,164 @@ fn render_per_iter_chart(s: &mut String, short: &str, metric: &str, cfg: &Config
             }
         }
     }
+    writeln!(s, "```\n").unwrap();
+}
+
+/// Presented-frame metrics for scenario workloads. Rendered only when the
+/// run produced them, so page-load reports are unchanged.
+///
+/// The unfiltered `presented.fps` is listed first and any post-processed
+/// interpretation after it, so a reader always sees what the device actually
+/// presented before seeing a number that reinterprets it.
+/// Per-thread CPU cost, when the scenario asked for it.
+///
+/// The row to read against `frame_time_ms.p50`: a thread whose CPU per frame
+/// approaches the frame time is the one the frame is waiting on, and the sum
+/// over all threads against the frame time says how much parallelism is
+/// actually being had.
+fn render_thread_cpu_section(s: &mut String, cfg: &ConfigResults) {
+    const PREFIX: &str = "thread_cpu_ms_per_frame.";
+    let mut keys: Vec<&String> = cfg
+        .iterations
+        .iter()
+        .filter_map(|i| match &i.status {
+            IterationStatus::Ok { metrics, .. } => Some(metrics),
+            _ => None,
+        })
+        .flat_map(|m| m.keys())
+        .filter(|k| k.starts_with(PREFIX))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    if keys.is_empty() {
+        return;
+    }
+
+    let median = |key: &str| -> Option<f64> {
+        let v: Vec<f64> = cfg
+            .iterations
+            .iter()
+            .filter_map(|i| match &i.status {
+                IterationStatus::Ok { metrics, .. } => metrics.get(key).copied(),
+                _ => None,
+            })
+            .collect();
+        crate::stats::summarise(&v).map(|s| s.p50)
+    };
+
+    let mut rows: Vec<(String, f64)> = keys
+        .iter()
+        .filter(|k| k.as_str() != "thread_cpu_ms_per_frame.total")
+        .filter_map(|k| median(k).map(|v| (k[PREFIX.len()..].to_string(), v)))
+        .collect();
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    writeln!(s, "### CPU per presented frame, by thread\n").unwrap();
+    writeln!(
+        s,
+        "`CPU ms/frame` divided by `threads` is the floor this group puts under the frame time; \
+         `busy` is how much of one core it kept.\n"
+    )
+    .unwrap();
+    writeln!(s, "| thread | CPU ms/frame | threads | per thread | busy |").unwrap();
+    writeln!(s, "|---|---:|---:|---:|---:|").unwrap();
+    for (name, v) in &rows {
+        let n = median(&format!("thread_count.{name}"))
+            .unwrap_or(1.0)
+            .max(1.0);
+        let busy = median(&format!("thread_core_pct.{name}")).unwrap_or(0.0);
+        writeln!(
+            s,
+            "| {name} | {v:.2} | {n:.0} | {:.2} | {busy:.0}% |",
+            v / n
+        )
+        .unwrap();
+    }
+    if let Some(total) = median("thread_cpu_ms_per_frame.total") {
+        writeln!(s, "| **all threads** | **{total:.2}** | | | |").unwrap();
+    }
     writeln!(s).unwrap();
+}
+
+fn render_scenario_section(s: &mut String, cfg: &ConfigResults) {
+    const ROWS: &[(&str, &str, &str)] = &[
+        ("presented.fps", "Presented fps", ""),
+        ("presented.fps_active", "…excluding idle gaps", ""),
+        ("frame_time_ms.p10", "Frame time p10", " ms"),
+        ("frame_time_ms.p25", "Frame time p25", " ms"),
+        ("frame_time_ms.p50", "Frame time p50", " ms"),
+        ("frame_time_ms.p75", "Frame time p75", " ms"),
+        ("frame_time_ms.p95", "Frame time p95", " ms"),
+        ("frame_time_ms.p99", "Frame time p99", " ms"),
+        ("presented.idle_pct", "Idle share", " %"),
+        ("presented.frames", "Frames presented", ""),
+        ("presented.frames_near_gap", "Frames near the idle gap", ""),
+        ("presented.window_coverage_pct", "Window coverage", " %"),
+        ("presented.lost_sample_windows", "Lost sample windows", ""),
+        (
+            "frame_time_ms.vsync1_pct",
+            "…presented at the next vsync",
+            " %",
+        ),
+        ("frame_time_ms.vsync2_pct", "…one vsync late", " %"),
+        ("frame_time_ms.vsync3_pct", "…two vsyncs late", " %"),
+        (
+            "frame_time_ms.vsync4plus_pct",
+            "…three or more vsyncs late",
+            " %",
+        ),
+    ];
+
+    let samples = |key: &str| -> Vec<f64> {
+        cfg.iterations
+            .iter()
+            .filter_map(|i| match &i.status {
+                IterationStatus::Ok { metrics, .. } => metrics.get(key).copied(),
+                _ => None,
+            })
+            .collect()
+    };
+
+    writeln!(s, "### Presented frames\n").unwrap();
+    writeln!(s, "| metric | p50 | min | max | n |").unwrap();
+    writeln!(s, "|---|---|---|---|---|").unwrap();
+    for (key, label, unit) in ROWS {
+        let v = samples(key);
+        if v.is_empty() {
+            continue;
+        }
+        let Some(sum) = crate::stats::summarise(&v) else {
+            continue;
+        };
+        writeln!(
+            s,
+            "| {label} | {:.2}{unit} | {:.2} | {:.2} | {} |",
+            sum.p50,
+            v.iter().cloned().fold(f64::INFINITY, f64::min),
+            v.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+            v.len()
+        )
+        .unwrap();
+    }
+    writeln!(s).unwrap();
+
+    render_thread_cpu_section(s, cfg);
+
+    // Frames sitting just under the idle threshold are the ones the filter
+    // would censor next; a large share means the threshold is too low for
+    // this workload and `presented.fps_active` is flattering it.
+    let near: f64 = samples("presented.frames_near_gap").iter().sum();
+    let total: f64 = samples("presented.frames").iter().sum();
+    if total > 0.0 && near / total > 0.1 {
+        writeln!(
+            s,
+            "> {:.0}% of frames fall within a factor of two below the idle-gap \
+             threshold. Raise `gap_ms` for this workload, or read \
+             `presented.fps` rather than `presented.fps_active`.\n",
+            100.0 * near / total
+        )
+        .unwrap();
+    }
 }
 
 /// Append a "Thermal" section with a min/max/peak-delta summary and a
@@ -163,6 +410,9 @@ fn render_per_iter_chart(s: &mut String, short: &str, metric: &str, cfg: &Config
 fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
     fn mc_to_c(mc: f64) -> f64 {
         mc / 1000.0
+    }
+    fn all_equal(v: &[f64]) -> bool {
+        v.len() > 1 && v.windows(2).all(|w| w[0] == w[1])
     }
     let befores: Vec<f64> = cfg
         .iterations
@@ -195,7 +445,17 @@ fn render_thermal_section(s: &mut String, cfg: &ConfigResults) {
         })
         .collect();
 
-    writeln!(s, "### SoC thermal (zone0 `soc_thermal`, 70 °C trip)\n").unwrap();
+    writeln!(s, "### SoC thermal\n").unwrap();
+    if all_equal(&befores) && all_equal(&afters) {
+        writeln!(
+            s,
+            "> Every iteration reported the same before and after value. That is a static \
+             zone, not a thermally flat run — some devices pin a placeholder here (PLR-AL00 \
+             reports a flat 30000 m°C on `soc_thermal` under any load). Re-run with \
+             `--ohos-thermal-zone board_thermal`, or read these two columns as unavailable.\n"
+        )
+        .unwrap();
+    }
     let min_temp = befores
         .iter()
         .chain(afters.iter())
@@ -319,7 +579,18 @@ fn render_markdown(data: &RunResults) -> String {
         "bench"
     };
     writeln!(s, "## Reproduction\n").unwrap();
-    if subcommand == "ab" {
+    if data.cancelled {
+        writeln!(
+            s,
+            "> **This run was interrupted.** It reports the iterations that completed \
+             before the stop, so its `n` is smaller than the workload asked for and any \
+             comparison against it is over fewer samples.\n"
+        )
+        .unwrap();
+    }
+    if !data.command.is_empty() {
+        writeln!(s, "```\n{}\n```\n", data.command).unwrap();
+    } else if subcommand == "ab" {
         let base_bin = data
             .configs
             .get("base")
@@ -523,6 +794,14 @@ fn render_markdown(data: &RunResults) -> String {
         }) {
             render_thermal_section(&mut s, cfg);
         }
+
+        // Scenario workloads only: what the display actually showed.
+        if cfg.iterations.iter().any(|i| {
+            matches!(&i.status, IterationStatus::Ok { metrics, .. }
+                if metrics.contains_key("presented.fps"))
+        }) {
+            render_scenario_section(&mut s, cfg);
+        }
     }
 
     if !data.deltas.is_empty() {
@@ -539,6 +818,33 @@ fn render_markdown(data: &RunResults) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Guards the shape of what every command derives its output directory
+    /// and report header from. The previous bug was not a broken formatter but
+    /// a call site that kept its own copy of the epoch-seconds version.
+    #[test]
+    fn shared_helpers_produce_dates_not_epochs() {
+        let dir = super::default_out_dir("mossel");
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("mossel-"), "{name}");
+        let stamp = name.trim_start_matches("mossel-");
+        assert_eq!(stamp.len(), 15, "expected YYYYMMDD-HHMMSS, got {stamp}");
+        assert_eq!(&stamp[8..9], "-");
+        assert!(stamp.chars().filter(|c| c.is_ascii_digit()).count() == 14);
+        let now = super::now_utc();
+        assert!(now.ends_with(" UTC") && now.starts_with("20"), "{now}");
+    }
+
+    #[test]
+    fn utc_formatting_matches_a_known_instant() {
+        // 2026-09-10T20:30:45Z
+        let t = 1_789_072_245;
+        assert_eq!(super::format_utc(t), "2026-09-10 20:30:45 UTC");
+        assert_eq!(super::format_utc_compact(t), "20260910-203045");
+        // Epoch, and a leap day, to exercise the civil-date arithmetic.
+        assert_eq!(super::format_utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(super::format_utc_compact(1_709_164_800), "20240229-000000");
+    }
+
     use super::*;
     use crate::stats::summarise;
     use crate::trace::CriticalPathReport;
@@ -555,6 +861,9 @@ mod tests {
             device_pixel_ratio: None,
             servoshell_args: vec![],
             fixture: None,
+            scenario: None,
+            steps: vec![],
+            lcp: false,
         }
     }
 
@@ -590,11 +899,14 @@ mod tests {
         );
 
         let data = RunResults {
+            cancelled: false,
+            command: "servoperf bench demo --ohos".to_string(),
             tool_version: "0.1.0".into(),
             timestamp_utc: "2026-04-22T12:00:00Z".into(),
             workload: dummy_workload(),
             configs,
             deltas: BTreeMap::new(),
+            symbols_build_id: None,
         };
         let md = super::render_markdown(&data);
         assert!(md.contains("# servoperf — `test`"));

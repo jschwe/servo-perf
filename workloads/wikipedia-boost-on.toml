@@ -1,0 +1,12 @@
+name = "wikipedia-boost-on"
+url = "https://en.wikipedia.org/wiki/Servo_(software)"
+iterations = 15
+viewport = [824, 1830]
+device_pixel_ratio = 2.625
+servoshell_args = ["--ignore-certificate-errors", "--pref=thread_frame_path_boost_enabled=true"]
+
+# Article page with an infobox image and large text blocks: renders
+# real content and produces genuine LCP candidates.
+[fixture]
+kind = "wpr-replay"
+archive = "wikipedia.wprgo"

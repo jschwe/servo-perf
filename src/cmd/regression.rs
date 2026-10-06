@@ -36,6 +36,10 @@ pub fn run(args: RegressionArgs) -> Result<()> {
         bin: args.bin.clone(),
         iterations: args.iterations,
         out: args.out.clone(),
+        tracing_filter: None,
+        live: false,
+        lcp: false,
+        workload_def: None,
         ohos: args.ohos.clone(),
     };
     bench::run(bench_args)?;

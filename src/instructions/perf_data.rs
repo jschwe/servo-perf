@@ -19,7 +19,15 @@
 //!    `target/.../release/libservoshell.so` whose BuildID matches the
 //!    installed bundle). Iterate `.symtab`, keep `STT_FUNC` symbols, store
 //!    each as a `(virt_start, virt_end, demangled_name)` triple sorted by
-//!    `virt_start` for binary search.
+//!    `virt_start` for binary search. When the library also carries
+//!    `.debug_info`, an addr2line context is built alongside it so an address
+//!    resolves to the whole inline chain rather than to whichever function
+//!    the compiler folded the code into — without it an inlined boundary
+//!    reports **0**, which reads as "this phase is free" rather than "this
+//!    measurement is blind". Build the library with `debug = 1`: that is the
+//!    cheapest level carrying `DW_AT_linkage_name`, so inline frames demangle
+//!    to the same `<Type>::method` form the symbol-table path produces and
+//!    existing patterns keep matching.
 //! 2. Stream the perf.data once, accumulating two pieces of state:
 //!    - per-PID interval list of `MMAP2` mappings (address range +
 //!      page-offset + path basename) so an IP can be resolved to a
@@ -48,6 +56,36 @@ use std::path::Path;
 
 use crate::instructions::EngineConfig;
 
+/// What one `perf.data` yielded.
+pub struct Aggregation {
+    /// Inclusive instruction counts, keyed by configured target or group.
+    pub totals: HashMap<String, u64>,
+    /// How many samples the file held, and how many had at least one frame
+    /// inside the engine library. Without these a total of zero cannot be
+    /// told from an analysis that resolved nothing.
+    pub samples_seen: u64,
+    pub samples_in_library: u64,
+    /// Process names that contributed at least one in-library sample, with
+    /// their counts. `hiperf record -a` is system-wide and attribution here is
+    /// by library, so *any* process mapping the engine `.so` lands in
+    /// `totals` — a second browser tab's renderer, another app embedding the
+    /// same webview. Reporting who contributed is what makes that visible
+    /// instead of silently inflating the run.
+    pub library_samples_by_process: HashMap<String, u64>,
+    /// Targets whose patterns matched at least one symbol in the staged
+    /// library. A zero for one of these is a real zero — the phase ran no
+    /// instructions this iteration — while a zero for a target *not* here
+    /// means the pattern found nothing and the number is meaningless. Callers
+    /// need the distinction to decide which zeros belong in a median.
+    pub resolved_targets: std::collections::HashSet<String>,
+    /// First and last sample timestamp, in the same monotonic clock the
+    /// hitrace slices carry — so the trace can be narrowed to exactly the
+    /// interval these instructions came from.
+    ///
+    /// `None` when the capture produced no timestamped sample.
+    pub window: Option<(u64, u64)>,
+}
+
 /// Aggregate per-target inclusive hw-instruction counts from one
 /// `perf.data` produced by `hiperf record -a -e hw-instructions`.
 ///
@@ -62,23 +100,52 @@ pub fn aggregate_inclusive_from_perf_data(
     perf_data_path: &Path,
     engine: &EngineConfig,
     workloads_dir: &Path,
-) -> Result<HashMap<String, u64>> {
-    let mut totals: HashMap<String, u64> =
-        engine.functions.iter().map(|t| (t.clone(), 0u64)).collect();
+) -> Result<Aggregation> {
+    let mut window: Option<(u64, u64)> = None;
+    let mut samples_seen = 0u64;
+    let mut samples_in_library = 0u64;
+    let mut dropped_no_period = 0u64;
+    let mut dropped_no_mappings = 0u64;
+    let mut other_dsos: rustc_hash::FxHashMap<String, u64> = Default::default();
+    let mut totals: HashMap<String, u64> = engine
+        .functions
+        .iter()
+        .map(|t| (t.clone(), 0u64))
+        .chain(engine.groups.iter().map(|g| (g.name.clone(), 0u64)))
+        .collect();
 
     if engine.symbol_file.is_empty() {
         // Caller's already warned about this; produce empty results so the
         // bench keeps running.
-        return Ok(totals);
+        return Ok(Aggregation {
+            totals,
+            window: None,
+            samples_seen: 0,
+            samples_in_library: 0,
+            library_samples_by_process: HashMap::new(),
+            resolved_targets: std::collections::HashSet::new(),
+        });
     }
 
     let sym_path = workloads_dir.join(&engine.symbol_file);
-    let symbols = SymbolIndex::load(&sym_path)
-        .with_context(|| format!("loading symbols from {}", sym_path.display()))?;
+    let symbolizer = Symbolizer::load(&sym_path)?;
     // The DSO basename hiperf records under MMAP2's path field (e.g.
     // "libarkweb_engine.so" or "libservoshell.so"). Pre-compute the symbol
     // file's basename for the same comparison.
     let symbol_basename = sym_basename_from_path(&engine.symbol_file);
+    if symbolizer.has_inline_info()
+        && crate::log_once::first_time(&format!("dwarf:{}", sym_path.display()))
+    {
+        eprintln!(
+            "instructions: {} carries DWARF; inlined functions are attributed",
+            sym_path.display()
+        );
+    }
+    // Reused across samples so the hot loop allocates nothing.
+    let mut cache = MatchCache::new();
+    let mut scratch_names: Vec<String> = Vec::new();
+    let mut scratch_match = AddressMatch::default();
+    let mut frame_ips: Vec<u64> = Vec::with_capacity(64);
 
     let file = File::open(perf_data_path)
         .with_context(|| format!("opening {}", perf_data_path.display()))?;
@@ -93,6 +160,36 @@ pub fn aggregate_inclusive_from_perf_data(
     // per pid is fine: perf records hundreds of mmaps for a typical
     // capture, and binary search on the Vec is ~O(log n) per lookup.
     let mut mmaps_by_pid: HashMap<i32, Vec<Mapping>> = HashMap::new();
+    // Process name per pid, from PERF_RECORD_COMM. Used only to report (and
+    // optionally restrict) which processes the totals came from.
+    let mut comm_by_pid: HashMap<i32, String> = HashMap::new();
+    let mut library_samples_by_process: HashMap<String, u64> = HashMap::new();
+    // Per-*thread* names, for crediting worker pools whose callchains do not
+    // name the phase they are running. See `ParallelPool`.
+    let mut comm_by_tid: HashMap<i32, String> = HashMap::new();
+    // Resolved once: which target/group slots each pool credits.
+    let pool_targets: Vec<(&crate::instructions::ParallelPool, Vec<usize>, Vec<usize>)> = engine
+        .parallel_pools
+        .iter()
+        .map(|pool| {
+            let funcs = engine
+                .functions
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| pool.credit.iter().any(|c| c == *f))
+                .map(|(i, _)| i)
+                .collect();
+            let groups = engine
+                .groups
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| pool.credit.iter().any(|c| *c == g.name))
+                .map(|(i, _)| i)
+                .collect();
+            (pool, funcs, groups)
+        })
+        .collect();
+    let mut pool_credited_samples: u64 = 0;
 
     while let Some(record) = record_iter
         .next_record(&mut perf_file)
@@ -129,54 +226,59 @@ pub fn aggregate_inclusive_from_perf_data(
                             });
                         }
                     }
+                    EventRecord::Comm(c) => {
+                        comm_by_tid.insert(
+                            c.tid,
+                            String::from_utf8_lossy(&c.name.as_slice()).into_owned(),
+                        );
+                        // COMM is per-*thread*. Only the main thread's name
+                        // identifies the process: taking any thread's would
+                        // report `ThreadPoolServi` or `OS_FFRT_4_3` and make
+                        // one ordinary multi-threaded app look like several
+                        // processes. The kernel truncates it to 15 bytes, so
+                        // this is a prefix of the bundle, not the bundle.
+                        if c.pid == c.tid {
+                            comm_by_pid.insert(
+                                c.pid,
+                                String::from_utf8_lossy(&c.name.as_slice()).into_owned(),
+                            );
+                        }
+                    }
                     EventRecord::Sample(s) => {
+                        if let Some(t) = s.timestamp {
+                            window = Some(match window {
+                                Some((lo, hi)) => (lo.min(t), hi.max(t)),
+                                None => (t, t),
+                            });
+                        }
+                        samples_seen += 1;
                         let Some(pid) = s.pid else { continue };
-                        let Some(period) = s.period else { continue };
+                        let Some(period) = s.period else {
+                            dropped_no_period += 1;
+                            continue;
+                        };
                         let Some(mappings) = mmaps_by_pid.get(&pid) else {
+                            dropped_no_mappings += 1;
                             continue;
                         };
 
-                        // The sample's IP is the leaf frame; the callchain is
-                        // a list of caller IPs above it. We process the IP +
-                        // every callchain entry as a single set of frames.
-                        // Match each frame against the target list once.
+                        // The sample's IP is the leaf frame; the callchain
+                        // is a list of caller IPs above it. Every frame — and,
+                        // where DWARF is available, every function inlined
+                        // into it — is matched against the target list, each
+                        // target credited at most once per sample so recursion
+                        // cannot run the count away.
                         let mut matched_for_this_sample: Vec<bool> =
                             vec![false; engine.functions.len()];
+                        // Groups are credited independently of the per-symbol
+                        // targets, and once per sample: a chain containing two
+                        // members of the same group counts once, so nesting
+                        // does not double-count.
+                        let mut matched_groups: Vec<bool> = vec![false; engine.groups.len()];
 
-                        let mut process_ip =
-                            |ip: u64,
-                             symbols: &SymbolIndex,
-                             mappings: &[Mapping],
-                             matched: &mut [bool]| {
-                                let Some(mapping) = find_mapping(mappings, ip) else {
-                                    return;
-                                };
-                                if mapping.basename != symbol_basename {
-                                    return;
-                                }
-                                let file_offset = ip - mapping.start + mapping.page_offset;
-                                let Some(name) = symbols.lookup(file_offset) else {
-                                    return;
-                                };
-                                for (i, t) in engine.functions.iter().enumerate() {
-                                    if matched[i] {
-                                        // Already credited this sample for this target —
-                                        // matches the dedup semantics noted in module
-                                        // docs (avoid runaway counts on recursion).
-                                        continue;
-                                    }
-                                    if name.contains(t.as_str()) {
-                                        if let Some(slot) = totals.get_mut(t) {
-                                            *slot += period;
-                                        }
-                                        matched[i] = true;
-                                        break;
-                                    }
-                                }
-                            };
-
+                        frame_ips.clear();
                         if let Some(ip) = s.ip {
-                            process_ip(ip, &symbols, mappings, &mut matched_for_this_sample);
+                            frame_ips.push(ip);
                         }
                         if let Some(chain) = s.callchain {
                             for idx in 0..chain.len() {
@@ -188,8 +290,94 @@ pub fn aggregate_inclusive_from_perf_data(
                                 if ip >= 0xffff_ffff_ffff_ff00 {
                                     continue;
                                 }
-                                process_ip(ip, &symbols, mappings, &mut matched_for_this_sample);
+                                frame_ips.push(ip);
                             }
+                        }
+
+                        let mut in_library = false;
+                        for &ip in frame_ips.iter() {
+                            let Some(mapping) = find_mapping(mappings, ip) else {
+                                continue;
+                            };
+                            if mapping.basename != symbol_basename {
+                                // Remembered so a basename that never matches
+                                // can be named, rather than leaving every
+                                // total at zero with no explanation.
+                                *other_dsos.entry(mapping.basename.clone()).or_default() += 1;
+                                continue;
+                            }
+                            in_library = true;
+                            let file_offset = ip - mapping.start + mapping.page_offset;
+                            let hit = cache.get(
+                                file_offset,
+                                &symbolizer,
+                                engine,
+                                &mut scratch_names,
+                                &mut scratch_match,
+                            );
+                            for &i in &hit.funcs {
+                                let i = i as usize;
+                                if matched_for_this_sample[i] {
+                                    continue;
+                                }
+                                if let Some(slot) = totals.get_mut(&engine.functions[i]) {
+                                    *slot += period;
+                                }
+                                matched_for_this_sample[i] = true;
+                            }
+                            for &g in &hit.groups {
+                                let g = g as usize;
+                                if matched_groups[g] {
+                                    continue;
+                                }
+                                if let Some(slot) = totals.get_mut(&engine.groups[g].name) {
+                                    *slot += period;
+                                }
+                                matched_groups[g] = true;
+                            }
+                        }
+                        // A worker-pool sample is layout work even though its
+                        // own stack does not say so. Credited after the chain
+                        // walk and through the same per-sample flags, so a
+                        // chain that *did* name the target is not counted twice.
+                        if in_library && !pool_targets.is_empty() {
+                            let thread = s.tid.and_then(|t| comm_by_tid.get(&t));
+                            if let Some(thread) = thread {
+                                for (pool, funcs, groups) in &pool_targets {
+                                    if !pool.threads.iter().any(|p| thread.starts_with(p)) {
+                                        continue;
+                                    }
+                                    pool_credited_samples += 1;
+                                    for &i in funcs {
+                                        if matched_for_this_sample[i] {
+                                            continue;
+                                        }
+                                        if let Some(slot) = totals.get_mut(&engine.functions[i]) {
+                                            *slot += period;
+                                        }
+                                        matched_for_this_sample[i] = true;
+                                    }
+                                    for &g in groups {
+                                        if matched_groups[g] {
+                                            continue;
+                                        }
+                                        if let Some(slot) = totals.get_mut(&engine.groups[g].name) {
+                                            *slot += period;
+                                        }
+                                        matched_groups[g] = true;
+                                    }
+                                }
+                            }
+                        }
+                        if in_library {
+                            samples_in_library += 1;
+                            let who = comm_by_pid
+                                .get(&pid)
+                                .map(String::as_str)
+                                .unwrap_or("<unknown>");
+                            *library_samples_by_process
+                                .entry(who.to_string())
+                                .or_insert(0) += 1;
                         }
                     }
                     _ => {}
@@ -199,7 +387,185 @@ pub fn aggregate_inclusive_from_perf_data(
         }
     }
 
-    Ok(totals)
+    for warning in coverage_warnings(
+        samples_seen,
+        samples_in_library,
+        dropped_no_period,
+        dropped_no_mappings,
+        &other_dsos,
+        &symbol_basename,
+    ) {
+        eprintln!("{warning}");
+    }
+    if pool_credited_samples > 0 && crate::log_once::first_time("instructions-parallel-pool") {
+        eprintln!(
+            "instructions: {pool_credited_samples} sample(s) credited from worker pools \
+             ({}) — without that they would be dropped, because a worker's callchain does not \
+             name the phase it is running.",
+            engine
+                .parallel_pools
+                .iter()
+                .flat_map(|p| p.threads.iter())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    explain_zeros(&totals, &symbolizer, engine, &sym_path);
+    let mut resolved_targets = std::collections::HashSet::new();
+    for f in &engine.functions {
+        if symbolizer.symtab.matches_any(f) {
+            resolved_targets.insert(f.clone());
+        }
+    }
+    for g in &engine.groups {
+        if g.functions.iter().any(|f| symbolizer.symtab.matches_any(f)) {
+            resolved_targets.insert(g.name.clone());
+        }
+    }
+    Ok(Aggregation {
+        totals,
+        window,
+        samples_seen,
+        samples_in_library,
+        library_samples_by_process,
+        resolved_targets,
+    })
+}
+
+/// Report how much of the capture the analysis actually reached.
+///
+/// Every drop in the loop above is a `continue`, so a capture that yields
+/// nothing looks exactly like an engine that did no work — and the zero then
+/// gets diagnosed as "the phase did not run", which is the opposite of the
+/// truth. These counters are the difference between the two.
+fn coverage_warnings(
+    seen: u64,
+    in_library: u64,
+    no_period: u64,
+    no_mappings: u64,
+    other_dsos: &rustc_hash::FxHashMap<String, u64>,
+    symbol_basename: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if seen == 0 {
+        out.push("warning: the capture contains no samples at all".to_string());
+        return out;
+    }
+    if in_library == 0 {
+        let mut top: Vec<(&String, &u64)> = other_dsos.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        let names: Vec<String> = top
+            .iter()
+            .take(3)
+            .map(|(n, c)| format!("{n} ({c})"))
+            .collect();
+        out.push(format!(
+            "warning: {seen} samples, none with a frame in {symbol_basename:?} — every \
+             instruction total will be 0 because nothing was attributed, not because the \
+             engine was idle. Most-sampled libraries instead: {}. Check `symbol_file` names \
+             the library the device actually maps.",
+            if names.is_empty() {
+                "none resolved".to_string()
+            } else {
+                names.join(", ")
+            }
+        ));
+    }
+    if no_period > 0 {
+        out.push(format!(
+            "warning: {no_period} of {seen} samples carried no period and were dropped — the \
+             capture's sample_type is missing PERF_SAMPLE_PERIOD, so counts are understated"
+        ));
+    }
+    if no_mappings * 2 > seen {
+        out.push(format!(
+            "warning: {no_mappings} of {seen} samples belonged to a pid with no mmap records; \
+             the capture may have started after the process did"
+        ));
+    }
+    out
+}
+
+/// Say why a configured target came back at zero.
+///
+/// A zero reads as "this phase is free" rather than "this measurement did not
+/// find anything", and the two are indistinguishable in the output. The
+/// symbol table can tell them apart.
+fn explain_zeros(
+    totals: &HashMap<String, u64>,
+    symbolizer: &Symbolizer,
+    engine: &EngineConfig,
+    sym_path: &Path,
+) {
+    let mut unmatched: Vec<String> = Vec::new();
+    let mut cold: Vec<String> = Vec::new();
+
+    let mut classify = |label: &str, patterns: &[String]| {
+        if totals.get(label).copied().unwrap_or(0) != 0 {
+            return;
+        }
+        let missing: Vec<&str> = patterns
+            .iter()
+            .filter(|p| !symbolizer.symtab.matches_any(p))
+            .map(|p| p.as_str())
+            .collect();
+        if missing.len() == patterns.len() {
+            unmatched.push(format!("`{label}` ({})", missing.join("`, `")));
+        } else {
+            cold.push(label.to_string());
+        }
+    };
+
+    for f in &engine.functions {
+        classify(f, std::slice::from_ref(f));
+    }
+    for g in &engine.groups {
+        classify(&g.name, &g.functions);
+    }
+
+    if !unmatched.is_empty() {
+        eprintln!(
+            "warning: these targets matched no symbol in {}, so their zero means \
+             'not found', not 'not run': {}. rustc renders an inherent method as \
+             `<Type>::method`, so the `>` is part of the name \
+             (`LayoutThread>::handle_reflow`, not `LayoutThread::handle_reflow`). Check one \
+             with `nm -C {} | grep <pattern>`.{}",
+            sym_path.display(),
+            unmatched.join(", "),
+            sym_path.display(),
+            if symbolizer.has_inline_info() {
+                ""
+            } else {
+                " This library carries no DWARF, so an inlined function has no symbol \
+                 of its own and can only report zero; build it with `debug = 1`."
+            }
+        );
+    }
+    if !cold.is_empty() {
+        eprintln!(
+            "note: {} resolved to a symbol but no sample landed in it — either the phase \
+             did not run, or the capture missed it.",
+            cold.join(", ")
+        );
+    }
+}
+
+/// Collapse `>::` to `::` so a pattern matches under either name-mangling
+/// scheme.
+///
+/// rustc demangles an *inherent* method as `Type::method` under the legacy
+/// scheme and `<Type>::method` under v0, and the two forms are mutually
+/// exclusive as substrings — a pattern written against one silently reports
+/// zero against the other. Trait-impl methods (`<A as B>::m`) render the same
+/// either way and keep matching, since the raw form is tried too.
+fn normalize_symbol(name: &str) -> String {
+    name.replace(">::", "::")
+}
+
+/// Does `name` contain `pattern`, under either mangling?
+fn name_matches(name: &str, pattern: &str, normalized_pattern: &str) -> bool {
+    name.contains(pattern) || normalize_symbol(name).contains(normalized_pattern)
 }
 
 /// Pull the basename out of an mmap path. The path field is null-terminated
@@ -262,6 +628,19 @@ struct SymbolEntry {
 }
 
 impl SymbolIndex {
+    /// Does any symbol's demangled name contain `pattern`?
+    ///
+    /// Separates the two reasons a target reports zero: a pattern that matches
+    /// no symbol at all (usually a typo, or the `<Type>::method` form rustc
+    /// renders inherent methods in), and a symbol that exists but never had a
+    /// sample land in it.
+    fn matches_any(&self, pattern: &str) -> bool {
+        let normalized = normalize_symbol(pattern);
+        self.entries
+            .iter()
+            .any(|e| name_matches(&e.name, pattern, &normalized))
+    }
+
     /// Build a file-offset → demangled-name lookup table.
     ///
     /// On most shared libraries the executable section's `vaddr` differs
@@ -272,12 +651,7 @@ impl SymbolIndex {
     /// section table once and rewriting every symbol's bounds in
     /// file-offset space, so lookups at runtime are a single binary
     /// search.
-    fn load(elf_path: &Path) -> Result<Self> {
-        let bytes =
-            std::fs::read(elf_path).with_context(|| format!("reading {}", elf_path.display()))?;
-        let elf = object::File::parse(bytes.as_slice())
-            .with_context(|| format!("parsing ELF {}", elf_path.display()))?;
-
+    fn from_elf(elf: &object::File) -> Self {
         // Build a vaddr-range → file-offset-delta map, one entry per
         // allocated section that backs file content. NOBITS sections
         // (.bss etc) have no file backing so we skip them.
@@ -332,7 +706,34 @@ impl SymbolIndex {
             });
         }
         entries.sort_by_key(|e| e.start);
-        Ok(SymbolIndex { entries })
+        SymbolIndex { entries }
+    }
+
+    /// File-offset → vaddr map, the inverse of the rewrite [`Self::load`]
+    /// performs. DWARF is addressed in vaddr space, so an inline lookup has
+    /// to undo the translation the symtab path bakes in.
+    fn offset_to_vaddr_map(elf: &object::File) -> Vec<(u64, u64, i64)> {
+        let mut map: Vec<(u64, u64, i64)> = Vec::new();
+        for section in elf.sections() {
+            let Some((file_off, file_size)) = section.file_range() else {
+                continue;
+            };
+            if file_size == 0 {
+                continue;
+            }
+            let vaddr = section.address();
+            if vaddr == 0 {
+                // Not mapped at runtime (debug sections); no IP lands here.
+                continue;
+            }
+            map.push((
+                file_off,
+                file_off + file_size,
+                vaddr as i64 - file_off as i64,
+            ));
+        }
+        map.sort_by_key(|s| s.0);
+        map
     }
 
     /// Return the demangled name covering `offset`, or `None` when no
@@ -375,6 +776,130 @@ fn demangle_name(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coverage_separates_an_idle_engine_from_a_failed_analysis() {
+        let mut others: rustc_hash::FxHashMap<String, u64> = Default::default();
+        others.insert("libarkweb_engine.so".into(), 221_495);
+
+        // Samples exist, none in the library we were asked to attribute to.
+        // Without this the totals are 0 and read as "the engine did nothing".
+        let w = super::coverage_warnings(57_720, 0, 0, 0, &others, "libservo_arkweb.so");
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("none with a frame"));
+        assert!(
+            w[0].contains("libarkweb_engine.so"),
+            "names what was sampled"
+        );
+
+        // A healthy capture says nothing.
+        assert!(
+            super::coverage_warnings(57_720, 12_332, 0, 0, &others, "libarkweb_engine.so")
+                .is_empty()
+        );
+
+        // An empty capture, and a sample_type missing the period field.
+        assert_eq!(super::coverage_warnings(0, 0, 0, 0, &others, "x").len(), 1);
+        let w = super::coverage_warnings(100, 100, 100, 0, &others, "x");
+        assert!(w[0].contains("PERF_SAMPLE_PERIOD"));
+    }
+
+    /// The same pattern has to work whichever mangling the build used: rustc
+    /// renders an inherent method as `Type::method` (legacy) or
+    /// `<Type>::method` (v0), and the two are mutually exclusive as
+    /// substrings.
+    #[test]
+    fn patterns_match_under_either_mangling() {
+        let v0 = "<script::dom::window::window::Window>::reflow";
+        let legacy = "script::dom::window::window::Window::reflow";
+        for pattern in ["Window>::reflow", "Window::reflow"] {
+            let n = super::normalize_symbol(pattern);
+            assert!(super::name_matches(v0, pattern, &n), "v0 vs {pattern}");
+            assert!(
+                super::name_matches(legacy, pattern, &n),
+                "legacy vs {pattern}"
+            );
+        }
+        // A trait impl renders the same either way and must still match.
+        let trait_impl = "<layout::layout_impl::LayoutThread as layout_api::Layout>::reflow";
+        let n = super::normalize_symbol("Layout>::reflow");
+        assert!(super::name_matches(trait_impl, "Layout>::reflow", &n));
+        // And an unrelated symbol still must not.
+        let n = super::normalize_symbol("Window::reflow");
+        assert!(!super::name_matches(
+            "<script::dom::window::window::Window>::handle_pending_images",
+            "Window::reflow",
+            &n
+        ));
+    }
+
+    #[test]
+    fn symbol_presence_separates_a_typo_from_a_cold_symbol() {
+        let idx = super::SymbolIndex {
+            entries: vec![super::SymbolEntry {
+                start: 0,
+                end: 16,
+                name: "<layout::layout_impl::LayoutThread>::handle_reflow".into(),
+            }],
+        };
+        // Either mangling of the same method resolves.
+        assert!(idx.matches_any("LayoutThread>::handle_reflow"));
+        assert!(idx.matches_any("LayoutThread::handle_reflow"));
+        // A pattern for something that is not there does not, which is what
+        // lets a zero be reported as "not found" rather than "not run".
+        assert!(!idx.matches_any("LayoutThread>::build_display_list"));
+    }
+
+    /// The test binary itself is built with debug info, so it doubles as a
+    /// DWARF fixture: some address in it must expand to more than one frame,
+    /// or inline attribution is silently not working.
+    #[test]
+    fn dwarf_symbolizer_expands_inline_frames() {
+        let exe = std::env::current_exe().unwrap();
+        let sym = match super::Symbolizer::load(&exe) {
+            Ok(s) => s,
+            Err(_) => return, // stripped build; nothing to assert
+        };
+        if !sym.has_inline_info() {
+            return;
+        }
+        let len = std::fs::metadata(&exe).unwrap().len();
+        let mut names = Vec::new();
+        let mut deepest = 0usize;
+        let mut single = 0usize;
+        let step = (len / 20_000).max(4);
+        for off in (0..len).step_by(step as usize) {
+            sym.names_at(off, &mut names);
+            deepest = deepest.max(names.len());
+            if names.len() == 1 {
+                single += 1;
+            }
+            if deepest >= 2 && single > 0 {
+                break;
+            }
+        }
+        assert!(
+            deepest >= 2,
+            "no address expanded to an inline chain — inline attribution is not working"
+        );
+        assert!(
+            single > 0,
+            "expected some addresses to resolve to one frame"
+        );
+    }
+
+    #[test]
+    fn file_offsets_map_back_to_vaddrs() {
+        // .text at file 0x1000 mapped to vaddr 0x2000, plus a section mapped 1:1.
+        let map = [(0x1000u64, 0x2000u64, 0x1000i64), (0x9000, 0xa000, 0)];
+        assert_eq!(super::vaddr_for(&map, 0x1000), Some(0x2000));
+        assert_eq!(super::vaddr_for(&map, 0x1fff), Some(0x2fff));
+        assert_eq!(super::vaddr_for(&map, 0x9500), Some(0x9500));
+        // Before the first section, between two, and past the end: unmapped.
+        assert_eq!(super::vaddr_for(&map, 0x0100), None);
+        assert_eq!(super::vaddr_for(&map, 0x5000), None);
+        assert_eq!(super::vaddr_for(&map, 0xffff), None);
+    }
+
     use super::*;
 
     #[test]
@@ -453,4 +978,670 @@ mod tests {
         // Above last.
         assert_eq!(idx.lookup(0x1500), None);
     }
+}
+
+/// Resolves a file offset in the engine library to the names of every
+/// function active at that address — the containing function plus, when the
+/// library carries DWARF, the chain of functions inlined into it.
+///
+/// Without inline information an inlined boundary resolves to whichever
+/// function it was folded into, so its own metric reports **0**. A zero reads
+/// as "this phase is free" rather than "this measurement is blind", which is
+/// the failure this type exists to remove.
+struct Symbolizer {
+    symtab: std::sync::Arc<SymbolIndex>,
+    dwarf: Option<DwarfIndex>,
+}
+
+struct DwarfIndex {
+    ctx: addr2line::Context<gimli::EndianArcSlice<gimli::RunTimeEndian>>,
+    /// `(file_off_start, file_off_end, vaddr - file_off)`, sorted by start.
+    offset_to_vaddr: Vec<(u64, u64, i64)>,
+}
+
+/// The parts of a staged library that can be shared between aggregations.
+///
+/// Aggregations run on background threads, one per iteration, several alive at
+/// once. Each used to re-read a 150-300 MB ELF twice and re-demangle ~700k
+/// symbol names. The bytes and the symbol index are immutable, so one copy
+/// serves all of them; addr2line's `Context` is not `Sync` (it memoises
+/// lazily behind `UnsafeCell`), so that part is still built per aggregation —
+/// from the shared bytes rather than from disk.
+#[derive(Clone)]
+struct SharedElf {
+    bytes: std::sync::Arc<Vec<u8>>,
+    symtab: std::sync::Arc<SymbolIndex>,
+}
+
+static ELF_CACHE: std::sync::Mutex<Option<(std::path::PathBuf, SharedElf)>> =
+    std::sync::Mutex::new(None);
+
+fn shared_elf(elf_path: &Path) -> Result<SharedElf> {
+    let mut slot = ELF_CACHE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("symbol cache poisoned"))?;
+    if let Some((path, shared)) = slot.as_ref() {
+        if path == elf_path {
+            return Ok(shared.clone());
+        }
+    }
+    let bytes = std::sync::Arc::new(
+        std::fs::read(elf_path).with_context(|| format!("reading {}", elf_path.display()))?,
+    );
+    let elf = object::File::parse(bytes.as_slice())
+        .with_context(|| format!("parsing ELF {}", elf_path.display()))?;
+    let shared = SharedElf {
+        symtab: std::sync::Arc::new(SymbolIndex::from_elf(&elf)),
+        bytes: bytes.clone(),
+    };
+    // A campaign switches engines between legs, so keep the most recent rather
+    // than every library ever staged.
+    *slot = Some((elf_path.to_path_buf(), shared.clone()));
+    Ok(shared)
+}
+
+impl Symbolizer {
+    /// Read the ELF once and build both indexes from it.
+    ///
+    /// Worth the care: the staged libraries are 150-300 MB, and one of these
+    /// is built per aggregation — of which several run at once.
+    pub fn load(elf_path: &Path) -> Result<Self> {
+        let shared = shared_elf(elf_path)?;
+        let elf = object::File::parse(shared.bytes.as_slice())
+            .with_context(|| format!("parsing ELF {}", elf_path.display()))?;
+        let symtab = shared.symtab;
+        let has_debug_info = elf.section_by_name(".debug_info").is_some();
+        let dwarf = if has_debug_info {
+            match load_dwarf_context(&elf) {
+                Ok(ctx) => Some(DwarfIndex {
+                    ctx,
+                    offset_to_vaddr: SymbolIndex::offset_to_vaddr_map(&elf),
+                }),
+                Err(e) => {
+                    eprintln!(
+                        "warning: {} has .debug_info but it could not be read ({e}); \
+                         falling back to symbol-table lookups, so inlined functions \
+                         will report 0",
+                        elf_path.display()
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Symbolizer { symtab, dwarf })
+    }
+
+    /// True when inline expansion is available.
+    fn has_inline_info(&self) -> bool {
+        self.dwarf.is_some()
+    }
+
+    /// Append every function name active at `file_offset` to `out`,
+    /// innermost inlined frame first. Falls back to the symbol table when
+    /// DWARF is absent or covers no frame at this address (the two disagree
+    /// at, for instance, PLT stubs).
+    fn names_at(&self, file_offset: u64, out: &mut Vec<String>) {
+        out.clear();
+        if let Some(d) = &self.dwarf {
+            if let Some(vaddr) = d.vaddr_for(file_offset) {
+                if let Ok(mut frames) = d.ctx.find_frames(vaddr).skip_all_loads() {
+                    while let Ok(Some(frame)) = frames.next() {
+                        if let Some(f) = frame.function {
+                            if let Ok(name) = f.demangle() {
+                                out.push(name.into_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            if let Some(name) = self.symtab.lookup(file_offset) {
+                out.push(name.to_string());
+            }
+        }
+    }
+}
+
+/// Build an addr2line context over owning readers, so it outlives the parsed
+/// `object::File` the section bytes came from.
+fn load_dwarf_context(
+    elf: &object::File,
+) -> Result<addr2line::Context<gimli::EndianArcSlice<gimli::RunTimeEndian>>> {
+    let endian = if elf.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+    let load = |id: gimli::SectionId| -> Result<gimli::EndianArcSlice<gimli::RunTimeEndian>> {
+        let data = match elf.section_by_name(id.name()) {
+            Some(section) => section.uncompressed_data()?.into_owned(),
+            None => Vec::new(),
+        };
+        Ok(gimli::EndianArcSlice::new(data.into(), endian))
+    };
+    let dwarf = gimli::Dwarf::load(load)?;
+    Ok(addr2line::Context::from_dwarf(dwarf)?)
+}
+
+impl DwarfIndex {
+    fn vaddr_for(&self, file_offset: u64) -> Option<u64> {
+        vaddr_for(&self.offset_to_vaddr, file_offset)
+    }
+}
+
+/// Translate a file offset into the vaddr DWARF is addressed by, using the
+/// `(start, end, vaddr - offset)` map built from the section headers.
+/// `None` for an offset in no mapped section — a debug section, or padding.
+fn vaddr_for(map: &[(u64, u64, i64)], file_offset: u64) -> Option<u64> {
+    let idx = map.partition_point(|s| s.0 <= file_offset);
+    if idx == 0 {
+        return None;
+    }
+    let (_, end, delta) = map[idx - 1];
+    if file_offset >= end {
+        return None;
+    }
+    Some((file_offset as i64 + delta) as u64)
+}
+
+/// Which configured patterns an address matches, cached per address.
+///
+/// Resolving a DWARF inline chain is orders of magnitude slower than a binary
+/// search over a symbol table, and a capture repeats the same hot addresses
+/// across hundreds of thousands of samples — so the cache is what makes the
+/// inline path affordable rather than an optimisation.
+#[derive(Default, Clone)]
+struct AddressMatch {
+    /// Indices into `engine.functions`, deduplicated, in frame order.
+    funcs: Vec<u16>,
+    /// Indices into `engine.groups`, deduplicated.
+    groups: Vec<u16>,
+}
+
+/// Bytes an [`AddressMatch`] entry costs in the map, near enough for
+/// budgeting: 8 for the key, two `Vec` headers, and slot overhead. Entries
+/// that actually match allocate on top, but those are a small minority.
+const CACHE_ENTRY_BYTES: usize = 96;
+
+/// Cap on the address cache. Generous, because overshooting costs the host
+/// RSS while a too-small cache costs analysis time on every iteration.
+const MAX_CACHE_BYTES: usize = 1 << 30;
+
+struct MatchCache {
+    map: rustc_hash::FxHashMap<u64, AddressMatch>,
+    max_entries: usize,
+    /// Set once the cap is hit, so the warning is printed at most once.
+    warned: bool,
+}
+
+impl MatchCache {
+    fn new() -> Self {
+        MatchCache {
+            map: rustc_hash::FxHashMap::default(),
+            max_entries: MAX_CACHE_BYTES / CACHE_ENTRY_BYTES,
+            warned: false,
+        }
+    }
+
+    /// Resolve `file_offset` against the engine's patterns, memoised.
+    ///
+    /// At the cap the map is emptied and refilled rather than evicted
+    /// entry-by-entry: an LRU would cost more per lookup than it saves, and
+    /// the working set of hot addresses re-warms in a few thousand samples.
+    /// Results are unaffected either way — only speed is.
+    fn get<'a>(
+        &'a mut self,
+        file_offset: u64,
+        symbolizer: &Symbolizer,
+        engine: &EngineConfig,
+        scratch_names: &mut Vec<String>,
+        scratch_match: &mut AddressMatch,
+    ) -> &'a AddressMatch {
+        if !self.map.contains_key(&file_offset) {
+            symbolizer.names_at(file_offset, scratch_names);
+            scratch_match.funcs.clear();
+            scratch_match.groups.clear();
+            for name in scratch_names.iter() {
+                let normalized_name = normalize_symbol(name);
+                // One frame credits at most one function pattern — the first
+                // that matches — mirroring the symbol-table path.
+                for (i, t) in engine.functions.iter().enumerate() {
+                    if name.contains(t.as_str()) || normalized_name.contains(&normalize_symbol(t)) {
+                        let i = i as u16;
+                        if !scratch_match.funcs.contains(&i) {
+                            scratch_match.funcs.push(i);
+                        }
+                        break;
+                    }
+                }
+                for (g, group) in engine.groups.iter().enumerate() {
+                    let g = g as u16;
+                    if scratch_match.groups.contains(&g) {
+                        continue;
+                    }
+                    if group.functions.iter().any(|f| {
+                        name.contains(f.as_str()) || normalized_name.contains(&normalize_symbol(f))
+                    }) {
+                        scratch_match.groups.push(g);
+                    }
+                }
+            }
+            if self.map.len() < self.max_entries {
+                self.map.insert(file_offset, scratch_match.clone());
+            } else {
+                if !self.warned {
+                    eprintln!(
+                        "warning: symbolization cache hit its {} MiB cap and was reset; \
+                         analysis will be slower",
+                        MAX_CACHE_BYTES / (1 << 20)
+                    );
+                    self.warned = true;
+                }
+                self.map.clear();
+                self.map.insert(file_offset, scratch_match.clone());
+            }
+        }
+        &self.map[&file_offset]
+    }
+}
+
+/// Where the instructions under one phase actually go, for finding what to
+/// optimise rather than measuring a phase as a whole.
+#[derive(Debug, Default)]
+pub struct Profile {
+    /// Period summed over the samples that were counted (in-library and, when
+    /// a scope was given, inside it).
+    pub total: u64,
+    pub samples: u64,
+    /// Innermost function of the leaf frame.
+    pub self_by_function: HashMap<String, u64>,
+    /// Every distinct function on the chain, once per sample.
+    pub inclusive_by_function: HashMap<String, u64>,
+    /// With a `callers_of` pattern: for samples whose self function matches
+    /// it, the nearest enclosing frame that is engine code rather than
+    /// standard-library or container plumbing. Answers "who is doing all this
+    /// refcounting / allocating", which the self table cannot.
+    pub callers: HashMap<String, u64>,
+}
+
+/// Frames that are plumbing rather than a decision anyone in the engine made:
+/// the standard library, refcounting and borrow-checking containers, hashing,
+/// and the `Clone`/`Drop` impls those are reached through.
+fn is_plumbing(name: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "core::",
+        "<core::",
+        "alloc::",
+        "<alloc::",
+        "std::",
+        "<std::",
+        "<usize",
+        "<u32",
+        "<u64",
+        "<atomic_refcell::",
+        "atomic_refcell::",
+        "servo_arc::",
+        "<servo_arc::",
+        "hashbrown::",
+        "<hashbrown::",
+        "<smallvec::",
+        "smallvec::",
+        "<triomphe::",
+        "triomphe::",
+    ];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+        || name.contains(" as core::clone::Clone>::clone")
+        || name.contains(" as core::ops::drop::Drop>::drop")
+        || name.starts_with("<&")
+}
+
+/// Build a [`Profile`] over one or more captures.
+///
+/// `under`, when given, keeps only samples whose chain contains a function
+/// matching it — plus samples on one of the engine's `parallel_pool` threads
+/// when the pool credits that very pattern, since a worker's own chain never
+/// names the phase it is running.
+pub fn profile_from_perf_data(
+    perf_data_paths: &[std::path::PathBuf],
+    engine: &EngineConfig,
+    sym_path: &Path,
+    under: Option<&str>,
+    callers_of: Option<&str>,
+    parents_of: Option<&str>,
+) -> Result<Profile> {
+    anyhow::ensure!(
+        !engine.symbol_file.is_empty(),
+        "engine {:?} has no symbol_file",
+        engine.id
+    );
+    let symbolizer = Symbolizer::load(sym_path)?;
+    let symbol_basename = sym_basename_from_path(&engine.symbol_file);
+    let under_norm = under.map(normalize_symbol);
+    let pool_prefixes: Vec<&str> = match under {
+        Some(u) => engine
+            .parallel_pools
+            .iter()
+            .filter(|p| p.credit.iter().any(|c| c == u))
+            .flat_map(|p| p.threads.iter().map(String::as_str))
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let mut names_cache: rustc_hash::FxHashMap<u64, Vec<String>> = Default::default();
+    let mut scratch: Vec<String> = Vec::new();
+    let mut profile = Profile::default();
+    let mut chain_names: Vec<String> = Vec::new();
+
+    for path in perf_data_paths {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let PerfFileReader {
+            mut perf_file,
+            mut record_iter,
+        } = PerfFileReader::parse_file(BufReader::new(file))
+            .with_context(|| format!("parsing perf.data at {}", path.display()))?;
+        verify_capture_build_id(path, sym_path)?;
+        let mut mmaps_by_pid: HashMap<i32, Vec<Mapping>> = HashMap::new();
+        let mut comm_by_tid: HashMap<i32, String> = HashMap::new();
+
+        while let Some(record) = record_iter
+            .next_record(&mut perf_file)
+            .context("reading next perf record")?
+        {
+            let PerfFileRecord::EventRecord { record, .. } = record else {
+                continue;
+            };
+            match record.parse().context("parsing event record")? {
+                EventRecord::Mmap2(m) => {
+                    if matches!(m.cpu_mode, CpuMode::User) && (m.protection & 0x4) != 0 {
+                        mmaps_by_pid.entry(m.pid).or_default().push(Mapping {
+                            start: m.address,
+                            end: m.address.saturating_add(m.length),
+                            page_offset: m.page_offset,
+                            basename: basename_of(&m.path.as_slice()).into_owned(),
+                        });
+                    }
+                }
+                EventRecord::Mmap(m) => {
+                    if matches!(m.cpu_mode, CpuMode::User) && m.is_executable {
+                        mmaps_by_pid.entry(m.pid).or_default().push(Mapping {
+                            start: m.address,
+                            end: m.address.saturating_add(m.length),
+                            page_offset: m.page_offset,
+                            basename: basename_of(&m.path.as_slice()).into_owned(),
+                        });
+                    }
+                }
+                EventRecord::Comm(c) => {
+                    comm_by_tid.insert(
+                        c.tid,
+                        String::from_utf8_lossy(&c.name.as_slice()).into_owned(),
+                    );
+                }
+                EventRecord::Sample(s) => {
+                    let (Some(pid), Some(period)) = (s.pid, s.period) else {
+                        continue;
+                    };
+                    let Some(mappings) = mmaps_by_pid.get(&pid) else {
+                        continue;
+                    };
+                    let mut ips: Vec<u64> = Vec::with_capacity(64);
+                    if let Some(ip) = s.ip {
+                        ips.push(ip);
+                    }
+                    if let Some(chain) = s.callchain {
+                        for idx in 0..chain.len() {
+                            let Some(ip) = chain.get(idx) else { break };
+                            if ip < 0xffff_ffff_ffff_ff00 {
+                                ips.push(ip);
+                            }
+                        }
+                    }
+                    // Names along the chain, leaf first, inline frames
+                    // innermost first. Frames outside the engine library are
+                    // left out: the question is where the engine spends its
+                    // instructions.
+                    chain_names.clear();
+                    let mut leaf: Option<String> = None;
+                    for (depth, &ip) in ips.iter().enumerate() {
+                        let Some(m) = find_mapping(mappings, ip) else {
+                            continue;
+                        };
+                        if m.basename != symbol_basename {
+                            continue;
+                        }
+                        let off = ip - m.start + m.page_offset;
+                        let names = names_cache.entry(off).or_insert_with(|| {
+                            symbolizer.names_at(off, &mut scratch);
+                            std::mem::take(&mut scratch)
+                        });
+                        if depth == 0 {
+                            leaf = names.first().cloned();
+                        }
+                        for n in names.iter() {
+                            if !chain_names.contains(n) {
+                                chain_names.push(n.clone());
+                            }
+                        }
+                    }
+                    if chain_names.is_empty() {
+                        continue;
+                    }
+                    if let (Some(u), Some(un)) = (under, under_norm.as_deref()) {
+                        let on_chain = chain_names.iter().any(|n| name_matches(n, u, un));
+                        let on_pool = !pool_prefixes.is_empty()
+                            && s.tid
+                                .and_then(|t| comm_by_tid.get(&t))
+                                .is_some_and(|t| pool_prefixes.iter().any(|p| t.starts_with(p)));
+                        if !on_chain && !on_pool {
+                            continue;
+                        }
+                    }
+                    profile.total += period;
+                    profile.samples += 1;
+                    // A leaf outside the library (libc, the kernel) is
+                    // charged to the innermost engine frame that called it.
+                    let self_name = leaf.clone().unwrap_or_else(|| chain_names[0].clone());
+                    *profile.self_by_function.entry(self_name).or_insert(0) += period;
+                    for n in &chain_names {
+                        *profile.inclusive_by_function.entry(n.clone()).or_insert(0) += period;
+                    }
+                    if let Some(pat) = parents_of {
+                        // The first engine frame outward from the innermost
+                        // match: who calls the accessor, not what it calls.
+                        let pn = normalize_symbol(pat);
+                        if let Some(i) = chain_names.iter().position(|n| name_matches(n, pat, &pn))
+                        {
+                            let who = chain_names[i + 1..]
+                                .iter()
+                                .find(|n| !is_plumbing(n) && !name_matches(n, pat, &pn))
+                                .cloned()
+                                .unwrap_or_else(|| "<none above>".to_string());
+                            *profile.callers.entry(who).or_insert(0) += period;
+                        }
+                    }
+                    if let Some(c) = callers_of {
+                        let leaf_name = profile_leaf(&chain_names);
+                        if leaf_name.is_some_and(|l| name_matches(l, c, &normalize_symbol(c))) {
+                            let who = chain_names
+                                .iter()
+                                .find(|n| !is_plumbing(n))
+                                .cloned()
+                                .unwrap_or_else(|| "<only plumbing on the chain>".to_string());
+                            *profile.callers.entry(who).or_insert(0) += period;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(profile)
+}
+
+/// The self function of a sample: the innermost name on the chain.
+fn profile_leaf(chain_names: &[String]) -> Option<&str> {
+    chain_names.first().map(String::as_str)
+}
+
+/// Estimate how many times a function ran from sampled data alone: count
+/// *episodes*, runs of consecutive samples on one thread whose chain contains
+/// `pattern`, split when that thread produces a sample without it or when two
+/// matching samples are more than `gap_ns` apart.
+///
+/// This is how a reflow count is usually guessed from a profile when there is
+/// no trace marker. It exists here to be scored against a marker count, not
+/// to replace one: it cannot see an invocation cheaper than the sampling
+/// period, and it merges invocations that run back to back.
+pub fn sample_episodes(
+    perf_data_path: &Path,
+    engine: &EngineConfig,
+    symbols: &Path,
+    pattern: &str,
+    gap_ns: u64,
+) -> Result<(u64, u64, Option<(u64, u64)>)> {
+    let symbolizer = Symbolizer::load(symbols)?;
+    let symbol_basename = sym_basename_from_path(&engine.symbol_file);
+    let pn = normalize_symbol(pattern);
+    let file = File::open(perf_data_path)
+        .with_context(|| format!("opening {}", perf_data_path.display()))?;
+    let PerfFileReader {
+        mut perf_file,
+        mut record_iter,
+    } = PerfFileReader::parse_file(BufReader::new(file))?;
+    verify_capture_build_id(perf_data_path, symbols)?;
+    let mut mmaps_by_pid: HashMap<i32, Vec<Mapping>> = HashMap::new();
+    let mut match_cache: rustc_hash::FxHashMap<u64, bool> = Default::default();
+    let mut scratch: Vec<String> = Vec::new();
+    // Per thread: timestamp of the last matching sample, and whether the
+    // thread's previous sample matched.
+    let mut last: HashMap<i32, (u64, bool)> = HashMap::new();
+    let mut episodes = 0u64;
+    let mut matching = 0u64;
+    let mut window: Option<(u64, u64)> = None;
+    while let Some(record) = record_iter.next_record(&mut perf_file)? {
+        let PerfFileRecord::EventRecord { record, .. } = record else {
+            continue;
+        };
+        match record.parse()? {
+            EventRecord::Mmap2(m) => {
+                if matches!(m.cpu_mode, CpuMode::User) && (m.protection & 0x4) != 0 {
+                    mmaps_by_pid.entry(m.pid).or_default().push(Mapping {
+                        start: m.address,
+                        end: m.address.saturating_add(m.length),
+                        page_offset: m.page_offset,
+                        basename: basename_of(&m.path.as_slice()).into_owned(),
+                    });
+                }
+            }
+            EventRecord::Sample(s) => {
+                let (Some(pid), Some(tid), Some(ts)) = (s.pid, s.tid, s.timestamp) else {
+                    continue;
+                };
+                window = Some(match window {
+                    Some((lo, hi)) => (lo.min(ts), hi.max(ts)),
+                    None => (ts, ts),
+                });
+                let Some(mappings) = mmaps_by_pid.get(&pid) else {
+                    continue;
+                };
+                let mut ips: Vec<u64> = Vec::with_capacity(64);
+                if let Some(ip) = s.ip {
+                    ips.push(ip);
+                }
+                if let Some(chain) = s.callchain {
+                    for idx in 0..chain.len() {
+                        let Some(ip) = chain.get(idx) else { break };
+                        if ip < 0xffff_ffff_ffff_ff00 {
+                            ips.push(ip);
+                        }
+                    }
+                }
+                let mut in_library = false;
+                let mut hit = false;
+                for ip in ips {
+                    let Some(m) = find_mapping(mappings, ip) else {
+                        continue;
+                    };
+                    if m.basename != symbol_basename {
+                        continue;
+                    }
+                    in_library = true;
+                    let off = ip - m.start + m.page_offset;
+                    let h = *match_cache.entry(off).or_insert_with(|| {
+                        symbolizer.names_at(off, &mut scratch);
+                        scratch.iter().any(|n| name_matches(n, pattern, &pn))
+                    });
+                    if h {
+                        hit = true;
+                        break;
+                    }
+                }
+                if !in_library {
+                    continue;
+                }
+                let prev = last.get(&tid).copied();
+                if hit {
+                    matching += 1;
+                    let new_episode = match prev {
+                        Some((t, true)) => ts.saturating_sub(t) > gap_ns,
+                        _ => true,
+                    };
+                    if new_episode {
+                        episodes += 1;
+                    }
+                    last.insert(tid, (ts, true));
+                } else {
+                    last.insert(tid, (prev.map(|p| p.0).unwrap_or(0), false));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok((episodes, matching, window))
+}
+
+/// Refuse to symbolize a capture against a library from a different build.
+///
+/// Symbols from another build do not fail loudly: every address still lands in
+/// *some* function, and the result is a plausible-looking profile of the wrong
+/// code. hiperf records no build ids in its captures, so the anchor is the run
+/// the capture belongs to: `bench` checks the staged symbols against the
+/// installed library before measuring and records the build id in `raw.json`
+/// next to the captures. A capture with no such record cannot be checked,
+/// which is reported once rather than treated as a pass.
+fn verify_capture_build_id(capture: &Path, symbols: &Path) -> Result<()> {
+    let expected = std::fs::read(symbols).ok().and_then(|b| {
+        crate::instructions::symbols::build_id_from_elf_prefix(&b[..b.len().min(1 << 16)])
+    });
+    let recorded = capture
+        .parent()
+        .map(|d| d.join("raw.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("symbols_build_id")?.as_str().map(str::to_owned));
+    match (expected, recorded) {
+        (Some(e), Some(r)) => {
+            anyhow::ensure!(
+                e == r,
+                "{} was captured from a build with id {r}, but {} has build id {e}. \
+                 Pass the matching library with --symbols.",
+                capture.display(),
+                symbols.display()
+            );
+        }
+        _ => {
+            if crate::log_once::first_time("profile-unverified-symbols") {
+                eprintln!(
+                    "warning: cannot check {} against the build these captures came from (no \
+                     symbols_build_id in the run's raw.json -- runs before this check was \
+                     added have none). A mismatched library gives a plausible, wrong profile.",
+                    symbols.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }

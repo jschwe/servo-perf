@@ -2,8 +2,8 @@
 //! RAII lifecycle for localhost fixture servers.
 //!
 //! Three kinds of fixtures are supported:
-//!   * `Fixture::Http1` / `Fixture::Http2` — a Rust static-file server
-//!     spawned from the sibling `fixture_server` binary.
+//!   * `Fixture::Http1` / `Fixture::Http2` / `Fixture::Static` — a Rust
+//!     static-file server spawned from the sibling `fixture_server` binary.
 //!   * `Fixture::WprReplay` — a Web Page Replay archive served through
 //!     the patched `wpr` binary plus a small CONNECT-tunneling shim
 //!     (the sibling `wpr_tunnel` binary). If the archive file doesn't
@@ -99,6 +99,12 @@ pub fn spawn(
         Fixture::Http2 { port, doc_root } => {
             spawn_local_server(workloads_dir, "http2", *port, doc_root, out_dir)
         }
+        Fixture::Static { dir, port } => {
+            spawn_local_server(workloads_dir, "plain", *port, dir, out_dir)
+        }
+        Fixture::DeviceFiles { .. } => {
+            anyhow::bail!("a device-files fixture is copied to the device, not spawned")
+        }
         Fixture::WprReplay {
             archive,
             wpr_port,
@@ -113,6 +119,16 @@ pub fn spawn(
             out_dir,
         ),
     }
+}
+
+/// Where a fixture's `dir` lives on the host: as given if absolute, else under
+/// `<workloads_dir>/../fixtures/`.
+pub fn fixture_dir(workloads_dir: &Path, dir: &Path) -> Result<PathBuf> {
+    Ok(workloads_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("workloads_dir has no parent"))?
+        .join("fixtures")
+        .join(dir))
 }
 
 // -- Http1 / Http2 static-file fixtures ---------------------------------
@@ -135,11 +151,12 @@ fn spawn_local_server(
         doc_root.display()
     );
 
-    // Ensure TLS cert exists.
-    let _ = Command::new("sh")
-        .arg(fixtures_dir.join("gen_cert.sh"))
-        .status()
-        .context("running gen_cert.sh")?;
+    if mode != "plain" {
+        let _ = Command::new("sh")
+            .arg(fixtures_dir.join("gen_cert.sh"))
+            .status()
+            .context("running gen_cert.sh")?;
+    }
 
     preflight_port(port)?;
 
@@ -150,7 +167,7 @@ fn spawn_local_server(
         .arg(port.to_string())
         .arg(&doc_root)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(open_log(out_dir, ACCESS_LOG)?)
         .stderr(open_log(out_dir, "fixture_server.stderr")?)
         .spawn()
         .context("spawning fixture_server")?;
@@ -162,6 +179,32 @@ fn spawn_local_server(
     };
     wait_for_accept(&mut handle, port, "fixture_server")?;
     Ok(handle)
+}
+
+/// `fixture_server`'s request log, one `[srv <ts>] <status> <method> <path>`
+/// line per request, in the run's output directory.
+pub const ACCESS_LOG: &str = "fixture_server.log";
+
+/// Paths the page asked for that the fixture did not have, deduplicated, from
+/// a run's [`ACCESS_LOG`]. A page measured without its fonts or images is
+/// measured doing less work than it would with them, and neither engine says so.
+pub fn missing_resources(out_dir: &Path) -> Vec<String> {
+    let Ok(log) = std::fs::read_to_string(out_dir.join(ACCESS_LOG)) else {
+        return Vec::new();
+    };
+    let mut missing: Vec<String> = log
+        .lines()
+        .filter_map(|l| {
+            let mut fields = l.split_once("] ")?.1.split(' ');
+            let status = fields.next()?;
+            let path = fields.nth(1)?;
+            // Engines ask for a favicon unprompted; its absence costs nothing.
+            (status == "404" && path != "/favicon.ico").then(|| path.to_string())
+        })
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 // -- WPR replay fixture -------------------------------------------------
@@ -190,17 +233,22 @@ fn spawn_wpr_replay(
     preflight_port(wpr_port)?;
     preflight_port(tunnel_port)?;
 
+    // `wpr.exe` on Windows: both the default location and the PATH lookup
+    // have to carry the suffix, or a correctly installed binary is reported
+    // missing.
+    let wpr_name = format!("wpr{}", std::env::consts::EXE_SUFFIX);
     let wpr_bin = std::env::var_os("SERVOPERF_WPR_BIN")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
+        .or_else(|| {
             dirs_home()
-                .map(|h| h.join("bin").join("wpr"))
-                .unwrap_or_else(|| PathBuf::from("wpr"))
-        });
+                .map(|h| h.join("bin").join(&wpr_name))
+                .filter(|p| p.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from(&wpr_name));
     anyhow::ensure!(
         wpr_bin.is_file() || which_on_path(&wpr_bin).is_some(),
-        "wpr binary not found at {} (set SERVOPERF_WPR_BIN to override). \
-         See tools/servoperf/docs/wpr-setup.md.",
+        "wpr binary not found at {} (set SERVOPERF_WPR_BIN to override, or pass --live \
+         to run against the live site instead). See tools/servoperf/docs/wpr-setup.md.",
         wpr_bin.display()
     );
 
@@ -231,6 +279,18 @@ fn spawn_wpr_replay(
     // runs servoshell once at the workload URL, then tears WPR down with
     // SIGINT so it flushes the archive to disk before we start replay.
     if !archive.exists() {
+        // Recording stops WPR with SIGINT so it writes the archive out. Windows
+        // has no SIGINT for a child process; the fallback is TerminateProcess,
+        // which kills WPR before it flushes, leaving an empty archive that
+        // every later run then "replays". Refuse rather than record that.
+        anyhow::ensure!(
+            cfg!(unix),
+            "wpr-replay: archive {} is missing, and recording one is not supported on this \
+             host (WPR can only be stopped cleanly with SIGINT). Record it on Linux/macOS and \
+             copy it into {}, or pass --live.",
+            archive.display(),
+            archives_dir.display()
+        );
         eprintln!(
             "wpr-replay: archive {} missing — recording one pass from live origin",
             archive.display()
@@ -533,7 +593,15 @@ fn sibling_binary(name: &str) -> Result<PathBuf> {
     let exe_dir = exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("servoperf binary has no parent directory"))?;
-    let candidates = [exe_dir.join(name), exe_dir.join("..").join(name)];
+    // Cargo appends `.exe` on Windows; look for both so a Windows host finds
+    // the sibling helper binaries.
+    let exe_name = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let candidates = [
+        exe_dir.join(&exe_name),
+        exe_dir.join("..").join(&exe_name),
+        exe_dir.join(name),
+        exe_dir.join("..").join(name),
+    ];
     candidates
         .iter()
         .find(|p| p.is_file())
@@ -548,7 +616,10 @@ fn sibling_binary(name: &str) -> Result<PathBuf> {
 }
 
 fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    // `HOME` is not set on Windows; `USERPROFILE` is the equivalent.
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 fn which_on_path(name: &Path) -> Option<PathBuf> {
@@ -581,6 +652,9 @@ mod tests {
             device_pixel_ratio: None,
             servoshell_args: vec![],
             fixture: Some(fx),
+            scenario: None,
+            steps: vec![],
+            lcp: false,
         }
     }
 
@@ -645,6 +719,36 @@ mod tests {
         let w = workload_with(fx);
         let handle = spawn(&workloads_dir, &w, &PanickingDriver, out_dir.path())
             .expect("spawn http/2 fixture");
+        assert!(TcpStream::connect(format!("127.0.0.1:{}", handle.port())).is_ok());
+    }
+
+    #[test]
+    fn missing_resources_lists_404s_but_not_the_favicon() {
+        let out = tempfile::tempdir().unwrap();
+        std::fs::write(
+            out.path().join(ACCESS_LOG),
+            "listening on http://127.0.0.1:4490/ doc_root=/x mode=plain\n\
+             [srv 1.000] 200 GET /index.html (10B)\n\
+             [srv 1.100] 404 GET /fonts/a.woff2 (0B)\n\
+             [srv 1.200] 404 GET /favicon.ico (0B)\n\
+             [srv 2.100] 404 GET /fonts/a.woff2 (0B)\n",
+        )
+        .unwrap();
+        assert_eq!(missing_resources(out.path()), vec!["/fonts/a.woff2"]);
+    }
+
+    #[test]
+    fn static_fixture_serves_a_directory_without_certificates() {
+        let workloads_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("workloads");
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("index.html"), b"<p>hi</p>").unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let w = workload_with(Fixture::Static {
+            dir: root.path().to_path_buf(),
+            port: pick_free_port(),
+        });
+        let handle = spawn(&workloads_dir, &w, &PanickingDriver, out_dir.path())
+            .expect("spawn static fixture");
         assert!(TcpStream::connect(format!("127.0.0.1:{}", handle.port())).is_ok());
     }
 

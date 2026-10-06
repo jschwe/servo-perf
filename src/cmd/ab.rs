@@ -31,6 +31,12 @@ pub fn run(args: AbArgs) -> Result<()> {
     // TRACE-level Servo spans land in the trace. Same semantics as in
     // `cmd/bench.rs`; one guard covers both phases since they share the
     // device.
+    // Held for the whole run: a screen-off mid-capture freezes the app and
+    // silently invalidates every iteration after it.
+    let _screen_guard = match &base_target {
+        Target::Ohos(ohos) => Some(ohos.guard_screen_awake()),
+        Target::Local { .. } => None,
+    };
     let _trace_level_guard = match &base_target {
         Target::Ohos(ohos) => Some(ohos.guard_trace_level(&ohos.trace_level.clone())?),
         Target::Local { .. } => None,
@@ -115,7 +121,7 @@ pub fn run(args: AbArgs) -> Result<()> {
             .filter(|i| matches!(i.status, IterationStatus::Ok { .. }))
             .count();
         anyhow::ensure!(
-            2 * ok >= iters.len(),
+            crate::cancel::requested() || 2 * ok >= iters.len(),
             "{label}: more than 50% of iterations failed ({}/{}); aborting",
             iters.len() - ok,
             iters.len()
@@ -159,17 +165,14 @@ pub fn run(args: AbArgs) -> Result<()> {
     );
 
     let data = RunResults {
+        cancelled: crate::cancel::requested(),
+        command: crate::report::invocation(),
         tool_version: env!("CARGO_PKG_VERSION").to_string(),
-        timestamp_utc: format!(
-            "@{}s",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0)
-        ),
+        timestamp_utc: crate::report::now_utc(),
         workload: w,
         configs,
         deltas,
+        symbols_build_id: None,
     };
     report::write_json(&out_dir, &data)?;
     report::write_markdown(&out_dir, &data)?;
@@ -195,6 +198,10 @@ fn run_phase(
     let mut fcp = Vec::new();
     let mut lcp = Vec::new();
     for i in 0..w.iterations {
+        if crate::cancel::requested() {
+            eprintln!("{label}: cancelled after {i} iteration(s)");
+            break;
+        }
         let iter_out = out_dir.join(format!("{label}_{i}_cwd"));
         let _ = std::fs::create_dir_all(&iter_out);
         let timeout = runner::pick_timeout(successful_wall);
@@ -284,6 +291,18 @@ fn run_and_record(
                     {
                         metrics.insert("soc_thermal_milli_c.delta".to_string(), (a - b) as f64);
                     }
+                    // Presented-frame and page-reported metrics for scenario
+                    // workloads; a no-op for page-load ones.
+                    crate::fps::merge_scenario_metrics(
+                        &mut metrics,
+                        w,
+                        &art.fps_dumps,
+                        art.log.as_deref(),
+                        art.thread_cpu
+                            .as_ref()
+                            .map(|(b, a)| (b.as_str(), a.as_str())),
+                        Some(&pftrace),
+                    );
                     Iteration {
                         index: iter,
                         status: IterationStatus::Ok {
@@ -364,9 +383,5 @@ fn resolve_out(explicit: Option<&Path>, workload_name: &str) -> PathBuf {
     if let Some(p) = explicit {
         return p.to_path_buf();
     }
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    PathBuf::from("out").join(format!("{}-{}", workload_name, ts))
+    crate::report::default_out_dir(workload_name)
 }

@@ -24,6 +24,14 @@ pub enum Command {
     Ab(AbArgs),
     /// Run a workload and compare against a saved baseline JSON.
     Regression(RegressionArgs),
+    /// Run a whole measurement matrix — every workload of a suite against
+    /// every engine leg — from a checked-in `suites/<name>.toml`.
+    Suite(SuiteArgs),
+    /// Measure a static page of your own — a directory of HTML and resources,
+    /// or one HTML file — loading and scrolling, against every leg of a page
+    /// suite. The directory is served from the host and reached from the
+    /// device through `hdc rport`; nothing is installed on the device.
+    Page(PageArgs),
     /// Build an unstripped `libarkweb_engine.so` from a stripped on-device
     /// copy by re-attaching the `.symtab`/`.strtab` carried in the
     /// `.gnu_debugdata` MiniDebugInfo section, then push it to the device.
@@ -37,12 +45,97 @@ pub enum Command {
     /// report doesn't surface enough detail.
     #[cfg(feature = "pftrace")]
     Dump(DumpArgs),
+    /// Report what clock each thread actually ran at, from a hitrace capture
+    /// taken with the `sched` and `freq` tags. Answers whether a thread is slow
+    /// because of the work it does or because the governor never ramped it.
+    #[command(name = "cpufreq")]
+    CpuFreq(CpuFreqArgs),
+    /// Rank the functions an engine spends its instructions in, from the
+    /// `perf.data` captures of a run — optionally only inside one phase
+    /// (`--under 'Layout>::reflow'`). The per-run report measures phases as a
+    /// whole; this is for finding what inside a phase is worth optimising.
+    Profile(ProfileArgs),
+}
+
+#[derive(clap::Args, Clone)]
+pub struct ProfileArgs {
+    /// `perf.data` files, or run directories to take every
+    /// `iter_*.perf.data` from.
+    #[arg(required = true)]
+    pub inputs: Vec<PathBuf>,
+    /// `_instructions.toml` engine to symbolize against.
+    #[arg(long)]
+    pub engine: String,
+    /// Keep only samples whose callchain contains a function matching this
+    /// substring (same matching as `functions` patterns). Samples on the
+    /// engine's worker-pool threads count too when the pool credits exactly
+    /// this pattern.
+    #[arg(long)]
+    pub under: Option<String>,
+    /// Also tabulate, for samples whose self function matches this pattern,
+    /// the nearest enclosing engine function — e.g. `--callers-of atomic_add`
+    /// to find who is cloning all those `Arc`s.
+    #[arg(long)]
+    pub callers_of: Option<String>,
+    /// Tabulate, for samples with a function matching this pattern anywhere
+    /// on the chain, the engine function that called it — e.g.
+    /// `--parents-of 'BoxFragment>::style'` for who keeps re-borrowing styles.
+    #[arg(long, conflicts_with = "callers_of")]
+    pub parents_of: Option<String>,
+    /// Symbolize against this library instead of the engine's staged
+    /// `symbol_file` — for captures from a build that is not the one staged.
+    #[arg(long)]
+    pub symbols: Option<PathBuf>,
+    /// Instead of ranking functions, estimate from samples alone how many times
+    /// a function matching this pattern ran (runs of consecutive matching
+    /// samples per thread), one line per capture, next to the capture's
+    /// sampled window. For scoring such estimates against trace markers.
+    #[arg(long)]
+    pub episodes: Option<String>,
+    /// With `--episodes`: two matching samples further apart than this start
+    /// a new episode even with no non-matching sample in between.
+    #[arg(long, default_value_t = 2.0)]
+    pub gap_ms: f64,
+    /// Rows per table.
+    #[arg(long, default_value_t = 30)]
+    pub top: usize,
+}
+
+#[derive(clap::Args, Clone)]
+pub struct CpuFreqArgs {
+    /// Path to a hitrace text capture (`iter_<n>.hitrace.txt`).
+    pub trace: PathBuf,
+    /// Also write a scheduling + frequency timeline here as JSON, for
+    /// visualising which threads ran concurrently and at what clock.
+    #[arg(long)]
+    pub timeline: Option<PathBuf>,
+    /// Length of the timeline window in milliseconds, taken from the busiest
+    /// part of the capture.
+    #[arg(long, default_value_t = 200)]
+    pub timeline_ms: u64,
+    /// Comma-separated thread-name prefixes to include in the timeline.
+    /// Empty means every thread of the process.
+    #[arg(
+        long,
+        default_value = "Canvas,Script,org.servo,WR,Constellation,Compositor"
+    )]
+    pub timeline_threads: String,
 }
 
 /// Flags that select / configure a HarmonyOS device target reached over
 /// `hdc`. When `--ohos` is set, `--bin` (or its A/B equivalents) becomes
 /// optional: the .hap is expected to already be installed on the device,
 /// or installed once before the run if `--bin` points at a `.hap` file.
+/// CLI defaults, named so a suite file can fill in only the settings the
+/// command line did not set. Duplicating the literals in the `#[arg]`
+/// attributes would let the two drift apart silently.
+pub mod defaults {
+    pub const BUNDLE: &str = "org.servo.servo";
+    pub const ABILITY: &str = "EntryAbility";
+    pub const THERMAL_ZONE: &str = "soc_thermal";
+    pub const TRACE_BUFFER_KIB: u64 = 524_288;
+}
+
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct OhosArgs {
     /// Run against a HarmonyOS device via `hdc` instead of executing
@@ -57,23 +150,40 @@ pub struct OhosArgs {
     #[arg(long)]
     pub hdc_server: Option<String>,
     /// `hdc` binary to invoke (must match the device's hdc version).
+    /// On Windows this is `hdc.exe` from the command-line tools; put its
+    /// directory on `PATH` or pass the full path here.
     #[arg(long, default_value = "hdc")]
     pub hdc_bin: String,
+    /// Device serial, threaded through as `hdc -t <serial>`. Required when
+    /// more than one device is attached; with a single device it can be
+    /// omitted. `hdc list targets` prints the serials.
+    #[arg(long)]
+    pub hdc_target: Option<String>,
     /// Bundle name to launch.
-    #[arg(long, default_value = "org.servo.servo")]
+    #[arg(long, default_value = defaults::BUNDLE)]
     pub ohos_bundle: String,
     /// UIAbility name to launch.
-    #[arg(long, default_value = "EntryAbility")]
+    #[arg(long, default_value = defaults::ABILITY)]
     pub ohos_ability: String,
     /// Where on the device the captured hitrace text is written.
     #[arg(long, default_value = "/data/local/tmp/servoperf_hitrace.txt")]
     pub ohos_trace_path: String,
-    /// Hitrace ring buffer in KiB.
-    #[arg(long, default_value_t = 524_288)]
+    /// Hitrace ring buffer in KiB. The buffer is a *ring*: once it fills,
+    /// `--overwrite` discards the oldest records, which for a page-load
+    /// capture means losing the load burst — so a suspiciously low
+    /// `reflow.count` usually means the window was too long for the buffer,
+    /// not that the engine laid out less. Devices cap this: hitrace accepts
+    /// 256 KiB - 300 MB and DAYU200 enforces the upper end, rejecting this
+    /// default (`--trace_begin` then fails with hitrace's own message).
+    #[arg(long, default_value_t = defaults::TRACE_BUFFER_KIB)]
     pub ohos_trace_buffer_kib: u64,
     /// Comma-separated hitrace tag list (passed as positional args to
-    /// `hitrace`). The default mirrors the servo CI bencher.
-    #[arg(long, default_value = "app,graphic,ohos,freq,idle,memory")]
+    /// `hitrace`). The default mirrors the servo CI bencher, plus `nweb`:
+    /// ArkWeb's Blink trace events (`LocalFrameView::performLayout`,
+    /// `UpdateLayoutTree`, …) are emitted under that tag and are the
+    /// source of `reflow.count` — measured on PLR-AL00, dropping `nweb`
+    /// yields zero Blink markers.
+    #[arg(long, default_value = "app,graphic,ohos,freq,idle,memory,nweb")]
     pub ohos_trace_tags: String,
     /// Seconds to sleep after `aa start` before stopping the trace.
     /// Should comfortably exceed the workload's expected first-paint
@@ -122,6 +232,13 @@ pub struct OhosArgs {
     /// unused; that's bounded by `--ohos-capture-seconds`.
     #[arg(long, default_value_t = 45)]
     pub ohos_record_seconds: u64,
+    /// Thermal zone `type` to sample per iteration (see
+    /// `/sys/class/thermal/*/type`). Not every zone is live: on PLR-AL00
+    /// `soc_thermal` reads a flat 30000 under any load while `board_thermal`
+    /// tracks, so a run whose thermal columns never move is usually pointed at
+    /// a placeholder rather than a cool device.
+    #[arg(long, default_value = defaults::THERMAL_ZONE)]
+    pub ohos_thermal_zone: String,
     /// Collect per-function inclusive instruction counts per iteration via
     /// `hiperf record -a -e hw-instructions`, running in parallel with the
     /// hitrace capture. The per-engine symbol list lives in
@@ -131,6 +248,13 @@ pub struct OhosArgs {
     /// can resolve symbols in `libarkweb_engine.so`.
     #[arg(long)]
     pub with_instructions: bool,
+    /// Force which `_instructions.toml` engine entry to use, by `id`,
+    /// instead of resolving it from `--ohos-bundle`. Needed when one bundle
+    /// can run more than one engine — the arkweb test app can render with the
+    /// system ArkWeb engine or with Servo, and the two need different symbol
+    /// files and function lists.
+    #[arg(long)]
+    pub engine: Option<String>,
     /// hiperf sampling period (events between samples) when
     /// `--with-instructions` is set. 100 000 retired instructions per
     /// sample matches what the manual investigation used and produces
@@ -167,6 +291,104 @@ pub struct PrepareArkwebSymbolsArgs {
 }
 
 #[derive(clap::Args, Clone)]
+pub struct SuiteArgs {
+    /// Suite name (looked up in tools/servoperf/suites/).
+    pub suite: String,
+    /// Restrict the run to these leg ids, comma-separated.
+    #[arg(long)]
+    pub legs: Option<String>,
+    /// Restrict the run to these workloads, comma-separated.
+    #[arg(long)]
+    pub only: Option<String>,
+    /// Override every workload's repetition count, for a smoke run.
+    #[arg(long)]
+    pub iterations: Option<u32>,
+    /// Root output directory. Each cell lands in `<out>/<leg>-<workload>/`.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// `.hap` to install once before each leg, as for `bench --bin`.
+    #[arg(long)]
+    pub bin: Option<PathBuf>,
+    /// Do not pause for a manual engine switch on legs without a `setup`
+    /// command — assume the device is already on the right engine.
+    #[arg(long)]
+    pub assume_yes: bool,
+    /// Measure nothing: rewrite `<out>/comparison.md` from the cells already
+    /// there. For re-pairing legs measured at different times — re-running
+    /// one leg under changed settings without re-running the other.
+    #[arg(long, requires = "out")]
+    pub report_only: bool,
+    /// Run every workload against the live site, ignoring `[fixture]` blocks.
+    /// See `bench --live` for what that costs the comparison.
+    #[arg(long)]
+    pub live: bool,
+    /// Take no instruction samples, whatever the suite says, for a run whose
+    /// milestones are to be compared. See `PageArgs::no_instructions`.
+    #[arg(long)]
+    pub no_instructions: bool,
+    #[command(flatten)]
+    pub ohos: OhosArgs,
+}
+
+#[derive(clap::Args, Clone)]
+pub struct PageArgs {
+    /// Directory holding the page and everything it loads, or a single HTML
+    /// file, in which case its directory is served.
+    pub path: PathBuf,
+    /// Page to open, relative to the served directory. Defaults to the file
+    /// given, or `index.html` for a directory.
+    #[arg(long)]
+    pub entry: Option<String>,
+    /// Prefix for the cells' names and output directories. Defaults to the
+    /// directory's name, or the file's stem.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Page suite supplying the legs, device settings and the measurement
+    /// templates (looked up in tools/servoperf/suites/).
+    #[arg(long, default_value = "page-plr")]
+    pub suite: String,
+    /// Host port the page is served on, and forwarded to on the device.
+    #[arg(long, default_value_t = crate::workload::default_static_port())]
+    pub port: u16,
+    /// Copy the page into each app's files directory and open it as a
+    /// `file://` URL, instead of serving it from the host. Takes the host
+    /// connection out of the load, but both apps must be debuggable (it goes
+    /// through `hdc file send -b`), the ArkWeb wrapper needs `fileAccess` on,
+    /// and under ArkWeb a page's `fetch`, XHR and module imports of its
+    /// neighbours fail: Chromium gives every `file://` page an opaque origin.
+    #[arg(long)]
+    pub file: bool,
+    /// Only these measurements, comma-separated — the suite's template names
+    /// without their `_page-` prefix, e.g. `load` or `scroll`.
+    #[arg(long)]
+    pub only: Option<String>,
+    /// Restrict the run to these leg ids, comma-separated.
+    #[arg(long)]
+    pub legs: Option<String>,
+    /// Override every measurement's repetition count, for a smoke run.
+    #[arg(long)]
+    pub iterations: Option<u32>,
+    /// Root output directory. Each cell lands in `<out>/<leg>-<name>-<kind>/`.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    /// `.hap` to install once before each leg, as for `bench --bin`.
+    #[arg(long)]
+    pub bin: Option<PathBuf>,
+    /// Do not pause for a manual engine switch on legs without a `setup`.
+    #[arg(long)]
+    pub assume_yes: bool,
+    /// Take no instruction samples, for a run whose first-paint times are to
+    /// be compared. DWARF sampling slows the page load it is measuring: on a
+    /// PLR-AL00, a static page's first paint went from 0.76 s to 1.42 s under
+    /// Servo and from 1.18 s to 2.00 s under ArkWeb, which also narrows the
+    /// gap between them.
+    #[arg(long)]
+    pub no_instructions: bool,
+    #[command(flatten)]
+    pub ohos: OhosArgs,
+}
+
+#[derive(clap::Args, Clone)]
 pub struct BenchArgs {
     /// Workload name (looked up in tools/servoperf/workloads/).
     pub workload: String,
@@ -181,6 +403,35 @@ pub struct BenchArgs {
     /// Output directory. Defaults to `out/<workload>-<UTC-timestamp>/`.
     #[arg(long)]
     pub out: Option<PathBuf>,
+    /// Override the workload's `tracing_filter` for servoshell.
+    ///
+    /// The instrumentation is inside the frames being counted, so a hot span
+    /// inflates the very instructions the run reports. Measured on a
+    /// PLR-AL00: upstream #47669 put spans on
+    /// `ScrollTree::cumulative_node_transform`, called ~1.1 M times per 20 s
+    /// on a busy page, and under the default filter those spans were 46% of
+    /// display-list instructions. `info,layout::layout_impl=debug` keeps only
+    /// what servoperf reads (the `FirstContentfulPaint` and `RanLayout`
+    /// markers) and drops every per-function span.
+    #[arg(long)]
+    pub tracing_filter: Option<String>,
+    /// Ignore the workload's `[fixture]` and load its URL from the live site —
+    /// for a host without WPR set up. Not comparable with replayed runs: the
+    /// network is back in every number, and Servo's disk cache is off by
+    /// default, so every Servo iteration is a cold fetch while Chromium serves
+    /// repeats from its cache (on a PLR-AL00, mossel-index first paint was
+    /// 7.4 s live against 0.9 s replayed).
+    #[arg(long)]
+    pub live: bool,
+    /// Launch Servo with `largest_contentful_paint_enabled=true` so the run can
+    /// report LCP. Off by default, as Servo ships: the accounting costs
+    /// display-list instructions (see `Workload::lcp`).
+    #[arg(long)]
+    pub lcp: bool,
+    /// Measure this workload instead of loading `workload` from disk; for
+    /// commands that build one, like `page`.
+    #[arg(skip)]
+    pub workload_def: Option<crate::workload::Workload>,
     #[command(flatten)]
     pub ohos: OhosArgs,
 }
