@@ -41,20 +41,13 @@ later, to build the `wpr` replay proxy — see §6.
 
 ## 2. Device prerequisites
 
-- A device that can select the webview backend, switched with whatever system
-  parameter your image uses:
+- A device whose web engine is set up for the leg you are about to run.
+  servoperf never selects the engine itself; tell it which engine to expect
+  with `--engine`.
 
-  ```powershell
-  hdc shell param set <engine-param> <value>
-  ```
-
-  servoperf does not care which parameter it is or when you set it — it never
-  touches the engine selection. Set it before the leg and tell servoperf which
-  engine to expect with `--engine`.
-
-  The parameter alone is not proof that the engine changed — it takes effect
-  on the next cold start, so a stale process keeps the old one. Step 1 of
-  [reflow-benchmark.md](reflow-benchmark.md) has the check.
+  A change of engine takes effect on the next cold start, so a stale process
+  keeps the old one. Step 1 of [reflow-benchmark.md](reflow-benchmark.md) has
+  the check.
 
 - The wrapper app installed (`org.openharmonyrs.arkwebtest`). The same app
   serves both engines — that is the point of it. Check first:

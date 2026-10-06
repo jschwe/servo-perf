@@ -256,10 +256,9 @@ name = "colleagues_reflow"
 functions = ["Document::UpdateStyleAndLayout(", "WebFrameWidgetImpl::UpdateLifecycle"]
 
 # Servo running as the ArkWeb backend, inside the same wrapper app as the
-# entry above. Bundle matching cannot tell the two apart — the engine is
-# chosen by a device system parameter, not by which app is launched — so this
-# entry is selected explicitly with `--engine servo-arkweb` and claims no
-# bundles of its own.
+# entry above. Bundle matching cannot tell the two apart — both run in the
+# same app — so this entry is selected explicitly with `--engine servo-arkweb`
+# and claims no bundles of its own.
 [[engines]]
 id = "servo-arkweb"
 bundles = []

@@ -413,8 +413,7 @@ capture as secondary, since the denominator is the noisy part.
 ### Measured baseline (2026-09-09, DAYU200, `mossel-index`, live site)
 
 5 iterations per leg, 20 s window, `--instructions-period 250000`,
-`--ohos-trace-tags app,nweb`, same wrapper app, engine switched with the
-device's engine-selection system parameter:
+`--ohos-trace-tags app,nweb`, same wrapper app for both engines:
 
 | metric | median | CV |
 | --- | --- | --- |

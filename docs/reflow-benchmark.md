@@ -37,8 +37,8 @@ capture Chromium's out-of-process `:render` without chasing its pid. If `-a` is
 refused on a non-root shell, that half of the measurement will not work.
 
 Then start the app on the engine you want and check which library actually
-loaded. The engine-selection parameter takes effect on the next **cold start**,
-so a still-running process silently keeps the old engine — this is the single
+loaded. A change of engine takes effect on the next **cold start**, so a
+still-running process silently keeps the old engine — this is the single
 easiest way to mis-attribute a whole run:
 
 ```sh
@@ -155,13 +155,12 @@ covering a partly-suspended process. It cannot dismiss a lock screen that is
 *already* up, and warns when it sees one.
 
 Selecting the engine is the one thing servoperf will not guess. Give a leg a
-`setup` command — `setup = "param set <engine-param> <value>"`, run as
-`hdc shell` before the leg — or leave it out and the run pauses and asks you to
-switch by hand. `--assume-yes` skips the prompt when the device is already set.
+`setup` command, run as `hdc shell` before the leg, or leave it out and the run
+pauses and asks you to switch by hand. `--assume-yes` skips the prompt when the device is already set.
 
 A leg can also name its own `bundle` (and `ability`), for the case where the
-two legs are two different *apps* rather than one wrapper whose engine a system
-parameter picks — servoshell against the platform browser, say, which is what
+two legs are two different *apps* rather than one wrapper with two engines —
+servoshell against the platform browser, say, which is what
 [`suites/mossel-plr.toml`](../suites/mossel-plr.toml) does. Such a leg needs no
 engine switch, so the run neither prompts nor waits. The price is that the legs
 no longer differ only in the engine: startup path, chrome and window size differ

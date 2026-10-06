@@ -250,10 +250,9 @@ pub struct OhosArgs {
     pub with_instructions: bool,
     /// Force which `_instructions.toml` engine entry to use, by `id`,
     /// instead of resolving it from `--ohos-bundle`. Needed when one bundle
-    /// can run more than one engine — the arkweb test app renders with the
-    /// system ArkWeb engine or with Servo depending on a device system
-    /// parameter, and the two need different symbol files and function
-    /// lists.
+    /// can run more than one engine — the arkweb test app can render with the
+    /// system ArkWeb engine or with Servo, and the two need different symbol
+    /// files and function lists.
     #[arg(long)]
     pub engine: Option<String>,
     /// hiperf sampling period (events between samples) when

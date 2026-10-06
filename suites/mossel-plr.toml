@@ -3,10 +3,9 @@
 #
 # Run with:  servoperf suite mossel-plr --ohos
 #
-# Unlike `mossel`, the two legs are two different *apps*, not one wrapper whose
-# engine is picked by a system parameter: this device cannot switch its engine,
-# so ArkWeb runs in the test wrapper and Servo in servoshell. Each leg names its
-# own bundle and there is no engine switch between them.
+# Unlike `mossel`, the two legs are two different *apps*, not one wrapper with
+# two engines: ArkWeb runs in the test wrapper and Servo in servoshell. Each leg
+# names its own bundle and there is no engine switch between them.
 #
 # The ArkWeb side is deliberately NOT the stock browser. Measured on a PLR-AL00,
 # `com.huawei.hmos.browser` puts a modal "Allow Browser to send you

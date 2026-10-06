@@ -43,7 +43,7 @@ with_instructions = true
 [[leg]]
 id = "arkweb"
 engine = "arkweb"
-# setup = "param set <engine-param> <arkweb-value>"
+# setup = "<hdc shell command that selects ArkWeb>"
 # Blink emits its markers regardless of the threshold, so leave the device's
 # trace level alone on this leg.
 trace_level = ""
@@ -51,7 +51,7 @@ trace_level = ""
 [[leg]]
 id = "servo"
 engine = "servo-arkweb"
-# setup = "param set <engine-param> <servo-value>"
+# setup = "<hdc shell command that selects Servo>"
 
 # --- The matrix ----------------------------------------------------------
 # Trim this list to shorten a run; `--only` does the same from the command
